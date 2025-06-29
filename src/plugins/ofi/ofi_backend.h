@@ -71,7 +71,9 @@ private:
     std::thread eq_thread;
     std::atomic<bool> eq_thread_stop;
     long eq_timeout_ms;
-
+    bool hmem_ze_supported;
+    bool hmem_cuda_supported;
+    bool hmem_synapseai_supported;
 
     std::string local_agent_name;
 

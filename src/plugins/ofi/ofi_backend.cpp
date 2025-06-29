@@ -29,6 +29,9 @@ nixlOFI_Engine::nixlOFI_Engine(const nixlBackendInitParams* init_params) :
     cached_provider_info(nullptr),
     eq_thread_stop(false),
     eq_timeout_ms(100),
+    hmem_ze_supported(false),
+    hmem_synapseai_supported(false),
+    hmem_cuda_supported(false),
 {
     local_agent_name = init_params->localAgentName;
     struct fi_info *hints = nullptr;
@@ -62,7 +65,7 @@ nixlOFI_Engine::nixlOFI_Engine(const nixlBackendInitParams* init_params) :
         return;
     }
 
-    hints->caps = FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_DIRECTED_CM;
+    hints->caps = FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_DIRECTED_CM | FI_HMEM;
     hints->mode = FI_CONTEXT | FI_RX_CQ_DATA;
     hints->ep_attr->type = FI_EP_RDM; // Reliable Datagram Messaging
 
@@ -86,6 +89,25 @@ nixlOFI_Engine::nixlOFI_Engine(const nixlBackendInitParams* init_params) :
     if (!fi) {
         NIXL_ERROR << "Provider " << provider_name << " not found";
         goto err_getinfo;
+    }
+
+    if (fi->domain_attr->mr_mode & FI_MR_HMEM) {
+        struct {
+            const char* name;
+            enum fi_hmem_iface iface;
+            bool& flag;
+        } hmem_checks[] = {
+            {"NVIDIA CUDA", FI_HMEM_CUDA, hmem_cuda_supported},
+            {"Gaudi SynapseAI", FI_HMEM_SYNAPSEAI, hmem_synapseai_supported},
+            {"Intel Level Zero", FI_HMEM_ZE, hmem_ze_supported}
+        };
+
+        for (const auto& check : hmem_checks) {
+            if (fi->hmem_ifaces & (1ULL << check.iface)) {
+                check.flag = true;
+                NIXL_DEBUG << "OFI provider supports " << check.name;
+            }
+        }
     }
 
 
@@ -395,10 +417,20 @@ nixl_status_t nixlOFI_Engine::registerMem(const nixlBlobDesc &mem,
         mr_attr.iov_count = 1;
         mr_attr.access = FI_REMOTE_READ | FI_REMOTE_WRITE | FI_SEND | FI_RECV;
 
-        // Only host memory supported in core functionality
-        NIXL_ERROR << "Non-host memory types not supported in core functionality";
-        delete ofi_meta;
-        return NIXL_ERR_NOT_SUPPORTED;
+        if (nixl_mem == INTEL_GPU_SEG && hmem_ze_supported) {
+            mr_attr.iface = FI_HMEM_ZE;
+            mr_attr.device.ze = mem.devId;
+        } else if (nixl_mem == GAUDI_DEVICE_SEG && hmem_synapseai_supported) {
+            mr_attr.iface = FI_HMEM_SYNAPSEAI;
+            mr_attr.device.synapseai = mem.devId;
+        } else if (nixl_mem == VRAM_SEG && hmem_cuda_supported) {
+            mr_attr.iface = FI_HMEM_CUDA;
+            mr_attr.device.cuda = mem.devId;
+        } else {
+            NIXL_ERROR << "Unsupported memory type or provider capability for HMEM";
+            delete ofi_meta;
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
 
         ret = fi_mr_regattr(domain, &mr_attr, 0, &ofi_meta->mr);
     }
