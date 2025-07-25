@@ -1,0 +1,275 @@
+# SPDX-License-Identifier: Apache-2.0
+# syntax=docker/dockerfile:1.4
+
+# Run as:
+# docker build --target nixlbench . -t nixlbench -f Dockerfile.nixlbench \
+#    --cache-from nixl-base \
+#    --build-arg HTTP_PROXY=${http_proxy} \
+#    --build-arg HTTPS_PROXY=${https_proxy} 
+
+# Assumes:
+# nixl/ source tree exists in the current directory, and also libfabric/
+# exists in $(pwd) if build against a custom libfabric is desired 
+
+# Bench image
+FROM nixlbase AS nixlbench
+
+# Pre‐declare all ENVs so later `ENV foo=$foo…` works without linter errors
+ENV LD_LIBRARY_PATH="" \
+    PKG_CONFIG_PATH="" \
+    CMAKE_PREFIX_PATH="" \
+    CPLUS_INCLUDE_PATH="" \
+    C_INCLUDE_PATH="" \
+    LDFLAGS=""
+
+ARG ARCH="x86_64"
+ARG DEFAULT_PYTHON_VERSION="3.12"
+ARG LIBFABRIC_REF="v1.20.1"
+ARG UCX_REF="v1.19.x"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV HOME=/root
+ENV PREFIX=$HOME/.local
+ENV PATH=$PREFIX/bin:$PATH
+ENV LD_LIBRARY_PATH=$PREFIX/lib:$PREFIX/lib64:$PREFIX/lib/ucx:$PREFIX/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+
+# Install curl for health checks, etcd
+RUN apt-get update && \
+    apt-get install -y curl unzip etcd-server etcd-client && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip && \
+    unzip -q /tmp/awscliv2.zip -d /tmp && \
+    /tmp/aws/install
+
+# Create necessary directories early
+RUN mkdir -p $PREFIX/{bin,lib,include} && \
+    mkdir -p /workspace
+
+# Copy requirements first for better layer caching
+COPY nixl/requirements.txt /tmp/requirements.txt
+
+# Set up venv for nixl early
+ENV VIRTUAL_ENV=/workspace/nixl/.venv
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv $VIRTUAL_ENV --python $DEFAULT_PYTHON_VERSION && \
+    uv pip install --upgrade meson pybind11 patchelf msgspec zmq && \
+    uv pip install -r /tmp/requirements.txt
+
+# Copy nixl sources and build!
+COPY nixl/ /workspace/nixl
+
+WORKDIR /workspace/nixl
+
+# Set up venv for nixl
+ENV VIRTUAL_ENV=/workspace/nixl/.venv
+RUN uv venv $VIRTUAL_ENV --python $DEFAULT_PYTHON_VERSION && \
+    uv pip install --upgrade meson pybind11 patchelf && \
+    uv pip install -r /tmp/requirements.txt
+
+# Set up environment for nixl to find libfabric and etcd-cpp
+ENV PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH \
+    CPLUS_INCLUDE_PATH=$PREFIX/include:$CPLUS_INCLUDE_PATH \
+    C_INCLUDE_PATH=$PREFIX/include:$C_INCLUDE_PATH \
+    LDFLAGS="-L$PREFIX/lib $LDFLAGS" \
+    LD_LIBRARY_PATH=$PREFIX/lib:$LD_LIBRARY_PATH
+
+# Build nixl using local libfabric and UCX
+RUN uv run --active meson setup \
+    --wipe \
+    --prefix=$PREFIX \
+    --buildtype=release \
+    -Ddisable_gds_backend=true \
+    -Dlibfabric_path=$PREFIX \
+    -Ducx_path=$PREFIX \
+    builddir .
+
+RUN cd builddir && \
+    ninja && \
+    ninja install && \
+    ldconfig && \
+    cd .. && rm -rf builddir
+
+# Install python modules
+RUN pip install pandas msgspec pyzmq
+
+WORKDIR /workspace/nixl/
+RUN pip install -r requirements.txt
+RUN pip install .
+
+# Build nixlbench
+WORKDIR /workspace/nixl/benchmark/nixlbench/
+RUN uv run --active meson setup \
+    --wipe \
+    --prefix=$PREFIX \
+    -Dnixl_path=$PREFIX \
+    -Dcudapath_inc='' \
+    -Dcudapath_lib='' \
+    -Dcudapath_stub='' \
+    builddir .
+
+RUN cd builddir && \
+    ninja && \
+    ninja install
+
+# Verify installation and library paths
+RUN ldconfig && \
+    echo "Library paths configured:" && \
+    echo $LD_LIBRARY_PATH | tr ':' '\n' && \
+    echo "Installed binaries:" && \
+    ls -la $PREFIX/bin/ || true && \
+    echo "Installed libraries:" && \
+    find $PREFIX/lib* -name "*.so*" 2>/dev/null | head -10 || true
+
+
+# Run scripts
+# 1a) Localhost (loopback) using UCX shm+tcp
+#    Usage (two terminals): nixlbench-local-ucxtcp.sh
+COPY <<'UCXTCP' $HOME/.local/bin/nixlbench-local-ucxtcp.sh
+#!/usr/bin/env bash
+set -euo pipefail
+sysctl -w net.core.rmem_max=268435456
+sysctl -w net.core.wmem_max=268435456
+sysctl -w net.ipv4.tcp_rmem=4096 131072 268435456
+sysctl -w net.ipv4.tcp_wmem=4096 131072 268435456
+sysctl -w net.core.somaxconn=65536
+sysctl -w net.core.netdev_max_backlog=5000  
+sysctl -w net.ipv4.tcp_max_syn_backlog=8192
+export ETCD=${ETCD:-http://127.0.0.1:2379}
+export START=${START:-4096}
+export MAX=${MAX:-67108864}
+export NITER=${NITER:-1000}
+export NTH=${NTH:-1}
+export WARM=${WARM:-100}
+export UCX_TLS=${UCX_TLS:-sm,tcp,self}
+export UCX_NET_DEVICES=${UCX_NET_DEVICES:-lo}
+export UCX_SOCKADDR_TLS_PRIORITY=${UCX_SOCKADDR_TLS_PRIORITY:-tcp}
+export UCX_TCP_SNDBUF=${UCX_TCP_SNDBUF:-2097152}     # 2MB send buffer
+export UCX_TCP_RCVBUF=${UCX_TCP_RCVBUF:-2097152}     # 2MB receive buffer
+export UCX_TCP_CM_REUSEADDR=${UCX_TCP_CM_REUSEADDR:-y}
+export UCX_LOG_LEVEL=error
+export NIXL_LOG_LEVEL=${NIXL_LOG_LEVEL:-WARN}
+exec "$HOME/.local/bin/nixlbench" \
+  --etcd-endpoints "$ETCD" \
+  --backend UCX \
+  --initiator_seg_type DRAM --target_seg_type DRAM \
+  --scheme pairwise --mode SG --op_type WRITE \
+  --start_block_size "$START" --max_block_size "$MAX" \
+  --num_iter "$NITER" --warmup_iter "$WARM" \
+  --num_threads "$NTH"
+UCXTCP
+
+# 1b) Localhost (loopback) using UCX shm
+#    Usage (two terminals): nixlbench-local-ucxmo.sh
+COPY <<'UCXMO' $HOME/.local/bin/nixlbench-local-ucxmo.sh
+#!/usr/bin/env bash
+set -euo pipefail
+export ETCD=${ETCD:-http://127.0.0.1:2379}
+export START=${START:-4096}
+export MAX=${MAX:-67108864}
+export NITER=${NITER:-1000}
+export NTH=${NTH:-4}
+export WARM=${WARM:-100}
+export UCX_TLS=${UCX_TLS:-sm,tcp,self}
+export UCX_NET_DEVICES=${UCX_NET_DEVICES:-lo}
+unset UCX_SOCKADDR_TLS_PRIORITY
+export UCX_TCP_MAX_CONN_RETRIES=${UCX_TCP_MAX_CONN_RETRIES:-100}
+export UCX_MEM_MMAP_RELOC=${UCX_MEM_MMAP_RELOC:-no}  # Reduce memory allocation overhead
+export UCX_MEMTYPE_CACHE=${UCX_MEMTYPE_CACHE:-n}     # Disable memory type caching for better perf
+export UCX_LOG_LEVEL=error
+export NIXL_LOG_LEVEL=${NIXL_LOG_LEVEL:-WARN}
+exec "$HOME/.local/bin/nixlbench" \
+  --etcd-endpoints "$ETCD" \
+  --backend UCX_MO \
+  --initiator_seg_type DRAM --target_seg_type DRAM \
+  --scheme pairwise --mode SG --op_type WRITE \
+  --start_block_size "$START" --max_block_size "$MAX" \
+  --num_iter "$NITER" --warmup_iter "$WARM" \
+  --num_threads "$NTH"
+UCXMO
+
+# 2) Localhost (loopback) using OBJ
+#    Usage (two terminals): nixlbench-local-obj.sh
+COPY <<'LOCALOBJ' $HOME/.local/bin/nixlbench-local-obj.sh
+#!/usr/bin/env bash
+set -euo pipefail
+export ETCD=${ETCD:-http://127.0.0.1:2379}
+export MAX=${MAX:-67108864}
+export NITER=${NITER:-1000}
+export NTH=${NTH:-4}
+export WARM=${WARM:-100}
+export OBJ_BUCKET_NAME=${OBJ_BUCKET_NAME:-nixl-bucket}
+export OBJ_SCHEME=${OBJ_SCHEME:-http}
+export OBJ_REGION=${OBJ_REGION:-us-east-1}
+export OBJ_ACCESS_KEY=${OBJ_ACCESS_KEY:-minioadmin}
+export OBJ_SECRET_KEY=${OBJ_SECRET_KEY:-minioadmin}
+export OBJ_ENDPOINT=${OBJ_ENDPOINT:-http://127.0.0.1:9000}
+export OBJ_VIRTUAL_ADDRESSING=${OBJ_VIRTUAL_ADDRESSING:-0}
+export NIXL_LOG_LEVEL=${NIXL_LOG_LEVEL:-WARN}
+exec "$HOME/.local/bin/nixlbench" \
+  --etcd-endpoints "$ETCD" \
+  --backend OBJ \
+  --obj_bucket_name "$OBJ_BUCKET_NAME" \
+  --obj_scheme "$OBJ_SCHEME" \
+  --obj_region "$OBJ_REGION" \
+  --obj_access_key "$OBJ_ACCESS_KEY" \
+  --obj_secret_key "$OBJ_SECRET_KEY" \
+  --obj_endpoint_override "$OBJ_ENDPOINT" \
+  --obj_use_virtual_addressing "$OBJ_VIRTUAL_ADDRESSING" \
+  --num_iter "$NITER" --warmup_iter "$WARM" \
+  --num_threads "$NTH"
+LOCALOBJ
+
+# 3) Two-host over OFI/TCP
+#    Usage (on BOTH hosts): ETCD_IP=<host-running-etcd> nixlbench-2host-tcp.sh
+COPY <<'OFITCP' $HOME/.local/bin/nixlbench-2host-tcp.sh
+#!/usr/bin/env bash
+set -euo pipefail
+: "${ETCD_IP:?Set ETCD_IP to the host running etcd on port 2379}"
+export ETCD="http://${ETCD_IP}:2379"
+export START=${START:-4096}
+export MAX=${MAX:-67108864}
+export NITER=${NITER:-1000}
+export WARM=${WARM:-100}
+unset FI_PROVIDER FI_TCP_IFACE || true
+export FI_PROVIDER=tcp
+export FI_TCP_IFACE=${FI_TCP_IFACE:-}
+exec "$HOME/.local/bin/nixlbench" \
+  --etcd-endpoints "$ETCD" \
+  --backend OFI \
+  --initiator_seg_type DRAM --target_seg_type DRAM \
+  --scheme pairwise --mode SG --op_type WRITE \
+  --start_block_size "$START" --max_block_size "$MAX" \
+  --num_iter "$NITER" --warmup_iter "$WARM"
+OFITCP
+
+# 4) Two-host over OFI verbs;ofi_rxm (RDM)
+#    Usage (on BOTH hosts): ETCD_IP=<host-running-etcd> nixlbench-2host-rxm.sh
+COPY <<'OFIVERBS' $HOME/.local/bin/nixlbench-2host-rxm.sh
+#!/usr/bin/env bash
+set -euo pipefail
+: "${ETCD_IP:?Set ETCD_IP to the host running etcd on port 2379}"
+export ETCD="http://${ETCD_IP}:2379"
+export START=${START:-4096}
+export MAX=${MAX:-67108864}
+export NITER=${NITER:-1000}
+export WARM=${WARM:-100}
+# Force RXM layered over verbs (RDM endpoint)
+unset FI_PROVIDER || true
+export FI_PROVIDER="verbs;ofi_rxm"
+# Optional: select a specific HCA (uncomment and set as needed)
+# export FI_VERBS_DEVICE=mlx5_1
+exec "$HOME/.local/bin/nixlbench" \
+  --etcd-endpoints "$ETCD" \
+  --backend OFI \
+  --initiator_seg_type DRAM --target_seg_type DRAM \
+  --scheme pairwise --mode SG --op_type WRITE \
+  --start_block_size "$START" --max_block_size "$MAX" \
+  --num_iter "$NITER" --warmup_iter "$WARM"
+OFIVERBS
+
+RUN chmod +x $HOME/.local/bin/nixlbench-*.sh
+
+
+WORKDIR $HOME
+
+# Done

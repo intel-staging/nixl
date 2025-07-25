@@ -1,0 +1,133 @@
+# SPDX-License-Identifier: Apache-2.0
+# syntax=docker/dockerfile:1.4
+
+# Run as:
+# docker build --target bench . -t nixlbench -f Dockerfile.nixlbench \
+#    --cache-from nixl-base \
+#    --build-arg HTTP_PROXY=${http_proxy} \
+#    --build-arg HTTPS_PROXY=${https_proxy} 
+
+# Assumes:
+# nixl/ source tree exists in the current directory, and also libfabric/
+# exists in $(pwd) if build against a custom libfabric is desired 
+
+# Base image
+# FROM ubuntu:24.04 AS nixlbase
+FROM vault.habana.ai/gaudi-docker/1.21.2/ubuntu24.04/habanalabs/pytorch-installer-2.6.0 AS nixlbase
+
+# ——————————————————————————————————————————————————
+# Pre‐declare all ENVs so later `ENV foo=$foo…` works without linter errors
+ENV LD_LIBRARY_PATH="" \
+    PKG_CONFIG_PATH="" \
+    CMAKE_PREFIX_PATH="" \
+    CPLUS_INCLUDE_PATH="" \
+    C_INCLUDE_PATH="" \
+    LDFLAGS=""
+# ——————————————————————————————————————————————————
+
+ARG ARCH="x86_64"
+ARG DEFAULT_PYTHON_VERSION="3.12"
+ARG LIBFABRIC_REF="v1.20.1"
+ARG UCX_REF="v1.19.x"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV HOME=/root
+ENV PREFIX=$HOME/.local
+ENV PATH=$PREFIX/bin:$PATH
+ENV LD_LIBRARY_PATH=$PREFIX/lib:$PREFIX/lib64:$LD_LIBRARY_PATH
+
+# Core deps (no libfabric packages!)
+RUN apt-get update && apt-get install -y \
+    build-essential git cmake ninja-build \
+    autotools-dev automake libtool wget curl pkg-config \
+    pybind11-dev libclang-dev libgflags-dev \
+    libgrpc-dev libgrpc++-dev libprotobuf-dev \
+    libaio-dev liburing-dev protobuf-compiler-grpc \
+    libcpprest-dev etcd-client etcd-server \
+    libz-dev flex libgtest-dev libcurl4-openssl-dev \
+    libssl-dev uuid-dev zlib1g-dev libboost-all-dev \
+    libibverbs-dev rdma-core ibverbs-utils libibumad-dev \
+    librdmacm-dev ibverbs-providers meson \
+    python${DEFAULT_PYTHON_VERSION} python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+# 1) Build and install libfabric into $PREFIX
+COPY libfabric-*.tar.gz /workspace/
+WORKDIR /workspace
+RUN if ls libfabric-*.tar.gz 1> /dev/null 2>&1; then \
+      echo "Using vendored libfabric tarball"; \
+      tar xf libfabric-*.tar.gz && \
+      mv libfabric-*/ libfabric/; \
+    else \
+      echo "libfabric tarball not found. Cloning ${LIBFABRIC_REF}"; \
+      git clone https://github.com/ofiwg/libfabric.git; \
+      cd libfabric && git checkout ${LIBFABRIC_REF}; \
+    fi && \
+    cd /workspace/libfabric && \
+    ./autogen.sh && \
+    ./configure --prefix=$PREFIX --enable-verbs --enable-shm --enable-sockets --enable-tcp && \
+    make -j$(nproc) && make install && ldconfig
+
+# 2) Build and install UCX into $PREFIX
+WORKDIR /workspace
+RUN git clone https://github.com/openucx/ucx.git && \
+    cd ucx && git checkout ${UCX_REF} && \
+    ./autogen.sh && \
+    ./configure \
+      --prefix=$PREFIX \
+      --enable-shared \
+      --disable-static \
+      --disable-doxygen-doc \
+      --enable-optimizations \
+      --enable-cma \
+      --enable-devel-headers \
+      --with-verbs \
+      --enable-mt && \
+    make -j$(nproc) && make install && ldconfig
+
+# 3) Build and install etcd-cpp-apiv3 into $PREFIX
+WORKDIR /workspace
+RUN git clone https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git && \
+    cd etcd-cpp-apiv3 && mkdir build && cd build && \
+    cmake .. \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=$PREFIX \
+      -DCPPREST_INCLUDE_DIR=/usr/include \
+      -DCPPREST_LIB=/usr/lib/x86_64-linux-gnu/libcpprest.so \
+      -DGRPC_GRPC++_LIBRARY=/usr/lib/x86_64-linux-gnu/libgrpc++.so \
+      -DGRPC_LIBRARY=/usr/lib/x86_64-linux-gnu/libgrpc.so \
+      -DGPR_LIBRARY=/usr/lib/x86_64-linux-gnu/libgpr.so && \
+    make -j$(nproc) && make install && ldconfig
+
+# 4) AWS SDK (still goes to /usr/local)
+WORKDIR /workspace
+RUN git clone --recurse-submodules https://github.com/aws/aws-sdk-cpp.git --branch 1.11.581 && \
+    mkdir aws_sdk_build && cd aws_sdk_build && \
+    cmake ../aws-sdk-cpp \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_ONLY="s3" \
+      -DENABLE_TESTING=OFF \
+      -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    make -j$(nproc) && make install && ldconfig
+
+# 5) uv, Rust, and Python setup
+WORKDIR /workspace
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    RUST_VERSION=1.86.0 \
+    RUSTARCH=${ARCH}-unknown-linux-gnu
+
+RUN wget --tries=3 --waitretry=5 \
+      "https://static.rust-lang.org/rustup/archive/1.28.1/${RUSTARCH}/rustup-init" \
+      "https://static.rust-lang.org/rustup/archive/1.28.1/${RUSTARCH}/rustup-init.sha256" && \
+    sha256sum -c rustup-init.sha256 && \
+    chmod +x rustup-init && \
+    ./rustup-init -y --no-modify-path --profile minimal \
+      --default-toolchain $RUST_VERSION --default-host ${RUSTARCH} && \
+    rm rustup-init* && \
+    chmod -R a+w $RUSTUP_HOME $CARGO_HOME
+
+# Done
