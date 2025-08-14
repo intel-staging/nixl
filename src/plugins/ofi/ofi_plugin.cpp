@@ -26,7 +26,7 @@ namespace
     // create a new OFI backend engine instance
     static nixlBackendEngine *
     create_ofi_engine (const nixlBackendInitParams *init_params) {
-    return new nixlOFI_Engine (init_params);
+        return new nixlOFI_Engine (init_params);
     }
     
     static void
@@ -49,11 +49,6 @@ namespace
         nixl_b_params_t params;
         params["provider"] = "verbs";  // Default to verbs as per requirements
         params["eq_timeout_ms"] = "100";
-        params["fabric"] = "";  // Optional fabric name
-        params["domain"] = "";  // Optional domain name
-        params["roce_version"] = "2";  // RoCEv2 optimization
-        params["inline_threshold"] = "64";  // Inline send optimization
-        params["tx_queue_size"] = "256";  // TX queue size for performance
         return params;
     }
     
@@ -93,7 +88,7 @@ nixl_plugin_init() {
 // Plugin cleanup function
 extern "C" NIXL_PLUGIN_EXPORT void
 nixl_plugin_fini() {
-    // Cleanup any resources if needed
+    // Cleanup
 }
 
 #endif

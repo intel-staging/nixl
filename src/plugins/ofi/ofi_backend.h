@@ -92,6 +92,32 @@ private:
                                        bool& cuda_supported,
                                        bool& ze_supported,
                                        bool& synapseai_supported);
+    
+    // provider config based on fabtests test_configs
+    struct ProviderConfig {
+        std::string name;
+        enum fi_ep_type ep_type;
+        uint64_t caps;
+        uint64_t mode;
+        uint64_t mr_mode;
+        fi_resource_mgmt resource_mgmt;
+        struct fi_tx_attr tx_attr;
+        struct fi_rx_attr rx_attr;
+        uint32_t addr_format;
+        uint32_t data_progress;
+        uint32_t control_progress;
+    };
+    
+    static const ProviderConfig SUPPORTED_PROVIDERS[];
+    static const size_t NUM_SUPPORTED_PROVIDERS;
+    static const ProviderConfig* findProviderConfig(const std::string& provider_name);
+    
+    // parameter helpers
+    void getStringParam(const nixlBackendInitParams* init_params, const std::string& key, std::string& value);
+    void getLongParam(const nixlBackendInitParams* init_params, const std::string& key, long& value, long min_val, long max_val);
+    void getSizeTParam(const nixlBackendInitParams* init_params, const std::string& key, size_t& value);
+    
+    void configureHintsForProvider(struct fi_info* hints, const std::string& provider_name);
 
 public:
     nixlOFI_Engine(const nixlBackendInitParams* init_params);
@@ -131,6 +157,10 @@ public:
 
     nixl_status_t getConnInfo(std::string &conn_info) const override;
     nixl_status_t loadRemoteConnInfo(const std::string &remote_agent, const std::string &conn_info) override;
+    
+    nixl_status_t getPublicData(const nixlBackendMD* meta, std::string &str) const override;
+    nixl_status_t loadRemoteMD(const nixlBlobDesc &input, const nixl_mem_t &nixl_mem, 
+                               const std::string &remote_agent, nixlBackendMD* &output) override;
 };
 
 #endif
