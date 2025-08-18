@@ -24,7 +24,7 @@
 #include "ofi_backend.h"
 #include "common/nixl_log.h"
 
-class OFIBackendTest : public ::testing::Test {
+class OfiBackendTest : public ::testing::Test {
 protected:
     void SetUp() override {
         init_params.localAgent = "test_agent";
@@ -40,15 +40,15 @@ protected:
     std::map<std::string, std::string> custom_params;
 };
 
-TEST_F(OFIBackendTest, ConstructorBasic) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiBackendTest, ConstructorBasic) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
 
     // check if engine was created without initialization error
     EXPECT_NE(engine.get(), nullptr);
 }
 
-TEST_F(OFIBackendTest, SupportMethods) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiBackendTest, SupportMethods) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
 
     EXPECT_FALSE(engine->supportsNotif());
     EXPECT_TRUE(engine->supportsRemote());
@@ -56,44 +56,44 @@ TEST_F(OFIBackendTest, SupportMethods) {
     EXPECT_TRUE(engine->supportsProgTh());
 }
 
-TEST_F(OFIBackendTest, GetSupportedMems) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiBackendTest, GetSupportedMems) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
 
     nixl_mem_list_t mems = engine->getSupportedMems();
     EXPECT_FALSE(mems.empty());
     EXPECT_EQ(mems[0], DRAM_SEG);
 }
 
-TEST_F(OFIBackendTest, InvalidProvider) {
+TEST_F(OfiBackendTest, InvalidProvider) {
     custom_params["provider"] = "invalid_provider";
 
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
     EXPECT_NE(engine.get(), nullptr);
 }
 
-TEST_F(OFIBackendTest, CustomTimeout) {
+TEST_F(OfiBackendTest, CustomTimeout) {
     custom_params["eq_timeout_ms"] = "500";
 
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
     EXPECT_NE(engine.get(), nullptr);
 }
 
-TEST_F(OFIBackendTest, InvalidTimeout) {
+TEST_F(OfiBackendTest, InvalidTimeout) {
     custom_params["eq_timeout_ms"] = "invalid";
 
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
     EXPECT_NE(engine.get(), nullptr);
 }
 
-TEST_F(OFIBackendTest, TimeoutOutOfRange) {
+TEST_F(OfiBackendTest, TimeoutOutOfRange) {
     custom_params["eq_timeout_ms"] = "70000";
 
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
     EXPECT_NE(engine.get(), nullptr);
 }
 
-TEST_F(OFIBackendTest, GetConnInfo) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiBackendTest, GetConnInfo) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
     
     std::string conn_info;
     nixl_status_t status = engine->getConnInfo(conn_info);
@@ -102,8 +102,8 @@ TEST_F(OFIBackendTest, GetConnInfo) {
     EXPECT_FALSE(conn_info.empty());
 }
 
-TEST_F(OFIBackendTest, LoadRemoteConnInfo) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiBackendTest, LoadRemoteConnInfo) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
 
     std::string remote_agent = "remote_test_agent";
     std::string conn_info = "dummy_connection_info";
@@ -112,8 +112,8 @@ TEST_F(OFIBackendTest, LoadRemoteConnInfo) {
     EXPECT_EQ(status, NIXL_SUCCESS);
 }
 
-TEST_F(OFIBackendTest, ConnectWithoutRemoteInfo) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiBackendTest, ConnectWithoutRemoteInfo) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
 
     std::string remote_agent = "nonexistent_agent";
     nixl_status_t status = engine->connect(remote_agent);
@@ -121,8 +121,8 @@ TEST_F(OFIBackendTest, ConnectWithoutRemoteInfo) {
     EXPECT_EQ(status, NIXL_ERR_NOT_FOUND);
 }
 
-TEST_F(OFIBackendTest, DisconnectNonexistentAgent) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiBackendTest, DisconnectNonexistentAgent) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
 
     std::string remote_agent = "nonexistent_agent";
     nixl_status_t status = engine->disconnect(remote_agent);
@@ -130,8 +130,8 @@ TEST_F(OFIBackendTest, DisconnectNonexistentAgent) {
     EXPECT_EQ(status, NIXL_ERR_NOT_FOUND);
 }
 
-TEST_F(OFIBackendTest, RegisterMemoryDRAM) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiBackendTest, RegisterMemoryDRAM) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
 
     size_t buffer_size = 1024;
     void* buffer = malloc(buffer_size);
@@ -155,28 +155,28 @@ TEST_F(OFIBackendTest, RegisterMemoryDRAM) {
     free(buffer);
 }
 
-TEST_F(OFIBackendTest, DeregisterNullMetadata) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiBackendTest, DeregisterNullMetadata) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
     
     nixl_status_t status = engine->deregisterMem(nullptr);
     EXPECT_EQ(status, NIXL_ERR_INVALID_PARAM);
 }
 
-TEST_F(OFIBackendTest, CheckXferWithNullHandle) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiBackendTest, CheckXferWithNullHandle) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
     
     nixl_status_t status = engine->checkXfer(nullptr);
     EXPECT_EQ(status, NIXL_ERR_INVALID_PARAM);
 }
 
-TEST_F(OFIBackendTest, ReleaseReqHWithNullHandle) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiBackendTest, ReleaseReqHWithNullHandle) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
     
     nixl_status_t status = engine->releaseReqH(nullptr);
     EXPECT_EQ(status, NIXL_ERR_INVALID_PARAM);
 }
 
-class OFISHMProviderTest : public ::testing::Test {
+class OfiShmProviderTest : public ::testing::Test {
 protected:
     void SetUp() override {
         init_params.localAgent = "shm_test_agent";
@@ -192,13 +192,13 @@ protected:
     std::map<std::string, std::string> custom_params;
 };
 
-TEST_F(OFISHMProviderTest, SHMProviderDetection) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiShmProviderTest, SHMProviderDetection) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
     EXPECT_NE(engine.get(), nullptr);
 }
 
-TEST_F(OFISHMProviderTest, SHMConnectionlessConnect) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiShmProviderTest, SHMConnectionlessConnect) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
 
     std::string remote_agent = "shm_remote_agent";
     std::string conn_info = "dummy_shm_address";
@@ -210,8 +210,8 @@ TEST_F(OFISHMProviderTest, SHMConnectionlessConnect) {
     EXPECT_TRUE(status == NIXL_SUCCESS || status == NIXL_ERR_BACKEND);
 }
 
-TEST_F(OFISHMProviderTest, SHMConnectionlessDisconnect) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiShmProviderTest, SHMConnectionlessDisconnect) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
 
     std::string remote_agent = "nonexistent_shm_agent";
     nixl_status_t status = engine->disconnect(remote_agent);
@@ -219,8 +219,8 @@ TEST_F(OFISHMProviderTest, SHMConnectionlessDisconnect) {
     EXPECT_EQ(status, NIXL_ERR_NOT_FOUND);
 }
 
-TEST_F(OFISHMProviderTest, SHMSupportMethods) {
-    std::unique_ptr<nixlOFI_Engine> engine(new nixlOFI_Engine(&init_params));
+TEST_F(OfiShmProviderTest, SHMSupportMethods) {
+    std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
 
     EXPECT_FALSE(engine->supportsNotif());
     EXPECT_TRUE(engine->supportsRemote());
@@ -228,38 +228,38 @@ TEST_F(OFISHMProviderTest, SHMSupportMethods) {
     EXPECT_TRUE(engine->supportsProgTh());
 }
 
-class OFIMetadataTest : public ::testing::Test {
+class OfiMetadataTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        metadata = new nixlOFI_Metadata();
+        metadata = new nixlOfiMetadata();
     }
 
     void TearDown() override {
         delete metadata;
     }
 
-    nixlOFI_Metadata* metadata;
+    nixlOfiMetadata* metadata;
 };
 
-TEST_F(OFIMetadataTest, DefaultConstructor) {
+TEST_F(OfiMetadataTest, DefaultConstructor) {
     EXPECT_EQ(metadata->mr, nullptr);
     EXPECT_EQ(metadata->desc, nullptr);
 }
 
-class OFIRequestTest : public ::testing::Test {
+class OfiRequestTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        request = new nixlOFI_Request();
+        request = new nixlOfiRequest();
     }
 
     void TearDown() override {
         delete request;
     }
 
-    nixlOFI_Request* request;
+    nixlOfiRequest* request;
 };
 
-TEST_F(OFIRequestTest, DefaultConstructor) {
+TEST_F(OfiRequestTest, DefaultConstructor) {
     EXPECT_EQ(request->cq, nullptr);
     EXPECT_EQ(request->wr_id, 0);
 }

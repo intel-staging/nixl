@@ -36,93 +36,31 @@
 #include <thread>
 #include <atomic>
 
-class nixlOFI_Metadata : public nixlBackendMD {
+class nixlOfiMetadata : public nixlBackendMD {
 public:
     fid_mr *mr;
     void *desc;
 
-    nixlOFI_Metadata() : nixlBackendMD(false), mr(nullptr), desc(nullptr) { }
-    ~nixlOFI_Metadata() { }
+    nixlOfiMetadata() : nixlBackendMD(false), mr(nullptr), desc(nullptr) { }
+    ~nixlOfiMetadata() { }
 };
 
-class nixlOFI_Request : public nixlBackendReqH {
+class nixlOfiRequest : public nixlBackendReqH {
 public:
     fid_cq *cq;
     uint64_t wr_id;
 
-    nixlOFI_Request() : cq(nullptr), wr_id(0) { }
-    ~nixlOFI_Request() { }
+    nixlOfiRequest() : cq(nullptr), wr_id(0) { }
+    ~nixlOfiRequest() { }
 };
 
-class nixlOFI_Engine : public nixlBackendEngine {
-private:
-    fid_fabric *fabric;
-    fid_domain *domain;
-    fid_ep *ep;
-    fid_cq *cq;
-    fid_eq *eq;
-    fid_pep *pep;
-    struct fi_info *fi;
-
-    std::string provider_name;
-    struct fi_info *cached_provider_info;
-    std::string local_addr;
-    std::map<std::string, std::string> remote_addrs;
-    std::map<std::string, fid_ep *> connected_eps;
-    std::map<std::string, fi_addr_t> shm_addrs;
-    fid_av *av;
-    mutable std::mutex ep_lock;
-    bool is_connectionless;
-
-    std::thread eq_thread;
-    std::atomic<bool> eq_thread_stop;
-    long eq_timeout_ms;
-    bool hmem_ze_supported;
-    bool hmem_cuda_supported;
-    bool hmem_synapseai_supported;
-
-    std::string local_agent_name;
-
-    void eq_event_loop();
-    bool isConnectionlessProvider() const;
-    nixl_status_t setupEndpoint(bool connection_oriented);
-    static nixl_status_t getEndpointAddress(fid_ep* endpoint, std::string& address);
-    static void detectHmemCapabilities(struct fi_info* fi_info,
-                                       const std::string& provider_name,
-                                       bool& cuda_supported,
-                                       bool& ze_supported,
-                                       bool& synapseai_supported);
-    
-    // provider config based on fabtests test_configs
-    struct ProviderConfig {
-        std::string name;
-        enum fi_ep_type ep_type;
-        uint64_t caps;
-        uint64_t mode;
-        uint64_t mr_mode;
-        fi_resource_mgmt resource_mgmt;
-        struct fi_tx_attr tx_attr;
-        struct fi_rx_attr rx_attr;
-        uint32_t addr_format;
-        uint32_t data_progress;
-        uint32_t control_progress;
-    };
-    
-    static const ProviderConfig SUPPORTED_PROVIDERS[];
-    static const size_t NUM_SUPPORTED_PROVIDERS;
-    static const ProviderConfig* findProviderConfig(const std::string& provider_name);
-    
-    // parameter helpers
-    void getStringParam(const nixlBackendInitParams* init_params, const std::string& key, std::string& value);
-    void getLongParam(const nixlBackendInitParams* init_params, const std::string& key, long& value, long min_val, long max_val);
-    void getSizeTParam(const nixlBackendInitParams* init_params, const std::string& key, size_t& value);
-    
-    void configureHintsForProvider(struct fi_info* hints, const std::string& provider_name);
-
+class nixlOfiEngine : public nixlBackendEngine {
 public:
-    nixlOFI_Engine(const nixlBackendInitParams* init_params);
-    ~nixlOFI_Engine();
+    // constructors and destructor
+    nixlOfiEngine(const nixlBackendInitParams* init_params);
+    ~nixlOfiEngine();
 
+    // member functions
     bool supportsNotif() const override;
     bool supportsRemote() const override;
     bool supportsLocal() const override;
@@ -161,6 +99,73 @@ public:
     nixl_status_t getPublicData(const nixlBackendMD* meta, std::string &str) const override;
     nixl_status_t loadRemoteMD(const nixlBlobDesc &input, const nixl_mem_t &nixl_mem, 
                                const std::string &remote_agent, nixlBackendMD* &output) override;
+
+private:
+    // type definitions and nested classes
+    struct ProviderConfig {
+        std::string name;
+        enum fi_ep_type ep_type;
+        uint64_t caps;
+        uint64_t mode;
+        uint64_t mr_mode;
+        fi_resource_mgmt resource_mgmt;
+        struct fi_tx_attr tx_attr;
+        struct fi_rx_attr rx_attr;
+        uint32_t addr_format;
+        enum fi_progress data_progress;
+        enum fi_progress control_progress;
+    };
+    
+    // static member variables
+    static const ProviderConfig SUPPORTED_PROVIDERS[];
+    static const size_t NUM_SUPPORTED_PROVIDERS;
+
+    // member functions
+    void eq_event_loop();
+    bool isConnectionlessProvider() const;
+    nixl_status_t setupEndpoint(bool connection_oriented);
+    static nixl_status_t getEndpointAddress(fid_ep* endpoint, std::string& address);
+    static void detectHmemCapabilities(struct fi_info* fi_info,
+                                       const std::string& provider_name,
+                                       bool& cuda_supported,
+                                       bool& ze_supported,
+                                       bool& synapseai_supported);
+    static const ProviderConfig* findProviderConfig(const std::string& provider_name);
+    
+    // parameter helpers
+    void getStringParam(const nixlBackendInitParams* init_params, const std::string& key, std::string& value);
+    void getLongParam(const nixlBackendInitParams* init_params, const std::string& key, long& value, long min_val, long max_val);
+    void getSizeTParam(const nixlBackendInitParams* init_params, const std::string& key, size_t& value);
+    
+    void configureHintsForProvider(struct fi_info* hints, const std::string& provider_name);
+
+    // data members
+    fid_fabric *fabric_;
+    fid_domain *domain_;
+    fid_ep *ep_;
+    fid_cq *cq_;
+    fid_eq *eq_;
+    fid_pep *pep_;
+    struct fi_info *fi_;
+
+    std::string providerName_;
+    struct fi_info *cachedProviderInfo_;
+    std::string localAddr_;
+    std::map<std::string, std::string> remoteAddrs_;
+    std::map<std::string, fid_ep *> connectedEps_;
+    std::map<std::string, fi_addr_t> shmAddrs_;
+    fid_av *av_;
+    mutable std::mutex epLock_;
+    bool isConnectionless_;
+
+    std::thread eqThread_;
+    std::atomic<bool> eqThreadStop_;
+    long eqTimeoutMs_;
+    bool hmemZeSupported_;
+    bool hmemCudaSupported_;
+    bool hmemSynapseaiSupported_;
+
+    std::string localAgentName_;
 };
 
 #endif

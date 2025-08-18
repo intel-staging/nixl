@@ -26,7 +26,7 @@ namespace
     // create a new OFI backend engine instance
     static nixlBackendEngine *
     create_ofi_engine (const nixlBackendInitParams *init_params) {
-        return new nixlOFI_Engine (init_params);
+        return new nixlOfiEngine (init_params);
     }
     
     static void
@@ -73,7 +73,7 @@ namespace
 #ifdef STATIC_PLUGIN_OFI
 
 nixlBackendPlugin *
-createStaticOFIPlugin() {
+createStaticOfiPlugin() {
     return &plugin; // Return the static plugin instance
 }
 
