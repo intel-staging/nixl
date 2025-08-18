@@ -35,6 +35,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
 
 class nixlOfiMetadata : public nixlBackendMD {
 public:
@@ -160,6 +161,9 @@ private:
 
     std::thread eqThread_;
     std::atomic<bool> eqThreadStop_;
+    std::atomic<bool> eqThreadPaused_;
+    std::mutex eqPauseMutex_;
+    std::condition_variable eqPauseCV_;
     long eqTimeoutMs_;
     bool hmemZeSupported_;
     bool hmemCudaSupported_;

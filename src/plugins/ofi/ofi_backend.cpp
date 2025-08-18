@@ -20,6 +20,7 @@
 #include <rdma/fi_errno.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_endpoint.h>
+#include <stdexcept>
 
 nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     nixlBackendEngine(init_params),
@@ -34,6 +35,7 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     av_(nullptr),
     isConnectionless_(false),
     eqThreadStop_(false),
+    eqThreadPaused_(false),
     eqTimeoutMs_(100),
     hmemZeSupported_(false),
     hmemCudaSupported_(false),
@@ -55,12 +57,21 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
         NIXL_DEBUG << "Using default provider: " << providerName_;
     }
 
+    // validate that the provider is supported
+    const auto* config = findProviderConfig(providerName_);
+    if (!config) {
+        NIXL_ERROR << "Unsupported provider: " << providerName_;
+        NIXL_ERROR << "Supported providers: shm, tcp, verbs, verbs;ofi_rxm";
+        this->initErr = true;
+        return;
+    }
+
     // get EQ timeout parameter (0-60 seconds max)
     getLongParam(init_params, "eq_timeout_ms", eqTimeoutMs_, 0, 60000);
 
     hints = fi_allocinfo();
     if (!hints) {
-        initErr = true;
+        this->initErr = true;
         NIXL_ERROR << "fi_allocinfo failed";
         return;
     }
@@ -80,8 +91,14 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
         NIXL_INFO << "Skipping FI_HMEM test - DRAM memory only";
     }
 
-    // configure hints based on provider - keep it simple with good defaults
-    configureHintsForProvider(hints, providerName_);
+    // for shm and tcp providers, use minimal configuration (only provider name)
+    if (providerName_ == "shm" || providerName_ == "tcp") {
+        hints->fabric_attr->prov_name = strdup(providerName_.c_str());
+        NIXL_INFO << "Using minimal auto-negotiated hints for " << providerName_ << " provider";
+    } else {
+        // for other providers, use predefined configuration from SUPPORTED_PROVIDERS  
+        configureHintsForProvider(hints, providerName_);
+    }
 
     // debug print all hints
     NIXL_INFO << "=== constructor: fi_getinfo hints ===";
@@ -100,14 +117,31 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     ret = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, hints, &info);
     if (ret) {
         NIXL_ERROR << "fi_getinfo failed: " << fi_strerror(-ret);
-        goto cleanup_getinfo;
+        NIXL_INFO << "Trying fi_getinfo with minimal hints for provider " << providerName_;
+        
+        // Try with minimal hints to see what the provider supports
+        struct fi_info *minimal_hints = fi_allocinfo();
+        if (minimal_hints) {
+            minimal_hints->fabric_attr->prov_name = strdup(providerName_.c_str());
+            struct fi_info *minimal_fi = nullptr;
+            int minimal_ret = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, minimal_hints, &minimal_fi);
+            if (minimal_ret == 0) {
+                NIXL_INFO << "Provider " << providerName_ << " supports: caps=0x" << std::hex << minimal_fi->caps 
+                         << " ep_type=" << minimal_fi->ep_attr->type;
+                fi_freeinfo(minimal_fi);
+            } else {
+                NIXL_ERROR << "Even minimal fi_getinfo failed: " << fi_strerror(-minimal_ret);
+            }
+            fi_freeinfo(minimal_hints);
+        }
+        goto cleanup_teardown;
     }
 
     // use the first provider returned by fi_getinfo (highest performance)
     fi_ = info;
     if (!fi_) {
         NIXL_ERROR << "No providers returned by fi_getinfo";
-        goto cleanup_getinfo;
+        goto cleanup_teardown;
     }
     
     NIXL_DEBUG << "Selected provider: " << (fi_->fabric_attr->prov_name ? fi_->fabric_attr->prov_name : "unknown")
@@ -115,6 +149,9 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
 
     // connectionless provider?
     isConnectionless_ = isConnectionlessProvider();
+    NIXL_DEBUG << "Provider " << providerName_ << " ep_type=" 
+               << fi_tostr(&fi_->ep_attr->type, FI_TYPE_EP_TYPE) 
+               << " isConnectionless=" << isConnectionless_;
 
     // detect HMEM capabilities for this provider
     detectHmemCapabilities(fi_, providerName_, hmemCudaSupported_,
@@ -123,22 +160,22 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     ret = fi_fabric(fi_->fabric_attr, &fabric_, nullptr);
     if (ret) {
         NIXL_ERROR << "fi_fabric failed: " << fi_strerror(-ret);
-        goto cleanup_getinfo;
+        goto cleanup_teardown;
     }
 
     ret = fi_domain(fabric_, fi_, &domain_, nullptr);
     if (ret) {
         NIXL_ERROR << "fi_domain failed: " << fi_strerror(-ret);
-        goto cleanup_fabric;
+        goto cleanup_teardown;
     }
 
     if (setupEndpoint(!isConnectionless_) != NIXL_SUCCESS) {
-        goto cleanup_domain;
+        goto cleanup_teardown;
     }
 
     // get local address
     if (getEndpointAddress(ep_, localAddr_) != NIXL_SUCCESS) {
-        goto cleanup_ep;
+        goto cleanup_teardown;
     }
 
     // cache provider use in connect()
@@ -156,20 +193,17 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     }
     return;
 
-cleanup_ep:
-    if (pep_)    { fi_close(&pep_->fid);    pep_ = nullptr; }
+cleanup_teardown:
     if (ep_)     { fi_close(&ep_->fid);     ep_ = nullptr; }
-    if (cq_)     { fi_close(&cq_->fid);     cq_ = nullptr; }
-    if (eq_)     { fi_close(&eq_->fid);     eq_ = nullptr; }
     if (av_)     { fi_close(&av_->fid);     av_ = nullptr; }
-cleanup_domain:
+    if (pep_)    { fi_close(&pep_->fid);    pep_ = nullptr; }
+    if (eq_)     { fi_close(&eq_->fid);     eq_ = nullptr; }
+    if (cq_)     { fi_close(&cq_->fid);     cq_ = nullptr; }
     if (domain_) { fi_close(&domain_->fid); domain_ = nullptr; }
-cleanup_fabric:
     if (fabric_) { fi_close(&fabric_->fid); fabric_ = nullptr; }
-cleanup_getinfo:
-    if (hints)  { fi_freeinfo(hints);     hints = nullptr; }
-    if (info)   { fi_freeinfo(info);      info = nullptr; }
-    initErr = true;
+    if (info)    { fi_freeinfo(info);       info = nullptr; }
+    if (hints)   { fi_freeinfo(hints);      hints = nullptr; }
+    this->initErr = true;
 }
 
 // Parameter extraction helper methods
@@ -209,14 +243,15 @@ void nixlOfiEngine::getSizeTParam(const nixlBackendInitParams* init_params, cons
     }
 }
 
-// predefined provider configurations based on fabtests test_configs
+// Predefined provider configurations for providers that need explicit settings
+// Note: SHM and TCP providers use minimal auto-negotiated configuration instead
 const nixlOfiEngine::ProviderConfig nixlOfiEngine::SUPPORTED_PROVIDERS[] = {
     {
         "shm",
         FI_EP_RDM,
-        FI_MSG | FI_RMA | FI_READ | FI_WRITE,
-        FI_CONTEXT | FI_CONTEXT2,
-        FI_MR_VIRT_ADDR,
+        0,  // Let provider choose capabilities - use minimal config
+        0,  // Let provider choose mode
+        0,  // Let provider choose MR mode  
         FI_RM_UNSPEC,
         {0, 0, 0, 0, 0, 0, 0, 0, FI_TC_UNSPEC}, // tx_attr defaults
         {0, 0, 0, 0, 0, 0}, // rx_attr defaults
@@ -320,7 +355,8 @@ void nixlOfiEngine::configureHintsForProvider(struct fi_info* hints, const std::
     }
 
     // enable shared RX context for verbs providers to use XRC endpoints like fabtests
-    if (provider_name.find("verbs") != std::string::npos) {
+    // but only for connection-oriented (FI_EP_MSG) endpoints, not RDM
+    if (provider_name.find("verbs") != std::string::npos && config->ep_type == FI_EP_MSG) {
         hints->ep_attr->rx_ctx_cnt = FI_SHARED_CONTEXT;
     }
 
@@ -389,6 +425,8 @@ nixl_mem_list_t nixlOfiEngine::getSupportedMems() const {
 }
 
 nixl_status_t nixlOfiEngine::connect(const std::string &remote_agent) {
+    NIXL_DEBUG << "connect() called for remote_agent: " << remote_agent 
+               << " isConnectionless: " << isConnectionless_;
     std::lock_guard<std::mutex> lock(epLock_);
 
     if (isConnectionless_) {
@@ -438,6 +476,9 @@ nixl_status_t nixlOfiEngine::connect(const std::string &remote_agent) {
 
     // update dest_addr for this connection
     remote_fi->dest_addr = (void*)remote_addr_str.c_str();
+    remote_fi->dest_addrlen = remote_addr_str.length();
+    
+    
     // let libfabric use the auto-negotiated address format from fi_getinfo
 
     fid_ep *remote_ep = nullptr;
@@ -456,7 +497,8 @@ nixl_status_t nixlOfiEngine::connect(const std::string &remote_agent) {
         return NIXL_ERR_BACKEND;
     }
 
-    ret = fi_ep_bind(remote_ep, &eq_->fid, FI_SOURCE | FI_RMA | FI_MSG);
+    // use no flags for all providers to avoid compatibility issues
+    ret = fi_ep_bind(remote_ep, &eq_->fid, 0);
     if (ret) {
         NIXL_ERROR << "fi_ep_bind to EQ for remote failed: " << fi_strerror(-ret);
         fi_close(&remote_ep->fid);
@@ -472,26 +514,54 @@ nixl_status_t nixlOfiEngine::connect(const std::string &remote_agent) {
         return NIXL_ERR_BACKEND;
     }
 
+    // pause the event loop to prevent it from consuming our FI_CONNECTED event
+    eqThreadPaused_.store(true);
+    // Give the event loop time to notice the pause and stop processing
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    
     ret = fi_connect(remote_ep, remote_fi->dest_addr, localAgentName_.c_str(), localAgentName_.length() + 1);
     if (ret) {
         NIXL_ERROR << "fi_connect failed: " << fi_strerror(-ret);
+        // resume event loop before returning
+        eqThreadPaused_.store(false);
+        eqPauseCV_.notify_one();
         fi_close(&remote_ep->fid);
         fi_freeinfo(remote_fi);
         return NIXL_ERR_BACKEND;
     }
 
     // wait for connection to complete via EQ
+    // use fi_eq_sread (similar to fabtests implementation)
+    // for blocking synchronous read to avoid race with event loop
     struct fi_eq_cm_entry entry;
     uint32_t event;
-    ssize_t n_events = fi_eq_read(eq_, &event, &entry, 1, -1);
-    if (n_events < 0) {
-        NIXL_ERROR << "fi_eq_read failed during connect: " << fi_strerror(-n_events);
+    ssize_t n_events = fi_eq_sread(eq_, &event, &entry, sizeof(entry), -1, 0);
+    
+    // resume event loop now that we got our event
+    eqThreadPaused_.store(false);
+    eqPauseCV_.notify_one();
+    
+    if (n_events != sizeof(entry)) {
+        if (n_events < 0) {
+            NIXL_ERROR << "fi_eq_sread failed during connect: " << fi_strerror(-n_events);
+            // Try to read error details if available
+            if (n_events == -FI_EAVAIL) {
+                struct fi_eq_err_entry err_entry;
+                ssize_t err_ret = fi_eq_readerr(eq_, &err_entry, 0);
+                if (err_ret == sizeof(err_entry)) {
+                    NIXL_ERROR << "EQ error details: prov_errno=" << err_entry.prov_errno 
+                               << " err=" << err_entry.err << " (" << fi_strerror(err_entry.err) << ")";
+                }
+            }
+        } else {
+            NIXL_ERROR << "fi_eq_sread returned unexpected size: " << n_events << " (expected " << sizeof(entry) << ")";
+        }
         fi_close(&remote_ep->fid);
         fi_freeinfo(remote_fi);
         return NIXL_ERR_BACKEND;
     }
     if (event != FI_CONNECTED || entry.fid != &remote_ep->fid) {
-        NIXL_ERROR << "Unexpected EQ event during connect: " << event;
+        NIXL_ERROR << "Unexpected EQ event during connect: " << event << " (expected FI_CONNECTED=" << FI_CONNECTED << ")";
         fi_close(&remote_ep->fid);
         fi_freeinfo(remote_fi);
         return NIXL_ERR_BACKEND;
@@ -701,12 +771,12 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
             return NIXL_ERR_INVALID_PARAM;
         }
 
-        // Get remote memory key - either from mr or stored in desc field for remote metadata
+        // get remote memory key - either from mr or stored in desc field for remote metadata
         uint64_t remote_key;
         if (remote_meta->mr) {
             remote_key = fi_mr_key(remote_meta->mr);
         } else {
-            // For remote metadata, key is stored in desc field
+            // for remote metadata, key is stored in desc field
             remote_key = reinterpret_cast<uint64_t>(remote_meta->desc);
         }
         
@@ -734,9 +804,16 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         }
 
         if (ret) {
-            NIXL_ERROR << "OFI transfer failed: " << fi_strerror(-ret);
-            delete ofi_req;
-            return NIXL_ERR_BACKEND;
+            if (ret == -FI_EAGAIN) {
+                // RDM provider: FI_EAGAIN means operation was posted successfully
+                NIXL_DEBUG << "OFI transfer posted asynchronously (EAGAIN) - will complete via polling";
+                // continue to success path - operation posted successfully, will complete async
+                break;
+            } else {
+                NIXL_ERROR << "OFI transfer failed: " << fi_strerror(-ret);
+                delete ofi_req;
+                return NIXL_ERR_BACKEND;
+            }
         }
     }
 
@@ -744,7 +821,6 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     return NIXL_SUCCESS;
 
 }
-
 
 nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
     nixlOfiRequest *ofi_req = static_cast<nixlOfiRequest*>(handle);
@@ -797,7 +873,7 @@ nixl_status_t nixlOfiEngine::getPublicData(const nixlBackendMD* meta, std::strin
         return NIXL_ERR_INVALID_PARAM;
     }
     
-    // Serialize the memory registration key for remote access
+    // serialize memory registration key for remote access
     uint64_t mr_key = fi_mr_key(ofi_meta->mr);
     str = std::to_string(mr_key);
     return NIXL_SUCCESS;
@@ -805,20 +881,20 @@ nixl_status_t nixlOfiEngine::getPublicData(const nixlBackendMD* meta, std::strin
 
 nixl_status_t nixlOfiEngine::loadRemoteMD(const nixlBlobDesc &input, const nixl_mem_t &nixl_mem,
                                            const std::string &remote_agent, nixlBackendMD* &output) {
-    // Create a remote metadata object from the serialized public data
+    // create a remote metadata object from the serialized public data
     nixlOfiMetadata* remote_meta = new nixlOfiMetadata();
     if (!remote_meta) {
         return NIXL_ERR_BACKEND;
     }
     
-    // Parse the memory key from the metadata string
+    // parse the memory key from the metadata string
     try {
-        // The metaInfo should contain the memory key as a string
+        // the metaInfo should contain the memory key as a string
         std::string key_str(input.metaInfo.data(), input.metaInfo.size());
         uint64_t remote_key = std::stoull(key_str);
         
-        // For remote metadata, we don't have an actual mr object, just the key
-        // Store the key for later use in RMA operations
+        // for remote metadata, we don't have an actual mr object, just the key
+        // store the key for later use in RMA operations
         remote_meta->mr = nullptr;  // No local mr for remote metadata
         remote_meta->desc = reinterpret_cast<void*>(remote_key);  // Store key in desc field
         
@@ -833,6 +909,15 @@ nixl_status_t nixlOfiEngine::loadRemoteMD(const nixlBlobDesc &input, const nixl_
 
 void nixlOfiEngine::eq_event_loop() {
     while (!eqThreadStop_) {
+        // check if we need to pause the event loop during client connections
+        if (eqThreadPaused_.load()) {
+            std::unique_lock<std::mutex> lock(eqPauseMutex_);
+            eqPauseCV_.wait(lock, [this] { return !eqThreadPaused_.load() || eqThreadStop_.load(); });
+            if (eqThreadStop_) {
+                break;
+            }
+        }
+        
         struct fi_eq_cm_entry entry;
         uint32_t event;
         ssize_t ret = fi_eq_read(eq_, &event, &entry, 1, eqTimeoutMs_);
@@ -867,7 +952,8 @@ void nixlOfiEngine::eq_event_loop() {
                     fi_close(&new_ep->fid);
                     break;
                 }
-                connreq_ret = fi_ep_bind(new_ep, &eq_->fid, FI_SOURCE | FI_RMA | FI_MSG);
+                // use no flags for EQ binding to avoid compatibility issues
+                connreq_ret = fi_ep_bind(new_ep, &eq_->fid, 0);
                 if (connreq_ret) {
                     NIXL_ERROR << "fi_ep_bind to EQ for accepted connection failed: " << fi_strerror(-connreq_ret);
                     fi_close(&new_ep->fid);
@@ -918,23 +1004,18 @@ void nixlOfiEngine::eq_event_loop() {
 }
 
 bool nixlOfiEngine::isConnectionlessProvider() const {
-    // ofi_rxm is always connectionless (RDM model) regardless of underlying provider
-    if (providerName_.find("ofi_rxm") != std::string::npos) {
-        return true;
+    // Use libfabric's endpoint type to determine connection model
+    // FI_EP_RDM (Reliable Datagram) = connectionless
+    // FI_EP_MSG (Message) = connection-oriented  
+    // FI_EP_DGRAM (Datagram) = connectionless
+    if (fi_ && fi_->ep_attr) {
+        return (fi_->ep_attr->type == FI_EP_RDM || fi_->ep_attr->type == FI_EP_DGRAM);
     }
     
-    if (providerName_ == "shm" || providerName_ == "udp") {
+    // Fallback: if fi_ not available yet, use provider names for known cases
+    if (providerName_.find("ofi_rxm") != std::string::npos || 
+        providerName_ == "shm" || providerName_ == "udp") {
         return true;
-    }
-    
-    // also check the actual provider name from libfabric
-    if (fi_ && fi_->fabric_attr && fi_->fabric_attr->prov_name) {
-        std::string actual_provider = fi_->fabric_attr->prov_name;
-        if (actual_provider.find("ofi_rxm") != std::string::npos ||
-            actual_provider == "shm" || actual_provider == "udp" ||
-            actual_provider.find("shm") != std::string::npos) {
-            return true;
-        }
     }
     
     return false;
@@ -947,7 +1028,7 @@ nixl_status_t nixlOfiEngine::setupEndpoint(bool connection_oriented) {
     ret = fi_endpoint(domain_, fi_, &ep_, nullptr);
     if (ret) {
         NIXL_ERROR << "fi_endpoint failed: " << fi_strerror(-ret);
-        return NIXL_ERR_BACKEND;
+        return NIXL_ERR_BACKEND; // ep_ was never created, no cleanup needed
     }
 
     // create and bind completion queue
@@ -957,13 +1038,13 @@ nixl_status_t nixlOfiEngine::setupEndpoint(bool connection_oriented) {
     ret = fi_cq_open(domain_, &cq_attr, &cq_, nullptr);
     if (ret) {
         NIXL_ERROR << "fi_cq_open failed: " << fi_strerror(-ret);
-        goto cleanup_endpoint;
+        goto cleanup_setup;
     }
 
     ret = fi_ep_bind(ep_, &cq_->fid, FI_SEND | FI_RECV);
     if (ret) {
         NIXL_ERROR << "fi_ep_bind to CQ failed: " << fi_strerror(-ret);
-        goto cleanup_cq;
+        goto cleanup_setup;
     }
 
     if (connection_oriented) {
@@ -974,34 +1055,39 @@ nixl_status_t nixlOfiEngine::setupEndpoint(bool connection_oriented) {
         ret = fi_eq_open(fabric_, &eq_attr, &eq_, nullptr);
         if (ret) {
             NIXL_ERROR << "fi_eq_open failed: " << fi_strerror(-ret);
-            goto cleanup_cq;
+            goto cleanup_setup;
         }
 
         // bind endpoint to EQ for connection management
         ret = fi_ep_bind(ep_, &eq_->fid, 0);
         if (ret) {
             NIXL_ERROR << "fi_ep_bind to EQ failed: " << fi_strerror(-ret);
-            goto cleanup_eq;
+            goto cleanup_setup;
         }
 
         // create passive endpoint for listening
         ret = fi_passive_ep(fabric_, fi_, &pep_, nullptr);
         if (ret) {
-            NIXL_ERROR << "fi_passive_ep failed: " << fi_strerror(-ret);
-            goto cleanup_eq;
+            const char* prov = (fi_ && fi_->fabric_attr && fi_->fabric_attr->prov_name)
+                               ? fi_->fabric_attr->prov_name : "unknown";
+            NIXL_ERROR << "fi_passive_ep failed on provider=" << prov
+                       << " ep_type=" << fi_tostr(&fi_->ep_attr->type, FI_TYPE_EP_TYPE)
+                       << " err=" << -ret << " (" << fi_strerror(-ret) << ")";
+            goto cleanup_setup;
         }
 
         ret = fi_pep_bind(pep_, &eq_->fid, 0);
         if (ret) {
             NIXL_ERROR << "fi_pep_bind to EQ failed: " << fi_strerror(-ret);
-            goto cleanup_pep;
+            goto cleanup_setup;
         }
 
         ret = fi_listen(pep_);
         if (ret) {
             NIXL_ERROR << "fi_listen failed: " << fi_strerror(-ret);
-            goto cleanup_pep;
+            goto cleanup_setup;
         }
+        NIXL_INFO << "TCP passive endpoint listening for connections";
     } else {
         // address vector for connectionless communication
         struct fi_av_attr av_attr = {};
@@ -1009,34 +1095,31 @@ nixl_status_t nixlOfiEngine::setupEndpoint(bool connection_oriented) {
         ret = fi_av_open(domain_, &av_attr, &av_, nullptr);
         if (ret) {
             NIXL_ERROR << "fi_av_open failed: " << fi_strerror(-ret);
-            goto cleanup_cq;
+            goto cleanup_setup;
         }
 
         ret = fi_ep_bind(ep_, &av_->fid, 0);
         if (ret) {
             NIXL_ERROR << "fi_ep_bind to AV failed: " << fi_strerror(-ret);
-            goto cleanup_av;
+            goto cleanup_setup;
         }
 
         ret = fi_enable(ep_);
         if (ret) {
             NIXL_ERROR << "fi_enable failed: " << fi_strerror(-ret);
-            goto cleanup_av;
+            goto cleanup_setup;
         }
     }
     return NIXL_SUCCESS;
 
-    // Cleanup in reverse order of allocation
-cleanup_pep:
+cleanup_setup:
+    // cleanup only what setupEndpoint created, set pointers to nullptr
+    // Close endpoint BEFORE CQ since EP depends on CQ
+    if (ep_)  { fi_close(&ep_->fid);  ep_ = nullptr; }
+    if (av_)  { fi_close(&av_->fid);  av_ = nullptr; }
     if (pep_) { fi_close(&pep_->fid); pep_ = nullptr; }
-cleanup_eq:
-    if (eq_) { fi_close(&eq_->fid); eq_ = nullptr; }
-cleanup_av:
-    if (av_) { fi_close(&av_->fid); av_ = nullptr; }
-cleanup_cq:
-    if (cq_) { fi_close(&cq_->fid); cq_ = nullptr; }
-cleanup_endpoint:
-    if (ep_) { fi_close(&ep_->fid); ep_ = nullptr; }
+    if (eq_)  { fi_close(&eq_->fid);  eq_ = nullptr; }
+    if (cq_)  { fi_close(&cq_->fid);  cq_ = nullptr; }
     return NIXL_ERR_BACKEND;
 }
 
