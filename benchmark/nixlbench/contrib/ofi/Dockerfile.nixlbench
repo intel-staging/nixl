@@ -242,7 +242,7 @@ exec "$HOME/.local/bin/nixlbench" \
   --num_iter "$NITER" --warmup_iter "$WARM"
 OFITCP
 
-# 4) Two-host over OFI verbs;ofi_rxm (RDM)
+# 4) Two-host over OFI verbs (RDM)
 #    Usage (on BOTH hosts): ETCD_IP=<host-running-etcd> nixlbench-2host-rxm.sh
 COPY <<'OFIVERBS' $HOME/.local/bin/nixlbench-2host-rxm.sh
 #!/usr/bin/env bash
@@ -253,9 +253,9 @@ export START=${START:-4096}
 export MAX=${MAX:-67108864}
 export NITER=${NITER:-1000}
 export WARM=${WARM:-100}
-# Force RXM layered over verbs (RDM endpoint)
+# Force verbs provider
 unset FI_PROVIDER || true
-export FI_PROVIDER="verbs;ofi_rxm"
+export FI_PROVIDER="verbs"
 # Optional: select a specific HCA (uncomment and set as needed)
 # export FI_VERBS_DEVICE=mlx5_1
 exec "$HOME/.local/bin/nixlbench" \

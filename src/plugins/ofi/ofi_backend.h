@@ -139,6 +139,12 @@ private:
     void getSizeTParam(const nixlBackendInitParams* init_params, const std::string& key, size_t& value);
     
     void configureHintsForProvider(struct fi_info* hints, const std::string& provider_name);
+    
+    // Memory registration helpers
+    static uint64_t getMemoryRegistrationAccessFlags(const struct fi_info* fi_info);
+    fi_hmem_iface selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const;
+    nixl_status_t registerDramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
+    nixl_status_t registerVramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
 
     // data members
     fid_fabric *fabric_;

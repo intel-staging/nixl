@@ -28,7 +28,7 @@ class OfiBackendTest : public ::testing::Test {
 protected:
     void SetUp() override {
         init_params.localAgent = "test_agent";
-        custom_params["provider"] = "verbs;ofi_rxm";
+        custom_params["provider"] = "verbs";
         custom_params["eq_timeout_ms"] = "100";
         init_params.customParams = reinterpret_cast<nixl_b_params_t*>(&custom_params);
     }
