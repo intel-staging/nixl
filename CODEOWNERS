@@ -26,5 +26,9 @@ CODEOWNERS @ai-dynamo/Devops @ai-dynamo/nixl-maintainers
 /src/plugins/cuda_gds @w1ldptr @barneuman @etoledano vvenkates27
 /src/plugins/obj @w1ldptr @barneuman @etoledano vvenkates27
 
+# OFI Plugin
+/src/plugins/ofi @tsg- @jeromean
+
+
 # Benchmarks
 /benchmark @aranadive @ovidiusm @brminich
