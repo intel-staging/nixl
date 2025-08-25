@@ -30,6 +30,10 @@
 // #include <rdma/fi_cq.h>
 #include <rdma/fi_ext.h>
 
+#include <dlfcn.h>
+#include "habanalabs/synapse_api.h"
+#include "habanalabs/hlthunk.h"
+
 #include <string>
 #include <map>
 #include <mutex>
@@ -162,9 +166,9 @@ private:
     std::string providerName_;
     struct fi_info *cachedProviderInfo_;
     std::string localAddr_;
-    std::map<std::string, std::string> remoteAddrs_;
-    std::map<std::string, fid_ep *> connectedEps_;
-    std::map<std::string, fi_addr_t> shmAddrs_;
+    mutable std::map<std::string, std::string> remoteAddrs_;
+    mutable std::map<std::string, fid_ep *> connectedEps_;
+    mutable std::map<std::string, fi_addr_t> shmAddrs_;
     fid_av *av_;
     mutable std::mutex epLock_;
     bool isConnectionless_;
@@ -180,6 +184,22 @@ private:
     bool hmemSynapseaiSupported_;
 
     std::string localAgentName_;
+
+    // synapseAI dynamic loading handles
+    static void *synapseai_handle_;
+    static void *hlthunk_handle_;
+    
+    struct synapseai_ops {
+        synStatus (*synInitialize)(void);
+        synStatus (*synDestroy)(void);
+        synStatus (*synDeviceAcquireByModuleId)(synDeviceId *pDeviceId, const synModuleId moduleId);
+        synStatus (*synDeviceGetInfoV2)(const synDeviceId deviceId, synDeviceInfoV2 *pDeviceInfo);
+        synStatus (*synStreamCreateGeneric)(synStreamHandle *pStreamHandle, const synDeviceId deviceId, const uint32_t flags);
+        int (*hlthunk_device_mapped_memory_export_dmabuf_fd)(int fd, uint64_t addr, uint64_t size, uint64_t offset, uint32_t flags);
+    };
+    static synapseai_ops synapseai_ops_;
+    
+    nixl_status_t registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
 };
 
 #endif

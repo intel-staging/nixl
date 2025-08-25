@@ -23,6 +23,15 @@
 #include <stdexcept>
 #include <unistd.h>
 #include <functional>
+#include <fcntl.h>
+
+#include <cstdlib>
+
+// static synapseAI handles for dynamic loading
+void* nixlOfiEngine::synapseai_handle_ = nullptr;
+void* nixlOfiEngine::hlthunk_handle_ = nullptr;
+nixlOfiEngine::synapseai_ops nixlOfiEngine::synapseai_ops_ = {};
+static std::mutex synapseai_init_mutex_;
 
 nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     nixlBackendEngine(init_params),
@@ -412,6 +421,9 @@ nixlOfiEngine::~nixlOfiEngine() {
     if (domain_) { fi_close(&domain_->fid); domain_ = nullptr; }
     if (fabric_) { fi_close(&fabric_->fid); fabric_ = nullptr; }
     if (cachedProviderInfo_) fi_freeinfo(cachedProviderInfo_);
+
+    // note: static handles are shared across instances
+    // cleanup is handled by OS when process exits
 }
 
 bool nixlOfiEngine::supportsNotif() const {
@@ -747,8 +759,19 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     if (isConnectionless_) {
         auto shm_it = shmAddrs_.find(remote_agent);
         if (shm_it == shmAddrs_.end()) {
-            NIXL_ERROR << "OFI backend: No address mapping for " << remote_agent;
-            return NIXL_ERR_NOT_FOUND;
+            // auto-connect for first transfer - following nixl backend guide
+            NIXL_DEBUG << "auto-connecting to " << remote_agent << " (connectionless)";
+            nixl_status_t conn_status = const_cast<nixlOfiEngine*>(this)->connect(remote_agent);
+            if (conn_status != NIXL_SUCCESS) {
+                NIXL_ERROR << "failed to auto-connect to " << remote_agent;
+                return conn_status;
+            }
+            // retry address lookup after connection
+            shm_it = shmAddrs_.find(remote_agent);
+            if (shm_it == shmAddrs_.end()) {
+                NIXL_ERROR << "address mapping still missing after connect for " << remote_agent;
+                return NIXL_ERR_NOT_FOUND;
+            }
         }
         dest_addr = shm_it->second;
     } else {
@@ -1356,9 +1379,7 @@ fi_hmem_iface nixlOfiEngine::selectHmemInterface(const nixlBlobDesc &mem, uint64
     auto validateSynapseAIDevice = [](uint64_t dev_id) -> bool {
         std::string device_path = "/dev/accel/accel" + std::to_string(dev_id);
         if (access(device_path.c_str(), R_OK | W_OK) != 0) {
-            NIXL_ERROR << "SynapseAI device " << device_path << " is not accessible";
-            NIXL_ERROR << "  Device may be busy, missing, or have permission issues";
-            NIXL_ERROR << "  Please check device availability with 'ls -la /dev/accel/' and 'lsof /dev/accel/*'";
+            NIXL_INFO << "SynapseAI device " << device_path << " not accessible, will fallback to system memory";
             return false;
         }
         return true;
@@ -1469,6 +1490,22 @@ nixl_status_t nixlOfiEngine::registerDramMemory(const nixlBlobDesc &mem, nixlOfi
         return NIXL_ERR_INVALID_PARAM;
     }
     
+    // Check if this is actually device memory (HPU) that should use HMEM
+    uint64_t device_id = 0;
+    fi_hmem_iface iface = selectHmemInterface(mem, device_id);
+    
+    if (iface != FI_HMEM_SYSTEM) {
+        if (iface == FI_HMEM_SYNAPSEAI) {
+            // Use explicit SynapseAI registration to avoid hcclLookupDMABuff segfault
+            NIXL_DEBUG << "DRAM_SEG memory detected as SynapseAI device memory, using explicit dmabuf registration";
+            return registerSynapseAIMemoryExplicit(mem, ofi_meta);
+        }
+        // This is actually device memory, use HMEM registration
+        NIXL_DEBUG << "DRAM_SEG memory detected as device memory, using HMEM registration";
+        return registerVramMemory(mem, ofi_meta);
+    }
+    
+    // Standard host DRAM registration
     uint64_t access_flags = getMemoryRegistrationAccessFlags(fi_);
     
     int ret = fi_mr_reg(domain_, reinterpret_cast<void*>(mem.addr), mem.len,
@@ -1480,6 +1517,155 @@ nixl_status_t nixlOfiEngine::registerDramMemory(const nixlBlobDesc &mem, nixlOfi
         return NIXL_ERR_BACKEND;
     }
     
+    ofi_meta->desc = fi_mr_desc(ofi_meta->mr);
+    if (!ofi_meta->desc) {
+        NIXL_ERROR << "fi_mr_desc failed";
+        fi_close(&ofi_meta->mr->fid);
+        ofi_meta->mr = nullptr;
+        return NIXL_ERR_BACKEND;
+    }
+    
+    return NIXL_SUCCESS;
+}
+
+
+nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const {
+    // Try to get device info from the memory descriptor first
+    // If mem.devId is a valid SynapseAI device handle, use it directly
+    synDeviceId device_id = static_cast<synDeviceId>(mem.devId);
+    synDeviceInfoV2 device_info;
+    
+    // Try to get device info directly using the device ID from memory descriptor
+    NIXL_DEBUG << "Attempting to get device info for device ID: " << device_id;
+    
+    // thread-safe initialization of static handles
+    std::lock_guard<std::mutex> lock(synapseai_init_mutex_);
+    
+    // load synapseAI library functions (shared across instances)
+    if (!synapseai_handle_) {
+        synapseai_handle_ = dlopen("libSynapse.so", RTLD_NOW);
+        if (!synapseai_handle_) {
+            NIXL_ERROR << "failed to dlopen libSynapse.so: " << dlerror();
+            return NIXL_ERR_BACKEND;
+        }
+        
+        synapseai_ops_.synDeviceGetInfoV2 = 
+            (synStatus (*)(const synDeviceId, synDeviceInfoV2 *))dlsym(synapseai_handle_, "synDeviceGetInfoV2");
+        if (!synapseai_ops_.synDeviceGetInfoV2) {
+            NIXL_ERROR << "failed to find synDeviceGetInfoV2: " << dlerror();
+            return NIXL_ERR_BACKEND;
+        }
+    }
+    
+    if (!hlthunk_handle_) {
+        hlthunk_handle_ = dlopen("libhl-thunk.so", RTLD_NOW);
+        if (!hlthunk_handle_) {
+            NIXL_ERROR << "failed to dlopen libhl-thunk.so: " << dlerror();
+            return NIXL_ERR_BACKEND;
+        }
+        
+        synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd = 
+            (int (*)(int, uint64_t, uint64_t, uint64_t, uint32_t))dlsym(hlthunk_handle_, "hlthunk_device_mapped_memory_export_dmabuf_fd");
+        if (!synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd) {
+            NIXL_ERROR << "failed to find hlthunk_device_mapped_memory_export_dmabuf_fd: " << dlerror();
+            return NIXL_ERR_BACKEND;
+        }
+    }
+    
+    // Check if device is available first
+    if (synapseai_ops_.synDeviceGetInfoV2(device_id, &device_info) != synSuccess) {
+        NIXL_INFO << "SynapseAI device " << device_id << " not available, falling back to DRAM registration";
+        return registerDramMemory(mem, ofi_meta);
+    }
+    
+    NIXL_INFO << "Using existing SynapseAI device (PyTorch initialized) ID: " << device_id;
+
+    // Calculate aligned buffer size
+    const size_t ACCEL_PAGE_SIZE = 4096;
+    size_t buf_size = (mem.len + ACCEL_PAGE_SIZE - 1) & ~(ACCEL_PAGE_SIZE - 1);
+    
+    // Check if memory is within device range
+    uint64_t hbm_base = device_info.globalHbmBaseAddress;
+    uint64_t hbm_size = device_info.dramSize;
+    
+    NIXL_DEBUG << "Memory validation: addr=0x" << std::hex << mem.addr 
+              << " HBM_base=0x" << hbm_base 
+              << " HBM_size=0x" << hbm_size << std::dec;
+    
+    if (mem.addr < hbm_base || mem.addr >= (hbm_base + hbm_size)) {
+        NIXL_ERROR << "Memory address 0x" << std::hex << mem.addr 
+                  << " is not within HPU device memory range [0x" << hbm_base 
+                  << " - 0x" << (hbm_base + hbm_size) << "]";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    
+    // Get dmabuf fd
+    uint64_t device_offset = mem.addr - hbm_base;
+    NIXL_DEBUG << "Exporting dmabuf: fd=" << device_info.fd 
+              << " base=0x" << std::hex << hbm_base 
+              << " size=" << std::dec << buf_size 
+              << " offset=0x" << std::hex << device_offset;
+    
+    int dmabuf_fd = synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd(
+        device_info.fd,
+        hbm_base,
+        buf_size,
+        device_offset,
+        (O_RDWR | O_CLOEXEC)
+    );
+    
+    if (dmabuf_fd < 0) {
+        NIXL_ERROR << "hlthunk_device_mapped_memory_export_dmabuf_fd failed: " << strerror(-dmabuf_fd);
+        NIXL_ERROR << "  device_fd=" << device_info.fd;
+        NIXL_ERROR << "  base_addr=0x" << std::hex << hbm_base;
+        NIXL_ERROR << "  size=" << std::dec << buf_size;
+        NIXL_ERROR << "  offset=0x" << std::hex << device_offset;
+        return NIXL_ERR_BACKEND;
+    }
+    
+    NIXL_DEBUG << "Got dmabuf_fd: " << dmabuf_fd << " for device memory addr: 0x" 
+              << std::hex << mem.addr << " size: " << std::dec << mem.len;
+    
+    // set up dmabuf structure - fix page alignment issue
+    // kernel exported page-aligned region, but we register exact buffer
+    struct fi_mr_dmabuf dmabuf = {};
+    dmabuf.fd = dmabuf_fd;
+    dmabuf.offset = 0;                                   // kernel handled offset
+    dmabuf.len = mem.len;                                // exact buffer size
+    dmabuf.base_addr = reinterpret_cast<void*>(mem.addr); // exact buffer start
+    
+    // Set up memory registration attributes
+    struct fi_mr_attr mr_attr = {};
+    mr_attr.dmabuf = &dmabuf;
+    mr_attr.iov_count = 1;
+    mr_attr.access = getMemoryRegistrationAccessFlags(fi_);
+    mr_attr.iface = FI_HMEM_SYNAPSEAI;
+    mr_attr.device.synapseai = static_cast<uint32_t>(device_id);
+    
+    NIXL_DEBUG << "Registering SynapseAI memory with explicit dmabuf fd: " << dmabuf_fd;
+    
+    // register memory with explicit dmabuf
+    int ret = fi_mr_regattr(domain_, &mr_attr, FI_MR_DMABUF, &ofi_meta->mr);
+    
+    // cleanup fd after registration
+    close(dmabuf_fd);
+    
+    if (ret) {
+        NIXL_ERROR << "memory registration failed: " << fi_strerror(-ret);
+        ofi_meta->mr = nullptr;
+        return NIXL_ERR_BACKEND;
+    }
+    
+    // set descriptor
+    ofi_meta->desc = fi_mr_desc(ofi_meta->mr);
+    if (!ofi_meta->desc) {
+        NIXL_ERROR << "fi_mr_desc failed";
+        fi_close(&ofi_meta->mr->fid);
+        ofi_meta->mr = nullptr;
+        return NIXL_ERR_BACKEND;
+    }
+    
+    NIXL_INFO << "successfully registered SynapseAI memory via dmabuf";
     return NIXL_SUCCESS;
 }
 
@@ -1510,6 +1696,12 @@ nixl_status_t nixlOfiEngine::registerVramMemory(const nixlBlobDesc &mem, nixlOfi
     if (mr_attr.iface == FI_HMEM_SYSTEM) {
         NIXL_WARN << "VRAM requested but HMEM interface unavailable - falling back to system memory registration";
         return registerDramMemory(mem, ofi_meta);
+    }
+
+    // Use explicit dmabuf registration for SynapseAI to avoid hcclLookupDMABuff segfault
+    if (mr_attr.iface == FI_HMEM_SYNAPSEAI) {
+        NIXL_INFO << "Using explicit SynapseAI dmabuf registration (fabtests approach)";
+        return registerSynapseAIMemoryExplicit(mem, ofi_meta);
     }
     
     if (device_id >= UINT32_MAX) {
@@ -1580,6 +1772,9 @@ nixl_status_t nixlOfiEngine::registerVramMemory(const nixlBlobDesc &mem, nixlOfi
         }
         return NIXL_ERR_BACKEND;
     }
+    
+    // Set descriptor for successful registration
+    ofi_meta->desc = fi_mr_desc(ofi_meta->mr);
     
     return NIXL_SUCCESS;
 }
