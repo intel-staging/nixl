@@ -48,6 +48,9 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     eqThreadStop_(false),
     eqThreadPaused_(false),
     eqTimeoutMs_(100),
+    progressThreadStop_(false),
+    progressThreadEnabled_(false),
+    progressThreadDelay_(100),
     hmemZeSupported_(false),
     hmemCudaSupported_(false),
     hmemSynapseaiSupported_(false)
@@ -230,6 +233,17 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     } else {
         NIXL_DEBUG << "Skipping EQ event loop thread for connectionless provider";
     }
+
+    // init progress thread
+    progressThreadEnabled_ = init_params->enableProgTh;
+    progressThreadDelay_ = init_params->pthrDelay;
+    if (progressThreadEnabled_) {
+        NIXL_DEBUG << "Starting OFI progress thread with delay: " << progressThreadDelay_ << " microseconds";
+        progressThread_ = std::thread(&nixlOfiEngine::progressThreadFunc, this);
+    } else {
+        NIXL_DEBUG << "Progress thread disabled, using manual progress in checkXfer";
+    }
+
     NIXL_DEBUG << "OFI backend constructor completed successfully";
     return;
 
@@ -403,6 +417,12 @@ nixlOfiEngine::~nixlOfiEngine() {
             }
             eqThread_.join();
         }
+    }
+
+    // stop progress thread
+    progressThreadStop_.store(true);
+    if (progressThreadEnabled_ && progressThread_.joinable()) {
+        progressThread_.join();
     }
 
     // close connected endpoints
@@ -1230,6 +1250,50 @@ void nixlOfiEngine::eq_event_loop() {
                 break;
         }
     }
+}
+
+void nixlOfiEngine::progressThreadFunc() {
+    NIXL_DEBUG << "OFI progress thread started with delay: " << progressThreadDelay_ << " microseconds";
+
+    while (!progressThreadStop_.load()) {
+        // drive completion queues
+        driveProgress();
+
+        // sleep with configurable delay
+        auto delay = progressThreadDelay_ > 0 ? progressThreadDelay_ : 100;
+        std::this_thread::sleep_for(std::chrono::microseconds(delay));
+    }
+
+    NIXL_DEBUG << "OFI progress thread exiting";
+}
+
+void nixlOfiEngine::driveProgress() {
+    if (!cq_) {
+        return;  // no cq to drive
+    }
+
+    // drive cq progress (non-blocking)
+    const size_t batch_size = 16;
+    struct fi_cq_data_entry entries[batch_size];
+    int ret = fi_cq_read(cq_, entries, batch_size);
+
+    if (ret > 0) {
+        // process completions - contexts managed by checkXfer
+        for (int i = 0; i < ret; ++i) {
+            if (entries[i].op_context) {
+                // just drive progress, processing in checkXfer
+            }
+        }
+    } else if (ret < 0 && ret != -FI_EAGAIN) {
+        // handle errors without spam
+        static auto last_error_time = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_error_time).count() >= 1) {
+            NIXL_DEBUG << "Progress CQ read error: " << fi_strerror(-ret);
+            last_error_time = now;
+        }
+    }
+    // -FI_EAGAIN normal when no completions
 }
 
 bool nixlOfiEngine::isConnectionlessProvider() const {
