@@ -27,11 +27,36 @@
 
 #include <cstdlib>
 
+// OFI_POST macro based on libfabric FT_POST pattern for reliable operation posting
+#define OFI_POST(post_fn, cq, seq, op_str, ...)                            \
+    do {                                                                    \
+        int ret, progress_ret;                                              \
+        while (1) {                                                         \
+            ret = post_fn(__VA_ARGS__);                                     \
+            if (!ret) {                                                     \
+                break;                                                      \
+            }                                                               \
+            if (ret != -FI_EAGAIN) {                                        \
+                NIXL_ERROR << "OFI " op_str " failed: " << fi_strerror(-ret) << " (" << ret << ")"; \
+                return NIXL_ERR_BACKEND;                                    \
+            }                                                               \
+            progress_ret = ofi_progress_manual(cq);                         \
+            if (progress_ret < 0 && progress_ret != -FI_EAGAIN) {           \
+                NIXL_ERROR << "OFI progress failed during " op_str ": " << fi_strerror(-progress_ret); \
+                return NIXL_ERR_BACKEND;                                    \
+            }                                                               \
+        }                                                                   \
+        seq++;                                                              \
+    } while (0)
+
 // static synapseAI handles for dynamic loading
 void* nixlOfiEngine::synapseai_handle_ = nullptr;
 void* nixlOfiEngine::hlthunk_handle_ = nullptr;
 nixlOfiEngine::synapseai_ops nixlOfiEngine::synapseai_ops_ = {};
 static std::mutex synapseai_init_mutex_;
+
+// progress rate limiting constant
+const std::chrono::milliseconds nixlOfiEngine::PROGRESS_INTERVAL{5};
 
 nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     nixlBackendEngine(init_params),
@@ -48,9 +73,11 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     eqThreadStop_(false),
     eqThreadPaused_(false),
     eqTimeoutMs_(100),
-    progressThreadStop_(false),
-    progressThreadEnabled_(false),
-    progressThreadDelay_(100),
+    connectionProgressStop_(false),
+    shutdownFlag_(false),
+    connectionProgressEnabled_(false),
+    connectionProgressDelay_(10000), // 10ms for connection events
+    lastProgressTime_(std::chrono::steady_clock::now()),
     hmemZeSupported_(false),
     hmemCudaSupported_(false),
     hmemSynapseaiSupported_(false)
@@ -234,14 +261,17 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
         NIXL_DEBUG << "Skipping EQ event loop thread for connectionless provider";
     }
 
-    // init progress thread
-    progressThreadEnabled_ = init_params->enableProgTh;
-    progressThreadDelay_ = init_params->pthrDelay;
-    if (progressThreadEnabled_) {
-        NIXL_DEBUG << "Starting OFI progress thread with delay: " << progressThreadDelay_ << " microseconds";
-        progressThread_ = std::thread(&nixlOfiEngine::progressThreadFunc, this);
+    // init connection-focused progress thread
+    connectionProgressEnabled_ = init_params->enableProgTh;
+    if (init_params->pthrDelay > 0) {
+        connectionProgressDelay_ = init_params->pthrDelay;
+    }
+
+    if (connectionProgressEnabled_) {
+        NIXL_DEBUG << "Starting OFI connection progress thread with delay: " << connectionProgressDelay_ << " microseconds";
+        connectionProgressThread_ = std::thread(&nixlOfiEngine::connectionProgressFunc, this);
     } else {
-        NIXL_DEBUG << "Progress thread disabled, using manual progress in checkXfer";
+        NIXL_DEBUG << "Connection progress thread disabled, using EQ event loop only";
     }
 
     NIXL_DEBUG << "OFI backend constructor completed successfully";
@@ -407,6 +437,8 @@ void nixlOfiEngine::configureHintsForProvider(struct fi_info* hints, const std::
 }
 
 nixlOfiEngine::~nixlOfiEngine() {
+    shutdownFlag_.store(true);
+
     if (!isConnectionless_) {
         eqThreadStop_ = true;
         if (eqThread_.joinable()) {
@@ -419,10 +451,10 @@ nixlOfiEngine::~nixlOfiEngine() {
         }
     }
 
-    // stop progress thread
-    progressThreadStop_.store(true);
-    if (progressThreadEnabled_ && progressThread_.joinable()) {
-        progressThread_.join();
+    // stop connection progress thread
+    connectionProgressStop_.store(true);
+    if (connectionProgressEnabled_ && connectionProgressThread_.joinable()) {
+        connectionProgressThread_.join();
     }
 
     // close connected endpoints
@@ -493,8 +525,12 @@ nixl_mem_list_t nixlOfiEngine::getSupportedMems() const {
 }
 
 nixl_status_t nixlOfiEngine::connect(const std::string &remote_agent) {
-    NIXL_DEBUG << "connect() called for remote_agent: " << remote_agent 
+    NIXL_DEBUG << "connect() called for remote_agent: " << remote_agent
                << " isConnectionless: " << isConnectionless_;
+
+    // drive progress before attempting connection
+    driveProgressIfNeeded();
+
     std::lock_guard<std::mutex> lock(epLock_);
     return connect_unlocked(remote_agent);
 }
@@ -810,8 +846,8 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     if (isConnectionless_) {
         auto shm_it = shmAddrs_.find(remote_agent);
         if (shm_it == shmAddrs_.end()) {
-            // CRITICAL FIX: Connection should have been established in loadRemoteConnInfo
-            // If we reach here, it means the connection was not properly established
+            // connection should have been established in loadRemoteConnInfo
+            // if we reach here, it means the connection was not properly established
             NIXL_ERROR << "No address mapping found for " << remote_agent 
                       << " - connection should have been established in loadRemoteConnInfo";
             return NIXL_ERR_NOT_FOUND;
@@ -856,7 +892,6 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     // track posted operation contexts for proper cleanup
     std::vector<uint64_t*> op_contexts;
 
-    int ret = 0;
     for (size_t i = 0; i < static_cast<size_t>(local.descCount()); ++i) {
         const nixlMetaDesc &local_desc = local[i];
         const nixlMetaDesc &remote_desc = remote[i];
@@ -866,7 +901,7 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         
         if (!local_meta || !remote_meta || !local_meta->mr) {
             NIXL_ERROR << "Invalid metadata or memory registration";
-            // CRITICAL FIX: Clean up any previously allocated contexts
+            // clean up any previously allocated contexts
             for (auto* ctx : op_contexts) {
                 delete ctx;
             }
@@ -881,7 +916,7 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
                       << " local_len=" << local_desc.len
                       << " remote_addr=" << remote_desc.addr 
                       << " remote_len=" << remote_desc.len;
-            // CRITICAL FIX: Clean up any previously allocated contexts
+            // clean up any previously allocated contexts
             for (auto* ctx : op_contexts) {
                 delete ctx;
             }
@@ -892,7 +927,7 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         if (local_desc.len != remote_desc.len) {
             NIXL_ERROR << "Length mismatch: local=" << local_desc.len 
                       << " remote=" << remote_desc.len;
-            // CRITICAL FIX: Clean up any previously allocated contexts
+            // clean up any previously allocated contexts
             for (auto* ctx : op_contexts) {
                 delete ctx;
             }
@@ -916,23 +951,36 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
             .key = remote_key
         };
 
-        // use unique context for each operation  
-        uint64_t* op_context = new uint64_t(i);
-        
+        // check if we can use injection for small transfers (performance optimization)
+        size_t inject_size = fi_ ? fi_->tx_attr->inject_size : 0;
+        bool use_inject = (local_desc.len <= inject_size) && (operation == NIXL_WRITE);
+
+        // use unique context for each operation (not needed for inject operations)
+        uint64_t* op_context = use_inject ? nullptr : new uint64_t(i);
+        static uint64_t seq_num = 0;
+
         switch (operation) {
             case NIXL_READ:
-                ret = fi_read(target_ep, reinterpret_cast<void*>(local_desc.addr),
-                             local_desc.len, local_meta->desc, dest_addr,
-                             rma_iov.addr, rma_iov.key, op_context);
+                OFI_POST(fi_read, cq_, seq_num, "fi_read",
+                        target_ep, reinterpret_cast<void*>(local_desc.addr),
+                        local_desc.len, local_meta->desc, dest_addr,
+                        rma_iov.addr, rma_iov.key, op_context);
                 break;
             case NIXL_WRITE:
-                ret = fi_write(target_ep, reinterpret_cast<void*>(local_desc.addr),
-                              local_desc.len, local_meta->desc, dest_addr,
-                              rma_iov.addr, rma_iov.key, op_context);
+                if (use_inject) {
+                    OFI_POST(fi_inject_write, cq_, seq_num, "fi_inject_write",
+                            target_ep, reinterpret_cast<void*>(local_desc.addr),
+                            local_desc.len, dest_addr, rma_iov.addr, rma_iov.key);
+                } else {
+                    OFI_POST(fi_write, cq_, seq_num, "fi_write",
+                            target_ep, reinterpret_cast<void*>(local_desc.addr),
+                            local_desc.len, local_meta->desc, dest_addr,
+                            rma_iov.addr, rma_iov.key, op_context);
+                }
                 break;
             default:
                 NIXL_ERROR << "Unsupported operation type";
-                delete op_context;
+                if (op_context) delete op_context;
                 // cleanup all previously allocated contexts
                 for (auto* ctx : op_contexts) {
                     delete ctx;
@@ -941,27 +989,12 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
                 return NIXL_ERR_NOT_SUPPORTED;
         }
 
-        if (ret) {
-            if (ret == -FI_EAGAIN) {
-                // RDM provider: FI_EAGAIN means operation was posted successfully
-                NIXL_DEBUG << "OFI transfer " << i << " posted asynchronously (EAGAIN)";
-                op_contexts.push_back(op_context);
-            } else {
-                NIXL_ERROR << "OFI transfer " << i << " failed: " << fi_strerror(-ret);
-                delete op_context;
-                
-                // CRITICAL FIX: Don't delete contexts for already-posted operations!
-                // They are still running and will complete - deleting them causes use-after-free
-                // Instead, store only the successfully posted operations count
-                ofi_req->wr_id = op_contexts.size(); // Only posted operations
-                handle = ofi_req;
-                
-                NIXL_ERROR << "Partial transfer failure: " << op_contexts.size() 
-                          << " operations posted successfully, operation " << i << " failed";
-                return NIXL_ERR_BACKEND;
-            }
-        } else {
+        // OFI_POST succeeded, track the context if not using injection
+        if (op_context) {
             op_contexts.push_back(op_context);
+        } else if (use_inject) {
+            // injection operations complete immediately, no context tracking needed
+            NIXL_DEBUG << "OFI inject transfer " << i << " completed immediately";
         }
     }
 
@@ -972,7 +1005,118 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
 
 }
 
+void nixlOfiEngine::connectionProgressFunc() {
+    NIXL_DEBUG << "OFI connection progress thread started with delay: " << connectionProgressDelay_ << " microseconds";
+
+    while (!connectionProgressStop_.load()) {
+        if (shutdownFlag_.load()) {
+            break;  // shutdown in progress
+        }
+
+        // for connectionless providers (like RXM), we need to drive CQ progress
+        // to handle incoming operations from RMA clients
+        if (isConnectionless_ && cq_) {
+            // drive CQ progress to catch incoming RMA operations
+            // use multiple reads for better responsiveness with connectionless
+            for (int i = 0; i < 3; i++) {
+                int ret = ofi_progress_manual(cq_);
+                if (ret > 0) {
+                    NIXL_DEBUG << "Connection thread: processed " << ret << " completion(s)";
+                } else if (ret == -FI_EAGAIN) {
+                    break; // no more completions
+                }
+            }
+        } else if (!isConnectionless_ && cq_) {
+            // for connection-oriented, single CQ read is sufficient
+            int ret = ofi_progress_manual(cq_);
+            if (ret > 0) {
+                NIXL_DEBUG << "Connection thread: processed " << ret << " completion(s)";
+            }
+        }
+
+        // for connection-oriented providers, EQ events are handled by eq_event_loop
+        // so this thread mainly drives CQ for incoming data
+
+        // sleep with configurable delay (longer than data operations)
+        auto delay = connectionProgressDelay_ > 0 ? connectionProgressDelay_ : 10000; // 10ms default
+        std::this_thread::sleep_for(std::chrono::microseconds(delay));
+    }
+
+    NIXL_DEBUG << "OFI connection progress thread exiting";
+}
+
+void nixlOfiEngine::driveProgress() const {
+    if (shutdownFlag_.load()) {
+        return;  // shutdown in progress
+    }
+
+    if (!cq_) {
+        return;  // no cq to drive
+    }
+
+    // fabtest-style progress driving with proper error handling
+    int progress_ret = ofi_progress_manual(cq_);
+
+    if (progress_ret > 0) {
+        // successful completion read, context cleanup handled elsewhere
+        NIXL_DEBUG << "Progress thread: advanced " << progress_ret << " completion(s)";
+    } else if (progress_ret == -FI_EAGAIN) {
+        // no completions available, normal condition
+        return;
+    } else if (progress_ret < 0) {
+        // error occurred, rate-limit error messages
+        static auto last_error_time = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_error_time).count() >= 1) {
+            NIXL_DEBUG << "Progress thread error: " << fi_strerror(-progress_ret);
+            last_error_time = now;
+        }
+    }
+}
+
+void nixlOfiEngine::driveProgressIfNeeded() const {
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastProgressTime_ >= PROGRESS_INTERVAL) {
+        driveProgress();
+        lastProgressTime_ = now;
+    }
+}
+
+int nixlOfiEngine::ofi_progress_manual(fid_cq *cq) const {
+    if (!cq) {
+        return -FI_EINVAL;
+    }
+
+    struct fi_cq_data_entry comp;
+    int ret = fi_cq_read(cq, &comp, 1);
+
+    if (ret >= 0 || ret == -FI_EAGAIN) {
+        return ret;
+    }
+
+    if (ret == -FI_EAVAIL) {
+        struct fi_cq_err_entry err_entry;
+        ret = fi_cq_readerr(cq, &err_entry, 0);
+        if (ret < 0) {
+            NIXL_ERROR << "fi_cq_readerr failed: " << fi_strerror(-ret);
+        } else {
+            NIXL_ERROR << "CQ error: " << fi_strerror(err_entry.err);
+        }
+        return -FI_EAVAIL;
+    }
+
+    NIXL_ERROR << "fi_cq_read failed: " << fi_strerror(-ret);
+    return ret;
+}
+
 nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
+    if (shutdownFlag_.load()) {
+        return NIXL_ERR_BACKEND;  // shutdown in progress
+    }
+
+    // rate-limited progress driving for main thread
+    driveProgressIfNeeded();
+
     nixlOfiRequest *ofi_req = static_cast<nixlOfiRequest*>(handle);
     if (!ofi_req || !ofi_req->cq) {
         return NIXL_ERR_INVALID_PARAM;
@@ -990,6 +1134,7 @@ nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
     int ret = fi_cq_read(ofi_req->cq, entries, max_read);
     
     if (ret > 0) {
+        NIXL_DEBUG << "checkXfer: got " << ret << " completions";
         // got some completions - free the contexts
         for (int i = 0; i < ret; ++i) {
             if (entries[i].op_context) {
@@ -997,7 +1142,7 @@ nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
             }
         }
         
-        // CRITICAL FIX: Thread-safe atomic update of remaining completions
+        // thread-safe atomic update of remaining completions
         uint64_t expected = ofi_req->wr_id.load();
         uint64_t new_count;
         
@@ -1016,18 +1161,30 @@ nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
         return NIXL_IN_PROG; // some operations still pending
     } else if (ret == -FI_EAGAIN) {
         return NIXL_IN_PROG;
-    } else if (ret < 0) {
+    } else if (ret == -FI_EAVAIL) {
+        // handle error completions like fabtest ft_progress pattern
         struct fi_cq_err_entry err_entry;
         int err_ret = fi_cq_readerr(ofi_req->cq, &err_entry, 0);
         if (err_ret > 0) {
-            NIXL_ERROR << "CQ error: " << fi_strerror(err_entry.err) << " (" << err_entry.err << ")";
-            // cleanup context on error
+            NIXL_ERROR << "CQ error completion: " << fi_strerror(err_entry.err) << " provider=" << err_entry.prov_errno;
+
+            // cleanup context on error and count as completion
             if (err_entry.op_context) {
                 delete static_cast<uint64_t*>(err_entry.op_context);
             }
+
+            // atomically decrement remaining operations
+            uint64_t expected = ofi_req->wr_id.load();
+            uint64_t new_count = expected > 0 ? expected - 1 : 0;
+            while (!ofi_req->wr_id.compare_exchange_weak(expected, new_count)) {
+                new_count = expected > 0 ? expected - 1 : 0;
+            }
         } else {
-            NIXL_ERROR << "fi_cq_read failed: " << fi_strerror(-ret);
+            NIXL_ERROR << "fi_cq_readerr failed: " << fi_strerror(-err_ret);
         }
+        return NIXL_ERR_BACKEND;
+    } else if (ret < 0) {
+        NIXL_ERROR << "fi_cq_read failed: " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
     }
     return NIXL_IN_PROG;
@@ -1041,25 +1198,50 @@ nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
     
     // try to drain a few pending completions to prevent context leaks
     if (ofi_req->wr_id.load() > 0) {
-        int drain_attempts = 0;
-        const int max_drain_attempts = 10; // reduced from 1000 to be less aggressive
-        
-        while (ofi_req->wr_id.load() > 0 && drain_attempts < max_drain_attempts) {
-            nixl_status_t status = checkXfer(handle);
-            if (status == NIXL_ERR_BACKEND) {
-                break; // stop on CQ error
-            }
-            drain_attempts++;
-            
-            if (ofi_req->wr_id.load() > 0) {
-                usleep(100); // 100 microseconds - slightly longer delay
+        if (!shutdownFlag_.load()) {
+            int drain_attempts = 0;
+            const int max_drain_attempts = 10; // reduced from 1000 to be less aggressive
+
+            while (ofi_req->wr_id.load() > 0 && drain_attempts < max_drain_attempts) {
+                // drain completions directly without checkXfer to avoid shutdown flag interference
+                const size_t batch_size = 16;
+                struct fi_cq_data_entry entries[batch_size];
+                uint64_t expected_completions = ofi_req->wr_id.load();
+                size_t max_read = std::min(expected_completions, batch_size);
+
+                int ret = fi_cq_read(ofi_req->cq, entries, max_read);
+                if (ret > 0) {
+                    // process completions and free contexts
+                    for (int i = 0; i < ret; ++i) {
+                        if (entries[i].op_context) {
+                            delete static_cast<uint64_t*>(entries[i].op_context);
+                        }
+                    }
+
+                    // update completion count atomically
+                    uint64_t expected = ofi_req->wr_id.load();
+                    uint64_t new_count = (expected >= (uint64_t)ret) ? expected - ret : 0;
+                    ofi_req->wr_id.store(new_count);
+                } else if (ret < 0 && ret != -FI_EAGAIN) {
+                    break; // stop on CQ error
+                }
+
+                drain_attempts++;
+
+                if (ofi_req->wr_id.load() > 0) {
+                    usleep(100); // 100 microseconds - slightly longer delay
+                }
             }
         }
-        
+
         // if still pending, just log and continue - better than hanging
         uint64_t remaining = ofi_req->wr_id.load();
         if (remaining > 0) {
-            NIXL_DEBUG << "Releasing request with " << remaining << " pending operations";
+            if (shutdownFlag_.load()) {
+                NIXL_DEBUG << "Shutdown: releasing request with " << remaining << " pending operations (contexts may leak)";
+            } else {
+                NIXL_DEBUG << "Releasing request with " << remaining << " pending operations";
+            }
         }
     }
     
@@ -1068,17 +1250,23 @@ nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
 }
 
 nixl_status_t nixlOfiEngine::getConnInfo(std::string &conn_info) const {
+    // drive progress before returning connection info
+    driveProgressIfNeeded();
+
     conn_info = localAddr_;
     return NIXL_SUCCESS;
 }
 
 nixl_status_t nixlOfiEngine::loadRemoteConnInfo(const std::string &remote_agent, const std::string &conn_info) {
+    // drive progress to handle any pending operations before loading new connection info
+    driveProgressIfNeeded();
+
     // validate remote agent name to prevent memory attacks
     if (remote_agent.empty() || remote_agent.size() > 256) {
         NIXL_ERROR << "Invalid remote agent name length: " << remote_agent.size();
         return NIXL_ERR_INVALID_PARAM;
     }
-    
+
     if (conn_info.empty() || conn_info.size() > 1024) {
         NIXL_ERROR << "Invalid connection info size: " << conn_info.size();
         return NIXL_ERR_INVALID_PARAM;
@@ -1087,8 +1275,7 @@ nixl_status_t nixlOfiEngine::loadRemoteConnInfo(const std::string &remote_agent,
     std::lock_guard<std::mutex> lock(epLock_);
     remoteAddrs_[remote_agent] = conn_info;
     
-    // CRITICAL FIX: Establish connection immediately when remote agent info is loaded
-    // This prevents data integrity issues caused by auto-connect during first transfer
+    // establish connection immediately when remote agent info is loaded
     NIXL_DEBUG << "Establishing connection to " << remote_agent << " immediately";
     nixl_status_t connect_status = connect_unlocked(remote_agent);
     if (connect_status != NIXL_SUCCESS) {
@@ -1250,50 +1437,6 @@ void nixlOfiEngine::eq_event_loop() {
                 break;
         }
     }
-}
-
-void nixlOfiEngine::progressThreadFunc() {
-    NIXL_DEBUG << "OFI progress thread started with delay: " << progressThreadDelay_ << " microseconds";
-
-    while (!progressThreadStop_.load()) {
-        // drive completion queues
-        driveProgress();
-
-        // sleep with configurable delay
-        auto delay = progressThreadDelay_ > 0 ? progressThreadDelay_ : 100;
-        std::this_thread::sleep_for(std::chrono::microseconds(delay));
-    }
-
-    NIXL_DEBUG << "OFI progress thread exiting";
-}
-
-void nixlOfiEngine::driveProgress() {
-    if (!cq_) {
-        return;  // no cq to drive
-    }
-
-    // drive cq progress (non-blocking)
-    const size_t batch_size = 16;
-    struct fi_cq_data_entry entries[batch_size];
-    int ret = fi_cq_read(cq_, entries, batch_size);
-
-    if (ret > 0) {
-        // process completions - contexts managed by checkXfer
-        for (int i = 0; i < ret; ++i) {
-            if (entries[i].op_context) {
-                // just drive progress, processing in checkXfer
-            }
-        }
-    } else if (ret < 0 && ret != -FI_EAGAIN) {
-        // handle errors without spam
-        static auto last_error_time = std::chrono::steady_clock::now();
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_error_time).count() >= 1) {
-            NIXL_DEBUG << "Progress CQ read error: " << fi_strerror(-ret);
-            last_error_time = now;
-        }
-    }
-    // -FI_EAGAIN normal when no completions
 }
 
 bool nixlOfiEngine::isConnectionlessProvider() const {

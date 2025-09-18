@@ -131,8 +131,10 @@ private:
 
     // member functions
     void eq_event_loop();
-    void progressThreadFunc();
-    void driveProgress();
+    void connectionProgressFunc();
+    void driveProgress() const;
+    void driveProgressIfNeeded() const;
+    int ofi_progress_manual(fid_cq *cq) const;
     bool isConnectionlessProvider() const;
     nixl_status_t setupEndpoint(bool connection_oriented);
     static nixl_status_t getEndpointAddress(fid_ep* endpoint, std::string& address);
@@ -185,11 +187,16 @@ private:
     std::condition_variable eqPauseCV_;
     long eqTimeoutMs_;
 
-    // progress thread infrastructure
-    std::thread progressThread_;
-    std::atomic<bool> progressThreadStop_;
-    bool progressThreadEnabled_;
-    nixlTime::us_t progressThreadDelay_;
+    // connection-focused progress thread infrastructure
+    std::thread connectionProgressThread_;
+    std::atomic<bool> connectionProgressStop_;
+    std::atomic<bool> shutdownFlag_;
+    bool connectionProgressEnabled_;
+    nixlTime::us_t connectionProgressDelay_;
+
+    // intelligent main-thread progress rate limiting
+    mutable std::chrono::steady_clock::time_point lastProgressTime_;
+    static const std::chrono::milliseconds PROGRESS_INTERVAL;
     bool hmemZeSupported_;
     bool hmemCudaSupported_;
     bool hmemSynapseaiSupported_;
