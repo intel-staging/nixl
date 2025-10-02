@@ -309,14 +309,25 @@ nixlLibfabricTopology::discoverGpusWithHwloc() {
             NIXL_TRACE << "Found NVIDIA GPU " << num_gpus << ": " << pcie_addr
                        << " (vendor=" << std::hex << vendor_id << ", device=" << device_id
                        << ", class=" << class_id << std::dec << ")";
+            num_gpus++;
+        } else if (isIntelHpu(pci_obj)) {
+            std::string pcie_addr = getPcieAddressFromHwlocObj(pci_obj);
+            // Get device and vendor info
+            uint16_t vendor_id = pci_obj->attr->pcidev.vendor_id;
+            uint16_t device_id = pci_obj->attr->pcidev.device_id;
+            uint16_t class_id = pci_obj->attr->pcidev.class_id;
 
+            NIXL_TRACE << "Found Intel Habana GPU " << num_gpus << ": " << pcie_addr << " (vendor=0x"
+                       << std::hex << vendor_id << ", device=0x" << device_id << ", class=0x"
+                       << class_id << std::dec << ")";
             num_gpus++;
         }
     }
 
-    NIXL_TRACE << "Discovered " << num_gpus << " NVIDIA GPUs via hwloc";
+    NIXL_TRACE << "Discovered " << num_gpus << " GPUs via hwloc";
 
     // If we found more than 8 GPUs on P5en, investigate further
+    // FIXME: add Habana related messages
     if (num_gpus > 8) {
         NIXL_WARN << "Found " << num_gpus
                   << " NVIDIA GPUs, but P5en should have 8. Investigating...";
@@ -481,7 +492,7 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
     // Step 2: Discover GPUs
     hwloc_obj_t pci_obj = nullptr;
     while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
-        if (isNvidiaGpu(pci_obj)) {
+        if (isNvidiaGpu(pci_obj) || isIntelHpu(pci_obj)) {
             GpuInfo gpu;
             gpu.hwloc_node = pci_obj;
             gpu.domain_id = pci_obj->attr->pcidev.domain;
@@ -568,6 +579,21 @@ nixlLibfabricTopology::getPcieAddressFromHwlocObj(hwloc_obj_t obj) const {
              obj->attr->pcidev.dev,
              obj->attr->pcidev.func);
     return std::string(pcie_addr);
+}
+
+bool
+nixlLibfabricTopology::isIntelHpu(hwloc_obj_t obj) const {
+    if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE) {
+        return false;
+    }
+    // Intel Habana vendor ID is 0x1da3
+    if (obj->attr->pcidev.vendor_id != 0x1da3) {
+        return false;
+    }
+    // Gaudi devices use class 0x1200 (Processing Accelerators)
+    // Accept this class specifically for Habana devices
+    uint16_t class_id = obj->attr->pcidev.class_id;
+    return (class_id == 0x1200);
 }
 
 bool

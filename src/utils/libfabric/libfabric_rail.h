@@ -30,6 +30,11 @@
 #include "backend/backend_aux.h"
 #include "libfabric/libfabric_common.h"
 
+#ifdef HAVE_SYNAPSEAI
+#include <habanalabs/synapse_api.h>
+#include <habanalabs/hlthunk.h>
+#endif
+
 // Forward declarations
 class nixlLibfabricConnection;
 

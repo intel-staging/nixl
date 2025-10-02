@@ -49,6 +49,12 @@ if cuda_dep.found()
     libfabric_utils_cpp_args += ['-DHAVE_CUDA']
 endif
 
+# Add SynapseAI support if available (dependency is globally defined)
+if synapseai_dep.found()
+    libfabric_utils_deps += [synapseai_dep]
+    libfabric_utils_cpp_args += ['-DHAVE_SYNAPSEAI']
+endif
+
 # Create static library
 libfabric_utils_lib = static_library(
     'nixl_libfabric_utils',

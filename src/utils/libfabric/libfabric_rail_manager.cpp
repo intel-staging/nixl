@@ -323,7 +323,7 @@ nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr,
                                                nixl_mem_t mem_type,
                                                int gpu_id) const {
     if (mem_type == VRAM_SEG) {
-#ifdef HAVE_CUDA
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI)
         if (gpu_id < 0) {
             NIXL_ERROR << "Invalid GPU ID " << gpu_id << " for VRAM memory " << mem_addr;
             return {}; // Return empty vector to indicate failure
@@ -363,7 +363,7 @@ nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr,
                    << gpu_rails.size() << " rails total";
         return gpu_rails;
 #else
-        NIXL_ERROR << "VRAM memory type not supported without CUDA";
+        NIXL_ERROR << "VRAM memory type not supported without CUDA/SYNAPSEAI";
         return {};
 #endif
     }
