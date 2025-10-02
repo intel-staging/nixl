@@ -117,6 +117,8 @@ private:
     std::string
     getPcieAddressFromHwlocObj(hwloc_obj_t obj) const;
     bool
+    isIntelHpu(hwloc_obj_t obj) const;
+    bool
     isNvidiaGpu(hwloc_obj_t obj) const;
     bool
     isEfaDevice(hwloc_obj_t obj) const;

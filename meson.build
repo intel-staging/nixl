@@ -104,6 +104,38 @@ else
     warning('CUDA not found. UCX backend will be built without CUDA support, and some plugins will be disabled.')
 endif
 
+# SynapseAI (Habana Gaudi) dependency detection
+# Try to find both libSynapse and hl-thunk libraries
+synapse_lib = cpp.find_library('Synapse',
+                               dirs: ['/usr/lib/habanalabs', '/usr/local/lib/habanalabs'],
+                               required: false)
+hlthunk_lib = cpp.find_library('hl-thunk',
+                               dirs: ['/usr/lib/habanalabs', '/usr/local/lib/habanalabs'],
+                               required: false)
+
+# SynapseAI support requires both libraries
+synapseai_dep = dependency('', required: false)  # Initialize as not found
+if synapse_lib.found() and hlthunk_lib.found()
+    synapseai_dep = declare_dependency(dependencies: [synapse_lib, hlthunk_lib])
+elif hlthunk_lib.found()
+    # Fallback to just hl-thunk if libSynapse not available
+    synapseai_dep = hlthunk_lib
+endif
+
+if synapseai_dep.found()
+    # Create proper dependency with include paths (including DRM path for habanalabs headers)
+    synapseai_dep = declare_dependency(
+        dependencies: synapseai_dep,
+        include_directories: [
+            include_directories('/usr/include/habanalabs'),
+            include_directories('/usr/include/drm')
+        ]
+    )
+    message('Found SynapseAI support for Habana Gaudi devices')
+else
+    warning('SynapseAI not found. Habana Gaudi device support will be disabled.')
+endif
+
 # DOCA
 doca_gpunetio_dep = dependency('doca-gpunetio', required : false)
 

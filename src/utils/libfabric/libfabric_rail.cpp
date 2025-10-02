@@ -512,17 +512,19 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         }
 
         // Disable shared memory transfers for EFA provider to fix same-agent transfers
-        bool optval = false;
-        ret = fi_setopt(&endpoint->fid,
-                        FI_OPT_ENDPOINT,
-                        FI_OPT_SHARED_MEMORY_PERMITTED,
-                        &optval,
-                        sizeof(optval));
-        if (ret && ret != -FI_ENOSYS) {
-            NIXL_WARN << "fi_setopt FI_OPT_SHARED_MEMORY_PERMITTED failed for rail " << rail_id
-                      << ": " << fi_strerror(-ret) << " - continuing anyway";
-        } else if (ret == 0) {
-            NIXL_DEBUG << "Successfully disabled shared memory transfers for rail " << rail_id;
+        if (provider_name.find("efa") == 0) {
+           bool optval = false;
+           ret = fi_setopt(&endpoint->fid,
+                           FI_OPT_ENDPOINT,
+                           FI_OPT_SHARED_MEMORY_PERMITTED,
+                           &optval,
+                           sizeof(optval));
+           if (ret && ret != -FI_ENOSYS) {
+               NIXL_WARN << "fi_setopt FI_OPT_SHARED_MEMORY_PERMITTED failed for rail " << rail_id
+                         << ": " << fi_strerror(-ret) << " - continuing anyway";
+           } else if (ret == 0) {
+               NIXL_DEBUG << "Successfully disabled shared memory transfers for rail " << rail_id;
+           }
         }
 
         // Enable endpoint for this rail

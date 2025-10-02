@@ -33,6 +33,12 @@ if cuda_dep.found()
     compile_flags += ['-DHAVE_CUDA']
 endif
 
+# Add SynapseAI support if available (dependency is globally defined)
+if synapseai_dep.found()
+    libfabric_plugin_deps += [synapseai_dep]
+    compile_flags += ['-DHAVE_SYNAPSEAI']
+endif
+
 # Build as static or shared library based on configuration
 if 'LIBFABRIC' in static_plugins
     libfabric_backend_lib = static_library(
