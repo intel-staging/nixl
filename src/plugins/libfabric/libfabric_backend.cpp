@@ -263,6 +263,21 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
         NIXL_DEBUG << "Using default striping threshold: " << striping_threshold_ << " bytes";
     }
 
+    // Parse default HMEM interface parameter
+    // Auto-detect from topology if not specified
+    std::string hmem_iface_str;
+    if (getInitParam("default_hmem_iface", hmem_iface_str) == NIXL_SUCCESS) {
+        default_hmem_iface_ = hmem_iface_str;
+        NIXL_DEBUG << "Using custom default HMEM interface from backend params: " << default_hmem_iface_;
+    } else {
+        // Auto-detect device type from topology
+        // Note: topology discovery happens in rail_manager constructor
+        // For now, leave empty to use GDR fallback by default
+        // SynapseAI will be auto-detected per-registration via /dev/accel check
+        default_hmem_iface_ = "";
+        NIXL_DEBUG << "No default HMEM interface specified, will auto-detect per-registration";
+    }
+
     // Initialize Rail Manager which will discover the topology and create all rails.
     try {
         NIXL_DEBUG << "Rail Manager created with " << rail_manager.getNumDataRails()
@@ -787,14 +802,53 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
 #endif
     }
 
+    // Determine HMEM interface hint based on priority:
+    // 1. Environment variables (highest priority)
+    // 2. Per-registration hints via metaInfo blob
+    // 3. Backend-wide defaults from custom params
+    // 4. Auto-detection (fallback - empty string)
+    std::string hmem_hint;
+
+    // Priority 1: Check environment variables
+    const char* env_hmem = getenv("HMEM_IFACE");
+    if (env_hmem && env_hmem[0] != '\0') {
+        hmem_hint = env_hmem;
+        NIXL_DEBUG << "Using HMEM interface from environment variable: " << hmem_hint;
+    }
+    // Priority 2: Check per-registration hint from metaInfo
+    else if (!mem.metaInfo.empty()) {
+        hmem_hint = std::string(mem.metaInfo.begin(), mem.metaInfo.end());
+        NIXL_DEBUG << "Using HMEM interface from metaInfo hint: " << hmem_hint;
+    }
+    // Priority 3: Use backend-wide default
+    else if (!default_hmem_iface_.empty()) {
+        hmem_hint = default_hmem_iface_;
+        NIXL_DEBUG << "Using HMEM interface from backend default: " << hmem_hint;
+    }
+    // Priority 4: Auto-detect from system topology
+    else {
+        // Auto-detect device type based on topology discovery
+        // Intel HPU requires FI_HMEM_SYNAPSEAI (no GDR support exists)
+        // NVIDIA GPU can use GDR fallback (empty hint)
+        if (nixl_mem == VRAM_SEG && rail_manager.getNumIntelHpus() > 0) {
+            hmem_hint = "SYNAPSEAI";
+            NIXL_DEBUG << "Auto-detected Intel HPU system, using HMEM interface: SYNAPSEAI";
+        } else {
+            // Leave empty for GDR fallback (CUDA) or DRAM
+            NIXL_DEBUG << "Auto-detection: using GDR fallback (empty hint)";
+        }
+    }
+
     // Use Rail Manager for centralized memory registration with GPU Direct RDMA support
     NIXL_TRACE << "Registering memory: addr=" << (void *)mem.addr << " len=" << mem.len
-               << " mem_type=" << nixl_mem << " devId=" << mem.devId;
+               << " mem_type=" << nixl_mem << " devId=" << mem.devId
+               << " hmem_hint=" << (hmem_hint.empty() ? "auto" : hmem_hint);
 
     nixl_status_t status = rail_manager.registerMemory((void *)mem.addr,
                                                        mem.len,
                                                        nixl_mem,
                                                        mem.devId,
+                                                       hmem_hint,
                                                        priv->rail_mr_list_,
                                                        priv->rail_key_list_,
                                                        priv->selected_rails_);

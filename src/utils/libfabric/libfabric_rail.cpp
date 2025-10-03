@@ -21,6 +21,7 @@
 #include "serdes/serdes.h"
 #include "libfabric_common.h"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <stack>
@@ -1256,6 +1257,8 @@ nixlLibfabricRail::postRead(void *local_buffer,
 nixl_status_t
 nixlLibfabricRail::registerMemory(void *buffer,
                                   size_t length,
+                                  const std::string &hmem_hint,
+                                  int device_id,
                                   struct fid_mr **mr_out,
                                   uint64_t *key_out) const {
     if (!buffer || !mr_out || !key_out) {
@@ -1279,30 +1282,96 @@ nixlLibfabricRail::registerMemory(void *buffer,
     }
 
     struct fid_mr *mr;
+    int ret;
 
-    // For TCP providers, use a unique key to avoid conflicts
-    // TCP provider assigns key 0 by default, but we need unique keys for multiple registrations
-    uint64_t requested_key = 0;
-    if (provider_name == "tcp" || provider_name == "sockets") {
-        // Generate a unique key based on buffer address to avoid collisions
-        // Use the lower bits of the buffer address as a simple unique identifier
-        requested_key = reinterpret_cast<uintptr_t>(buffer) & 0xFFFFFFFF;
+    // Determine registration method based on hint:
+    // - Empty hint: Use GDR method (fi_mr_reg) - Default path
+    // - With hint: Use FI_HMEM method (fi_mr_regattr) - Required for SynapseAI, optional for CUDA
 
-        NIXL_DEBUG << "TCP provider: using requested key " << requested_key << " for buffer "
-                   << buffer << " on rail " << rail_id;
+    std::string hint_lower = hmem_hint;
+    std::transform(hint_lower.begin(), hint_lower.end(), hint_lower.begin(), ::tolower);
+
+    // Validate hint and check if explicit FI_HMEM registration is requested
+    bool use_hmem = false;
+    if (!hint_lower.empty()) {
+        if (hint_lower == "cuda" || hint_lower == "synapseai") {
+            use_hmem = true;
+        } else {
+            NIXL_WARN << "Unknown HMEM hint '" << hmem_hint << "' on rail " << rail_id
+                      << ", falling back to GDR method. Valid hints: CUDA, SYNAPSEAI";
+        }
     }
 
-    NIXL_TRACE << "Memory Registration: rail=" << rail_id << " provider=" << provider_name
-               << " buffer=" << buffer << " length=" << length << " access_flags=0x" << std::hex
-               << provider_access_flags << std::dec << " requested_key=" << requested_key;
+    if (use_hmem) {
+        // === FI_HMEM Path ===
+        NIXL_DEBUG << "Using FI_HMEM registration method on rail " << rail_id
+                   << " (hint=" << hmem_hint << ", device_id=" << device_id << ")";
 
-    int ret =
-        fi_mr_reg(domain, buffer, length, provider_access_flags, 0, requested_key, 0, &mr, NULL);
-    if (ret) {
-        NIXL_ERROR << "fi_mr_reg failed on rail " << rail_id << ": " << fi_strerror(-ret)
-                   << " (buffer=" << buffer << ", length=" << length
-                   << ", requested_key=" << requested_key << ")";
-        return NIXL_ERR_BACKEND;
+        // Use fi_mr_regattr for HMEM device memory registration
+        struct fi_mr_attr mr_attr = {};
+        struct iovec iov = {};
+
+        iov.iov_base = buffer;
+        iov.iov_len = length;
+
+        mr_attr.mr_iov = &iov;
+        mr_attr.iov_count = 1;
+        mr_attr.access = provider_access_flags;
+
+        // Map hint to FI_HMEM interface and set device ID
+        if (hint_lower == "cuda") {
+            mr_attr.iface = FI_HMEM_CUDA;
+            mr_attr.device.cuda = device_id;  // Critical for multi-GPU
+            NIXL_DEBUG << "Using CUDA HMEM interface for memory registration on rail " << rail_id
+                       << " device_id=" << device_id;
+        } else if (hint_lower == "synapseai") {
+            mr_attr.iface = FI_HMEM_SYNAPSEAI;
+            mr_attr.device.synapseai = static_cast<uint32_t>(device_id);  // Critical for multi-device
+            NIXL_DEBUG << "Using SynapseAI HMEM interface for memory registration on rail " << rail_id
+                       << " device_id=" << device_id;
+        }
+
+        NIXL_TRACE << "HMEM Registration: rail=" << rail_id << " provider=" << provider_name
+                   << " buffer=" << buffer << " length=" << length << " iface=" << mr_attr.iface
+                   << " device_id=" << device_id
+                   << " access_flags=0x" << std::hex << provider_access_flags << std::dec;
+
+        ret = fi_mr_regattr(domain, &mr_attr, 0, &mr);
+        if (ret) {
+            NIXL_ERROR << "fi_mr_regattr (HMEM) failed on rail " << rail_id << ": " << fi_strerror(-ret)
+                       << " (buffer=" << buffer << ", length=" << length
+                       << ", hint=" << hmem_hint << ", iface=" << mr_attr.iface
+                       << ", device_id=" << device_id << ")";
+            return NIXL_ERR_BACKEND;
+        }
+    } else {
+        // === GDR Path (Default) ===
+        // Uses standard fi_mr_reg() which relies on GPU Direct RDMA kernel modules
+        // (nvidia-peermem) to enable direct NIC-to-GPU memory access.
+
+        NIXL_DEBUG << "Using GDR registration method on rail " << rail_id
+                   << " (standard fi_mr_reg, relies on nvidia-peermem kernel module)";
+
+        // For TCP providers, use a unique key to avoid conflicts
+        uint64_t requested_key = 0;
+        if (provider_name == "tcp" || provider_name == "sockets") {
+            // Generate a unique key based on buffer address to avoid collisions
+            requested_key = reinterpret_cast<uintptr_t>(buffer) & 0xFFFFFFFF;
+            NIXL_DEBUG << "TCP provider: using requested key " << requested_key << " for buffer "
+                       << buffer << " on rail " << rail_id;
+        }
+
+        NIXL_TRACE << "GDR Memory Registration: rail=" << rail_id << " provider=" << provider_name
+                   << " buffer=" << buffer << " length=" << length << " access_flags=0x" << std::hex
+                   << provider_access_flags << std::dec << " requested_key=" << requested_key;
+
+        ret = fi_mr_reg(domain, buffer, length, provider_access_flags, 0, requested_key, 0, &mr, NULL);
+        if (ret) {
+            NIXL_ERROR << "fi_mr_reg failed on rail " << rail_id << ": " << fi_strerror(-ret)
+                       << " (buffer=" << buffer << ", length=" << length
+                       << ", requested_key=" << requested_key << ")";
+            return NIXL_ERR_BACKEND;
+        }
     }
 
     *mr_out = mr;

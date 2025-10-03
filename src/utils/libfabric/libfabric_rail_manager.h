@@ -110,6 +110,7 @@ public:
      * @param length Buffer size in bytes
      * @param mem_type Memory type (DRAM_SEG or VRAM_SEG)
      * @param gpu_id GPU device ID (used for VRAM_SEG, ignored for DRAM_SEG)
+     * @param hmem_hint HMEM interface hint ("cuda", "synapseai", "ze", or empty for auto-detection)
      * @param mr_list_out Memory registration handles, indexed by rail ID
      * @param key_list_out Remote access keys, indexed by rail ID
      * @param selected_rails_out List of rail IDs where memory was registered
@@ -120,6 +121,7 @@ public:
                    size_t length,
                    nixl_mem_t mem_type,
                    int gpu_id,
+                   const std::string &hmem_hint,
                    std::vector<struct fid_mr *> &mr_list_out,
                    std::vector<uint64_t> &key_list_out,
                    std::vector<size_t> &selected_rails_out);
@@ -243,6 +245,15 @@ public:
     /** Get count of currently active rails */
     size_t
     getActiveRailCount() const;
+
+    // Topology Information APIs
+    /** Get number of NVIDIA GPUs in the system */
+    int
+    getNumNvidiaGpus() const;
+
+    /** Get number of Intel HPUs in the system */
+    int
+    getNumIntelHpus() const;
 
     // Memory Descriptor APIs
     /** Get memory descriptor for specified rail and MR */

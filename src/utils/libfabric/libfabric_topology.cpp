@@ -34,6 +34,8 @@
 
 nixlLibfabricTopology::nixlLibfabricTopology()
     : num_gpus(0),
+      num_nvidia_gpus(0),
+      num_intel_hpus(0),
       num_numa_nodes(0),
       num_devices(0),
       topology_discovered(false),
@@ -98,6 +100,8 @@ nixlLibfabricTopology::discoverTopology() {
 
         // Set basic values without hwloc discovery
         num_gpus = 0; // TCP doesn't need GPU topology
+        num_nvidia_gpus = 0;
+        num_intel_hpus = 0;
         num_numa_nodes = 1; // Simple fallback
 
         // For TCP/sockets devices, no GPU-mapping required.
@@ -171,7 +175,8 @@ nixlLibfabricTopology::printTopologyInfo() const {
     NIXL_TRACE << "=== Libfabric Topology Information ===";
     NIXL_TRACE << "Topology discovered: " << (topology_discovered ? "Yes" : "No");
     NIXL_TRACE << "Provider: " << provider_name;
-    NIXL_TRACE << "Number of GPUs: " << num_gpus;
+    NIXL_TRACE << "Number of GPUs: " << num_gpus << " (" << num_nvidia_gpus << " NVIDIA, "
+               << num_intel_hpus << " Intel HPU)";
     NIXL_TRACE << "Number of NUMA nodes: " << num_numa_nodes;
     NIXL_TRACE << "Number of devices: " << num_devices;
     NIXL_TRACE << "Available devices: ";
@@ -309,7 +314,8 @@ nixlLibfabricTopology::discoverHwlocTopology() {
 
 nixl_status_t
 nixlLibfabricTopology::discoverGpusWithHwloc() {
-    num_gpus = 0;
+    num_nvidia_gpus = 0;
+    num_intel_hpus = 0;
     // Find all PCI devices and log detailed information
     hwloc_obj_t pci_obj = nullptr;
     while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
@@ -320,10 +326,10 @@ nixlLibfabricTopology::discoverGpusWithHwloc() {
             uint16_t device_id = pci_obj->attr->pcidev.device_id;
             uint16_t class_id = pci_obj->attr->pcidev.class_id;
 
-            NIXL_TRACE << "Found NVIDIA GPU " << num_gpus << ": " << pcie_addr << " (vendor=0x"
+            NIXL_TRACE << "Found NVIDIA GPU " << num_nvidia_gpus << ": " << pcie_addr << " (vendor=0x"
                        << std::hex << vendor_id << ", device=0x" << device_id << ", class=0x"
                        << class_id << std::dec << ")";
-            num_gpus++;
+            num_nvidia_gpus++;
         } else if (isIntelHpu(pci_obj)) {
             std::string pcie_addr = getPcieAddressFromHwlocObj(pci_obj);
             // Get device and vendor info
@@ -331,14 +337,16 @@ nixlLibfabricTopology::discoverGpusWithHwloc() {
             uint16_t device_id = pci_obj->attr->pcidev.device_id;
             uint16_t class_id = pci_obj->attr->pcidev.class_id;
 
-            NIXL_TRACE << "Found Intel Habana GPU " << num_gpus << ": " << pcie_addr << " (vendor=0x"
+            NIXL_TRACE << "Found Intel HPU " << num_intel_hpus << ": " << pcie_addr << " (vendor=0x"
                        << std::hex << vendor_id << ", device=0x" << device_id << ", class=0x"
                        << class_id << std::dec << ")";
-            num_gpus++;
+            num_intel_hpus++;
         }
     }
 
-    NIXL_TRACE << "Discovered " << num_gpus << " GPUs via hwloc";
+    num_gpus = num_nvidia_gpus + num_intel_hpus;
+    NIXL_TRACE << "Discovered " << num_gpus << " GPUs via hwloc (" << num_nvidia_gpus
+               << " NVIDIA, " << num_intel_hpus << " Intel HPU)";
 
     // If we found more than 8 GPUs on P5en, investigate further
     // FIXME: add Habana related messages

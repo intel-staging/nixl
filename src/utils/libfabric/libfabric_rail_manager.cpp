@@ -381,6 +381,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
                                          size_t length,
                                          nixl_mem_t mem_type,
                                          int gpu_id,
+                                         const std::string &hmem_hint,
                                          std::vector<struct fid_mr *> &mr_list_out,
                                          std::vector<uint64_t> &key_list_out,
                                          std::vector<size_t> &selected_rails_out) {
@@ -401,7 +402,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
     key_list_out.resize(data_rails_.size(), 0);
     selected_rails_out = selected_rails; // Return which rails were selected
 
-    // Register memory on each selected rail
+    // Register memory on each selected rail with HMEM hint
     for (size_t i = 0; i < selected_rails.size(); ++i) {
         size_t rail_idx = selected_rails[i];
         if (rail_idx >= data_rails_.size()) {
@@ -419,7 +420,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
 
         struct fid_mr *mr;
         uint64_t key;
-        nixl_status_t status = data_rails_[rail_idx]->registerMemory(buffer, length, &mr, &key);
+        nixl_status_t status = data_rails_[rail_idx]->registerMemory(buffer, length, hmem_hint, gpu_id, &mr, &key);
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "Failed to register memory on rail " << rail_idx;
             // Cleanup already registered MRs
@@ -891,4 +892,20 @@ size_t
 nixlLibfabricRailManager::getActiveRailCount() const {
     std::lock_guard<std::mutex> lock(active_rails_mutex_);
     return active_rails_.size();
+}
+
+int
+nixlLibfabricRailManager::getNumNvidiaGpus() const {
+    if (topology) {
+        return topology->getNumNvidiaGpus();
+    }
+    return 0;
+}
+
+int
+nixlLibfabricRailManager::getNumIntelHpus() const {
+    if (topology) {
+        return topology->getNumIntelHpus();
+    }
+    return 0;
 }

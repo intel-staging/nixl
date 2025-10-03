@@ -279,9 +279,17 @@ public:
     isProperlyInitialized() const;
 
     // Memory registration methods
-    /** Register memory buffer with libfabric */
+    /** Register memory buffer with libfabric with HMEM support
+     * @param buffer Memory buffer to register
+     * @param length Buffer length in bytes
+     * @param hmem_hint HMEM interface hint ("cuda", "synapseai", or empty for auto-detection)
+     * @param device_id Device ID for GPU memory (used when hmem_hint is specified, -1 for host memory)
+     * @param mr_out Output memory registration handle
+     * @param key_out Output remote access key
+     * @return NIXL_SUCCESS on success, error code on failure
+     */
     nixl_status_t
-    registerMemory(void *buffer, size_t length, struct fid_mr **mr_out, uint64_t *key_out) const;
+    registerMemory(void *buffer, size_t length, const std::string &hmem_hint, int device_id, struct fid_mr **mr_out, uint64_t *key_out) const;
 
     /** Deregister memory from libfabric */
     nixl_status_t

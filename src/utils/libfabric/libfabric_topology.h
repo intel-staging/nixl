@@ -42,7 +42,9 @@ private:
     std::string provider_name;
 
     // System information
-    int num_gpus;
+    int num_gpus;  // Total GPUs (NVIDIA + Intel HPU)
+    int num_nvidia_gpus;  // NVIDIA GPU count
+    int num_intel_hpus;   // Intel Habana HPU count
     int num_numa_nodes;
     int num_devices;
 
@@ -139,6 +141,16 @@ public:
     int
     getNumGpus() const {
         return num_gpus;
+    }
+
+    int
+    getNumNvidiaGpus() const {
+        return num_nvidia_gpus;
+    }
+
+    int
+    getNumIntelHpus() const {
+        return num_intel_hpus;
     }
 
     const std::vector<std::string> &
