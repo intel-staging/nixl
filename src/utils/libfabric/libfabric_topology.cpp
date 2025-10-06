@@ -440,8 +440,8 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
     hints->fabric_attr->prov_name = strdup(provider_name.c_str());
     LibfabricUtils::configureHintsForProvider(hints, provider_name);
 
-    // Use FI_VERSION(1, 16) for consistency with other fi_getinfo calls
-    int ret = fi_getinfo(FI_VERSION(1, 16), NULL, NULL, 0, hints, &info);
+    // Use FI_VERSION(1, 18) for DMABUF and HMEM support
+    int ret = fi_getinfo(FI_VERSION(1, 18), NULL, NULL, 0, hints, &info);
     if (ret) {
         NIXL_ERROR << "fi_getinfo failed for PCIe mapping with provider " << provider_name << ": "
                    << fi_strerror(-ret);

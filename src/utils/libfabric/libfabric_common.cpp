@@ -41,9 +41,9 @@ static const ProviderConfig PROVIDER_CONFIGS[] = {
     },
     {
         "verbs",  // Matches both "verbs" and "verbs;ofi_rxm"
-        FI_MSG | FI_RMA | FI_READ | FI_REMOTE_READ,
+        FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_RECV | FI_SEND | FI_REMOTE_READ | FI_REMOTE_WRITE | FI_MULTI_RECV | FI_LOCAL_COMM | FI_REMOTE_COMM | FI_HMEM,
         0,  // no mode flags required
-        FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY,
+        FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_HMEM,
         FI_RM_ENABLED,
         FI_THREAD_SAFE
     },
@@ -144,8 +144,8 @@ getAvailableNetworkDevices() {
         configureHintsForProvider(hints, "");
     }
 
-    // Use FI_VERSION(1, 16) where HMEM support for some GPUs was added
-    int ret = fi_getinfo(FI_VERSION(1, 16), NULL, NULL, 0, hints, &info);
+    // Use FI_VERSION(1, 18) for DMABUF and HMEM support
+    int ret = fi_getinfo(FI_VERSION(1, 18), NULL, NULL, 0, hints, &info);
     if (ret) {
         NIXL_ERROR << "fi_getinfo failed: " << fi_strerror(-ret);
         fi_freeinfo(hints);

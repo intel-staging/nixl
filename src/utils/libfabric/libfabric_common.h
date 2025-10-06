@@ -33,15 +33,6 @@
 #include <rdma/fi_rma.h>
 #include <rdma/fi_ext.h>
 
-// FI_HMEM constants compatibility for older libfabric versions (< 1.14.0)
-#ifndef FI_HMEM_CUDA
-#define FI_HMEM_CUDA ((fi_hmem_iface)1)
-#endif
-
-#ifndef FI_HMEM_SYNAPSEAI
-#define FI_HMEM_SYNAPSEAI ((fi_hmem_iface)8)
-#endif
-
 // Libfabric configuration constants
 #define NIXL_LIBFABRIC_DEFAULT_CONTROL_RAILS 1
 #define NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_SEC 1

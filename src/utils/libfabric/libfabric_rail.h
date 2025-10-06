@@ -383,6 +383,23 @@ public:
     nixlLibfabricReq *
     findRequestFromContext(void *context) const;
 
+#ifdef HAVE_SYNAPSEAI
+    // SynapseAI DMABUF registration helper
+    nixl_status_t
+    registerSynapseAIMemoryDmabuf(void *buffer, size_t length, int device_id, uint64_t provider_access_flags, struct fid_mr **mr_out) const;
+
+    // Static SynapseAI library handles (shared across all rails)
+    static void *synapseai_handle_;
+    static void *hlthunk_handle_;
+    static std::mutex synapseai_init_mutex_;
+
+    struct SynapseAIOps {
+        synStatus (*synDeviceGetInfoV2)(const synDeviceId deviceId, synDeviceInfoV2 *pDeviceInfo);
+        int (*hlthunk_device_mapped_memory_export_dmabuf_fd)(int fd, uint64_t addr, uint64_t size, uint64_t offset, uint32_t flags);
+    };
+    static SynapseAIOps synapseai_ops_;
+#endif
+
 private:
     // Core libfabric resources
     struct fi_info *info; // from rail_infos[rail_id]
@@ -417,6 +434,10 @@ private:
     processRecvCompletion(struct fi_cq_data_entry *comp) const;
     nixl_status_t
     processRemoteWriteCompletion(struct fi_cq_data_entry *comp) const;
+
+    // Memory registration helper
+    uint64_t
+    getMemoryRegistrationAccessFlags() const;
 };
 
 

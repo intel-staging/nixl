@@ -26,6 +26,18 @@
 #include <stdexcept>
 #include <stack>
 
+#ifdef HAVE_SYNAPSEAI
+#include <dlfcn.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+// Static SynapseAI library handles
+void* nixlLibfabricRail::synapseai_handle_ = nullptr;
+void* nixlLibfabricRail::hlthunk_handle_ = nullptr;
+std::mutex nixlLibfabricRail::synapseai_init_mutex_;
+nixlLibfabricRail::SynapseAIOps nixlLibfabricRail::synapseai_ops_ = {};
+#endif
+
 // RequestPool Base Class Implementation
 
 RequestPool::RequestPool(size_t pool_size, size_t rail_id)
@@ -433,8 +445,8 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
     hints->domain_attr->name = strdup(device_name.c_str());
     try {
         // Get fabric info for this specific device
-        // Use FI_VERSION(1, 16) for HMEM support for some GPU implementations
-        int ret = fi_getinfo(FI_VERSION(1, 16), NULL, NULL, 0, hints, &info);
+        // Use FI_VERSION(1, 18) for DMABUF and HMEM support
+        int ret = fi_getinfo(FI_VERSION(1, 18), NULL, NULL, 0, hints, &info);
         if (ret) {
             NIXL_ERROR << "fi_getinfo failed for rail " << rail_id << ": " << fi_strerror(-ret);
             throw std::runtime_error("fi_getinfo failed for rail " + std::to_string(rail_id));
@@ -1257,6 +1269,28 @@ nixlLibfabricRail::postRead(void *local_buffer,
 
 // Memory Registration Methods
 
+uint64_t
+nixlLibfabricRail::getMemoryRegistrationAccessFlags() const {
+    // Start with base flags needed for RDMA operations
+    uint64_t access_flags = FI_REMOTE_READ | FI_REMOTE_WRITE | FI_SEND | FI_RECV;
+
+    // TCP/sockets providers need additional basic flags
+    if (provider_name == "tcp" || provider_name == "sockets") {
+        access_flags |= FI_READ | FI_WRITE;
+    }
+
+    // Query provider capabilities and add conditionally
+    if (info && info->domain_attr) {
+        if (info->caps & FI_READ) access_flags |= FI_READ;
+        if (info->caps & FI_WRITE) access_flags |= FI_WRITE;
+        if (info->caps & FI_RMA) {
+            access_flags |= FI_READ | FI_WRITE;
+        }
+    }
+
+    return access_flags;
+}
+
 nixl_status_t
 nixlLibfabricRail::registerMemory(void *buffer,
                                   size_t length,
@@ -1273,16 +1307,8 @@ nixlLibfabricRail::registerMemory(void *buffer,
         return NIXL_ERR_BACKEND;
     }
 
-    // Determine access flags based on provider capabilities
-    uint64_t provider_access_flags;
-    if (provider_name == "tcp" || provider_name == "sockets") {
-        // TCP provider has more limited memory registration capabilities
-        // Use basic flags that are commonly supported
-        provider_access_flags = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
-    } else {
-        // EFA and other providers use standard remote access flags
-        provider_access_flags = FI_REMOTE_WRITE | FI_REMOTE_READ;
-    }
+    // Get access flags based on provider capabilities
+    uint64_t provider_access_flags = getMemoryRegistrationAccessFlags();
 
     struct fid_mr *mr;
     int ret;
@@ -1327,25 +1353,34 @@ nixlLibfabricRail::registerMemory(void *buffer,
             mr_attr.device.cuda = device_id;  // Critical for multi-GPU
             NIXL_DEBUG << "Using CUDA HMEM interface for memory registration on rail " << rail_id
                        << " device_id=" << device_id;
+
+            NIXL_TRACE << "HMEM Registration: rail=" << rail_id << " provider=" << provider_name
+                       << " buffer=" << buffer << " length=" << length << " iface=" << mr_attr.iface
+                       << " device_id=" << device_id
+                       << " access_flags=0x" << std::hex << provider_access_flags << std::dec;
+
+            ret = fi_mr_regattr(domain, &mr_attr, 0, &mr);
+            if (ret) {
+                NIXL_ERROR << "fi_mr_regattr (HMEM) failed on rail " << rail_id << ": " << fi_strerror(-ret)
+                           << " (buffer=" << buffer << ", length=" << length
+                           << ", hint=" << hmem_hint << ", iface=" << mr_attr.iface
+                           << ", device_id=" << device_id << ")";
+                return NIXL_ERR_BACKEND;
+            }
         } else if (hint_lower == "synapseai") {
-            mr_attr.iface = FI_HMEM_SYNAPSEAI;
-            mr_attr.device.synapseai = static_cast<uint32_t>(device_id);  // Critical for multi-device
-            NIXL_DEBUG << "Using SynapseAI HMEM interface for memory registration on rail " << rail_id
+#ifdef HAVE_SYNAPSEAI
+            // Use DMABUF path for SynapseAI
+            NIXL_DEBUG << "Using SynapseAI DMABUF registration on rail " << rail_id
                        << " device_id=" << device_id;
-        }
 
-        NIXL_TRACE << "HMEM Registration: rail=" << rail_id << " provider=" << provider_name
-                   << " buffer=" << buffer << " length=" << length << " iface=" << mr_attr.iface
-                   << " device_id=" << device_id
-                   << " access_flags=0x" << std::hex << provider_access_flags << std::dec;
-
-        ret = fi_mr_regattr(domain, &mr_attr, 0, &mr);
-        if (ret) {
-            NIXL_ERROR << "fi_mr_regattr (HMEM) failed on rail " << rail_id << ": " << fi_strerror(-ret)
-                       << " (buffer=" << buffer << ", length=" << length
-                       << ", hint=" << hmem_hint << ", iface=" << mr_attr.iface
-                       << ", device_id=" << device_id << ")";
-            return NIXL_ERR_BACKEND;
+            nixl_status_t status = registerSynapseAIMemoryDmabuf(buffer, length, device_id, provider_access_flags, &mr);
+            if (status != NIXL_SUCCESS) {
+                return status;
+            }
+#else
+            NIXL_ERROR << "SynapseAI support not enabled (HAVE_SYNAPSEAI not defined)";
+            return NIXL_ERR_NOT_SUPPORTED;
+#endif
         }
     } else {
         // === GDR Path (Default) ===
@@ -1387,6 +1422,137 @@ nixlLibfabricRail::registerMemory(void *buffer,
 
     return NIXL_SUCCESS;
 }
+
+#ifdef HAVE_SYNAPSEAI
+nixl_status_t
+nixlLibfabricRail::registerSynapseAIMemoryDmabuf(void *buffer, size_t length, int device_id, uint64_t provider_access_flags, struct fid_mr **mr_out) const {
+    synDeviceId syn_device_id = static_cast<synDeviceId>(device_id);
+    synDeviceInfoV2 device_info;
+
+    // Thread-safe initialization of static handles
+    std::lock_guard<std::mutex> lock(synapseai_init_mutex_);
+
+    // Load SynapseAI library functions (shared across instances)
+    if (!synapseai_handle_) {
+        synapseai_handle_ = dlopen("libSynapse.so", RTLD_NOW);
+        if (!synapseai_handle_) {
+            NIXL_ERROR << "Failed to dlopen libSynapse.so: " << dlerror();
+            return NIXL_ERR_BACKEND;
+        }
+
+        synapseai_ops_.synDeviceGetInfoV2 =
+            (synStatus (*)(const synDeviceId, synDeviceInfoV2 *))dlsym(synapseai_handle_, "synDeviceGetInfoV2");
+        if (!synapseai_ops_.synDeviceGetInfoV2) {
+            NIXL_ERROR << "Failed to find synDeviceGetInfoV2: " << dlerror();
+            return NIXL_ERR_BACKEND;
+        }
+    }
+
+    if (!hlthunk_handle_) {
+        hlthunk_handle_ = dlopen("libhl-thunk.so", RTLD_NOW);
+        if (!hlthunk_handle_) {
+            NIXL_ERROR << "Failed to dlopen libhl-thunk.so: " << dlerror();
+            return NIXL_ERR_BACKEND;
+        }
+
+        synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd =
+            (int (*)(int, uint64_t, uint64_t, uint64_t, uint32_t))dlsym(hlthunk_handle_, "hlthunk_device_mapped_memory_export_dmabuf_fd");
+        if (!synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd) {
+            NIXL_ERROR << "Failed to find hlthunk_device_mapped_memory_export_dmabuf_fd: " << dlerror();
+            return NIXL_ERR_BACKEND;
+        }
+    }
+
+    // Get device info
+    if (synapseai_ops_.synDeviceGetInfoV2(syn_device_id, &device_info) != synSuccess) {
+        NIXL_ERROR << "SynapseAI device " << device_id << " not available";
+        return NIXL_ERR_BACKEND;
+    }
+
+    NIXL_DEBUG << "Using SynapseAI device ID: " << device_id << " on rail " << rail_id;
+
+    // Calculate aligned buffer size
+    const size_t ACCEL_PAGE_SIZE = 4096;
+    size_t modi_memlen = length;
+
+    // Validate memory is within device range
+    uint64_t hbm_base = device_info.globalHbmBaseAddress;
+    uint64_t hbm_size = device_info.dramSize;
+    uint64_t buffer_addr = reinterpret_cast<uint64_t>(buffer);
+
+    if (buffer_addr < hbm_base || buffer_addr >= (hbm_base + hbm_size)) {
+        NIXL_ERROR << "Memory address 0x" << std::hex << buffer_addr
+                  << " is not within HPU device memory range [0x" << hbm_base
+                  << " - 0x" << (hbm_base + hbm_size) << "]" << std::dec;
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    // Align device offset to page size
+    uint64_t device_offset = buffer_addr - hbm_base;
+    uint64_t modi_mem_addr = buffer_addr;
+    if (buffer_addr % ACCEL_PAGE_SIZE) {
+        modi_mem_addr = (buffer_addr / ACCEL_PAGE_SIZE) * ACCEL_PAGE_SIZE;
+        device_offset -= buffer_addr - modi_mem_addr;
+        modi_memlen += ACCEL_PAGE_SIZE;
+    }
+    modi_memlen = (modi_memlen + ACCEL_PAGE_SIZE - 1) & ~(ACCEL_PAGE_SIZE - 1);
+
+    NIXL_DEBUG << "Exporting dmabuf: fd=" << device_info.fd
+              << " base=0x" << std::hex << hbm_base
+              << " size=" << std::dec << modi_memlen
+              << " buffer=0x" << std::hex << buffer_addr
+              << " aligned=0x" << modi_mem_addr
+              << " offset=0x" << device_offset << std::dec;
+
+    // Export dmabuf fd
+    int dmabuf_fd = synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd(
+        device_info.fd,
+        hbm_base,
+        modi_memlen,
+        device_offset,
+        (O_RDWR | O_CLOEXEC)
+    );
+
+    if (dmabuf_fd < 0) {
+        NIXL_ERROR << "hlthunk_device_mapped_memory_export_dmabuf_fd failed: " << strerror(-dmabuf_fd);
+        return NIXL_ERR_BACKEND;
+    }
+
+    NIXL_DEBUG << "Got dmabuf_fd: " << dmabuf_fd << " for device memory on rail " << rail_id;
+
+    // Set up dmabuf structure
+    struct fi_mr_dmabuf dmabuf = {};
+    dmabuf.fd = dmabuf_fd;
+    dmabuf.offset = 0;
+    dmabuf.len = modi_memlen;
+    dmabuf.base_addr = reinterpret_cast<void*>(modi_mem_addr);
+
+    // Set up memory registration attributes
+    struct fi_mr_attr mr_attr = {};
+    mr_attr.dmabuf = &dmabuf;
+    mr_attr.iov_count = 1;
+    mr_attr.access = provider_access_flags;
+    mr_attr.iface = FI_HMEM_SYNAPSEAI;
+    mr_attr.device.synapseai = static_cast<uint32_t>(device_id);
+
+    NIXL_DEBUG << "Registering SynapseAI memory with dmabuf fd: " << dmabuf_fd << " on rail " << rail_id;
+
+    // Register memory with dmabuf
+    int ret = fi_mr_regattr(domain, &mr_attr, FI_MR_DMABUF, mr_out);
+
+    // Cleanup fd after registration
+    close(dmabuf_fd);
+
+    if (ret) {
+        NIXL_ERROR << "fi_mr_regattr (DMABUF) failed on rail " << rail_id << ": " << fi_strerror(-ret);
+        *mr_out = nullptr;
+        return NIXL_ERR_BACKEND;
+    }
+
+    NIXL_INFO << "Successfully registered SynapseAI memory via dmabuf on rail " << rail_id;
+    return NIXL_SUCCESS;
+}
+#endif
 
 nixl_status_t
 nixlLibfabricRail::deregisterMemory(struct fid_mr *mr) const {
