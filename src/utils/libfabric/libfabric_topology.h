@@ -55,7 +55,8 @@ private:
     hwloc_topology_t hwloc_topology;
 
     // PCIe to Libfabric device mapping
-    std::map<std::string, std::string> pcie_to_libfabric_map;
+    // One PCIe address can have multiple libfabric devices (bonded case)
+    std::map<std::string, std::vector<std::string>> pcie_to_libfabric_map;
     std::map<std::string, std::string> libfabric_to_pcie_map;
 
     // Helper methods

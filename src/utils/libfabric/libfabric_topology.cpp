@@ -488,7 +488,7 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
                     std::string pcie_addr = path_str.substr(last_slash + 1);
                     // Verify format: domain:bus:device.function (e.g., 0000:6e:00.0)
                     if (pcie_addr.length() >= 7 && pcie_addr.find(':') != std::string::npos) {
-                        pcie_to_libfabric_map[pcie_addr] = libfabric_name;
+                        pcie_to_libfabric_map[pcie_addr].push_back(libfabric_name);
                         libfabric_to_pcie_map[libfabric_name] = pcie_addr;
                         mapped_count++;
                         NIXL_DEBUG << "  Successfully mapped PCIe " << pcie_addr << " → " << libfabric_name << " (via sysfs)";
@@ -516,7 +516,7 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
                  cur->nic->bus_attr->attr.pci.function_id);
 
         std::string pcie_address = pcie_addr;
-        pcie_to_libfabric_map[pcie_address] = libfabric_name;
+        pcie_to_libfabric_map[pcie_address].push_back(libfabric_name);
         libfabric_to_pcie_map[libfabric_name] = pcie_address;
         mapped_count++;
 
@@ -554,14 +554,18 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
     std::vector<NicInfo> discovered_nics;
     std::vector<GpuInfo> discovered_gpus;
 
-    NIXL_DEBUG << "Starting NIC discovery: pcie_to_libfabric_map has " << pcie_to_libfabric_map.size() << " entries";
+    NIXL_DEBUG << "Starting NIC discovery: pcie_to_libfabric_map has " << pcie_to_libfabric_map.size() << " PCIe addresses";
 
     // Discover NICs by correlating libfabric devices with hwloc objects
     for (const auto &pair : pcie_to_libfabric_map) {
         const std::string &pcie_addr = pair.first;
-        const std::string &libfabric_name = pair.second;
+        const std::vector<std::string> &libfabric_devices = pair.second;
 
-        NIXL_DEBUG << "Processing NIC: libfabric_name=" << libfabric_name << ", pcie_addr=" << pcie_addr;
+        NIXL_DEBUG << "Processing PCIe address " << pcie_addr << " with " << libfabric_devices.size() << " libfabric device(s)";
+
+        // Process all libfabric devices that share this PCIe address
+        for (const std::string &libfabric_name : libfabric_devices) {
+            NIXL_DEBUG << "  Processing device: " << libfabric_name;
 
         // Parse PCIe address
         uint16_t domain_id;
@@ -592,11 +596,12 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
             nic.device_id = device_id;
             nic.function_id = function_id;
             discovered_nics.push_back(nic);
-            NIXL_DEBUG << "Successfully correlated NIC: " << pcie_addr << " → " << libfabric_name;
+            NIXL_DEBUG << "    Successfully correlated NIC: " << pcie_addr << " → " << libfabric_name;
         } else {
-            NIXL_WARN << "Could not find hwloc object for PCIe address: " << pcie_addr;
+            NIXL_WARN << "  Could not find hwloc object for PCIe address: " << pcie_addr;
         }
-    }
+        } // end for each libfabric device
+    } // end for each PCIe address
 
     NIXL_DEBUG << "NIC discovery complete: found " << discovered_nics.size() << " NICs";
 
@@ -667,6 +672,33 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
             }
         }
     }
+
+    // Step 5: Handle bonded devices - if all NICs share the same PCIe address,
+    // assign them to all GPUs instead of just the closest one
+    if (!discovered_nics.empty() && pcie_to_libfabric_map.size() == 1) {
+        // All NICs share a single PCIe address - this is a bonded device
+        const std::string &bonded_pcie_addr = pcie_to_libfabric_map.begin()->first;
+        const std::vector<std::string> &bonded_devices = pcie_to_libfabric_map.begin()->second;
+
+        // Deduplicate device names - libfabric may report the same bonded device multiple times
+        std::vector<std::string> unique_devices;
+        std::set<std::string> seen;
+        for (const auto &dev : bonded_devices) {
+            if (seen.insert(dev).second) {
+                unique_devices.push_back(dev);
+            }
+        }
+
+        NIXL_INFO << "Detected bonded device at PCIe " << bonded_pcie_addr
+                  << " with " << bonded_devices.size() << " instances (" << unique_devices.size() << " unique)";
+        NIXL_INFO << "Assigning bonded device to all " << discovered_gpus.size() << " GPUs (bond driver handles load balancing)";
+
+        // Assign unique bonded device instances to all GPUs
+        for (size_t gpu_idx = 0; gpu_idx < discovered_gpus.size(); ++gpu_idx) {
+            gpu_to_nics[static_cast<int>(gpu_idx)] = unique_devices;
+        }
+    }
+
     return NIXL_SUCCESS;
 }
 
