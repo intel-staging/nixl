@@ -468,7 +468,7 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
         }
 
         if (!cur->nic->bus_attr) {
-            NIXL_DEBUG << "  Device " << libfabric_name << ": bus_attr is NULL (likely bonded device)";
+            NIXL_DEBUG << "  Device " << libfabric_name << ": bus_attr is NULL (likely virtual device, bonded NIC, etc.)";
             continue;
         }
 
@@ -563,8 +563,21 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
 
         NIXL_DEBUG << "Processing PCIe address " << pcie_addr << " with " << libfabric_devices.size() << " libfabric device(s)";
 
-        // Process all libfabric devices that share this PCIe address
-        for (const std::string &libfabric_name : libfabric_devices) {
+        // Deduplicate device names (libfabric may return the same device multiple times)
+        std::set<std::string> seen;
+        std::vector<std::string> unique_devices;
+        for (const auto &dev : libfabric_devices) {
+            if (seen.insert(dev).second) {
+                unique_devices.push_back(dev);
+            }
+        }
+
+        if (unique_devices.size() < libfabric_devices.size()) {
+            NIXL_DEBUG << "  Deduplicated " << libfabric_devices.size() << " → " << unique_devices.size() << " devices";
+        }
+
+        // Process all unique libfabric devices that share this PCIe address
+        for (const std::string &libfabric_name : unique_devices) {
             NIXL_DEBUG << "  Processing device: " << libfabric_name;
 
         // Parse PCIe address
@@ -673,27 +686,27 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
         }
     }
 
-    // Step 5: Handle bonded devices - if all NICs share the same PCIe address,
+    // Step 5: Handle virtual devices - if all NICs share the same PCIe address,
     // assign them to all GPUs instead of just the closest one
     if (!discovered_nics.empty() && pcie_to_libfabric_map.size() == 1) {
-        // All NICs share a single PCIe address - this is a bonded device
-        const std::string &bonded_pcie_addr = pcie_to_libfabric_map.begin()->first;
-        const std::vector<std::string> &bonded_devices = pcie_to_libfabric_map.begin()->second;
+        // All NICs share a single PCIe address - this is a virtual device
+        const std::string &vdev_pcie_addr = pcie_to_libfabric_map.begin()->first;
+        const std::vector<std::string> &vdev_devices = pcie_to_libfabric_map.begin()->second;
 
-        // Deduplicate device names - libfabric may report the same bonded device multiple times
+        // Deduplicate device names - libfabric may report the same virtual device multiple times
         std::vector<std::string> unique_devices;
         std::set<std::string> seen;
-        for (const auto &dev : bonded_devices) {
+        for (const auto &dev : vdev_devices) {
             if (seen.insert(dev).second) {
                 unique_devices.push_back(dev);
             }
         }
 
-        NIXL_INFO << "Detected bonded device at PCIe " << bonded_pcie_addr
-                  << " with " << bonded_devices.size() << " instances (" << unique_devices.size() << " unique)";
-        NIXL_INFO << "Assigning bonded device to all " << discovered_gpus.size() << " GPUs (bond driver handles load balancing)";
+        NIXL_INFO << "Detected virtual device at PCIe " << vdev_pcie_addr
+                  << " with " << vdev_devices.size() << " instances (" << unique_devices.size() << " unique)";
+        NIXL_INFO << "Assigning virtual device to all " << discovered_gpus.size() << " GPUs (if bond, lower layer handles load balancing)";
 
-        // Assign unique bonded device instances to all GPUs
+        // Assign unique virtual device instances to all GPUs
         for (size_t gpu_idx = 0; gpu_idx < discovered_gpus.size(); ++gpu_idx) {
             gpu_to_nics[static_cast<int>(gpu_idx)] = unique_devices;
         }
