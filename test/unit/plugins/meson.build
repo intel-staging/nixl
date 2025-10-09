@@ -1,4 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 Amazon.com, Inc. and affiliates.
+# SPDX-FileCopyrightText: Copyright (c) 2025 Intel Corporation. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,4 +48,9 @@ hf3fs_lib_file = 'hf3fs_api_shared'
 hf3fs_lib_found = cc.find_library(hf3fs_lib_file, dirs: [hf3fs_lib_path], required: false)
 if hf3fs_lib_found.found()
     subdir('hf3fs')
+endif
+
+# Libfabric plugin tests
+if libfabric_dep.found()
+    subdir('libfabric')
 endif
