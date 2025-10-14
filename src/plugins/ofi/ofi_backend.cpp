@@ -1249,11 +1249,11 @@ nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
             int ret = fi_cq_read(ofi_req->cq, entries, max_read);
             if (ret > 0) {
                 // process completions and free contexts
-                for (int i = 0; i < ret; ++i) {
-                    if (entries[i].op_context) {
-                        delete static_cast<uint64_t*>(entries[i].op_context);
-                    }
-                }
+                // for (int i = 0; i < ret; ++i) {
+                //     if (entries[i].op_context) {
+                //         delete static_cast<uint64_t*>(entries[i].op_context);
+                //     }
+                // }
 
                 // atomic update of completion count using compare-exchange to prevent races
                 uint64_t expected = ofi_req->wr_id.load();
