@@ -34,6 +34,7 @@
 #include <aws/core/utils/stream/PreallocatedStreamBuf.h>
 #include <aws/core/utils/memory/stl/AWSStringStream.h>
 #include <absl/strings/str_format.h>
+#include "common/nixl_log.h"
 #include "nixl_types.h"
 
 namespace {
@@ -44,9 +45,15 @@ createClientConfiguration(nixl_b_params_t *custom_params) {
 
     if (!custom_params) return config;
 
+    bool endpoint_override_set = false;
+    bool region_set = false;
+    bool verify_ssl_set = false;
+
     auto endpoint_override_it = custom_params->find("endpoint_override");
-    if (endpoint_override_it != custom_params->end())
+    if (endpoint_override_it != custom_params->end()) {
+        endpoint_override_set = true;
         config.endpointOverride = endpoint_override_it->second;
+    }
 
     auto scheme_it = custom_params->find("scheme");
     if (scheme_it != custom_params->end()) {
@@ -59,7 +66,26 @@ createClientConfiguration(nixl_b_params_t *custom_params) {
     }
 
     auto region_it = custom_params->find("region");
-    if (region_it != custom_params->end()) config.region = region_it->second;
+    if (region_it != custom_params->end()) {
+        config.region = region_it->second;
+        region_set = true;
+    }
+
+    // AWS SDK requires a region even for custom endpoints
+    if (endpoint_override_set && !region_set) {
+        config.region = "us-east-1";
+    }
+
+    auto verify_ssl_it = custom_params->find("verify_ssl");
+    if (verify_ssl_it != custom_params->end()) {
+        verify_ssl_set = true;
+        config.verifySSL = (verify_ssl_it->second == "true" || verify_ssl_it->second == "1");
+    }
+
+    // For custom endpoints, default to no SSL verification
+    if (endpoint_override_set && !verify_ssl_set) {
+        config.verifySSL = false;
+    }
 
     auto req_checksum_it = custom_params->find("req_checksum");
     if (req_checksum_it != custom_params->end()) {
@@ -75,7 +101,9 @@ createClientConfiguration(nixl_b_params_t *custom_params) {
     }
 
     auto ca_bundle_it = custom_params->find("ca_bundle");
-    if (ca_bundle_it != custom_params->end()) config.caFile = ca_bundle_it->second;
+    if (ca_bundle_it != custom_params->end()) {
+        config.caFile = ca_bundle_it->second;
+    }
 
     return config;
 }
@@ -106,19 +134,29 @@ bool
 getUseVirtualAddressing(nixl_b_params_t *custom_params) {
     if (!custom_params) return false;
 
+    bool has_custom_endpoint = (custom_params->find("endpoint_override") != custom_params->end());
+
     auto virtual_addressing_it = custom_params->find("use_virtual_addressing");
     if (virtual_addressing_it != custom_params->end()) {
         const std::string &value = virtual_addressing_it->second;
-        if (value == "true")
-            return true;
-        else if (value == "false")
+        bool requested_virtual = (value == "true" || value == "1");
+        
+        // Override to path-style for custom endpoints
+        if (requested_virtual && has_custom_endpoint) {
+            NIXL_WARN << "Virtual addressing not supported with custom endpoints. Using path-style.";
             return false;
+        }
+        
+        if (value == "false" || value == "0")
+            return false;
+        else if (value == "true" || value == "1")
+            return true;
         else
-            throw std::runtime_error("Invalid value for use_virtual_addressing: '" + value +
-                                     "'. Must be 'true' or 'false'");
+            throw std::runtime_error("Invalid use_virtual_addressing: '" + value + "'");
     }
 
-    return false;
+    // Default: path-style for custom endpoints, virtual for AWS S3
+    return !has_custom_endpoint;
 }
 
 std::string
@@ -204,6 +242,12 @@ awsS3Client::putObjectAsync(std::string_view key,
             const Aws::S3::Model::PutObjectRequest &req,
             const Aws::S3::Model::PutObjectOutcome &outcome,
             const std::shared_ptr<const Aws::Client::AsyncCallerContext> &context) {
+            if (!outcome.IsSuccess()) {
+                const auto &error = outcome.GetError();
+                NIXL_ERROR << "S3 PutObject failed for bucket='" << req.GetBucket() 
+                          << "' key='" << req.GetKey() << "': " 
+                          << error.GetExceptionName() << " - " << error.GetMessage();
+            }
             callback(outcome.IsSuccess());
         },
         nullptr);
@@ -235,6 +279,12 @@ awsS3Client::getObjectAsync(std::string_view key,
                          const Aws::S3::Model::GetObjectRequest &req,
                          const Aws::S3::Model::GetObjectOutcome &outcome,
                          const std::shared_ptr<const Aws::Client::AsyncCallerContext> &context) {
+            if (!outcome.IsSuccess()) {
+                const auto &error = outcome.GetError();
+                NIXL_ERROR << "S3 GetObject failed for bucket='" << req.GetBucket() 
+                          << "' key='" << req.GetKey() << "' range='" << req.GetRange() 
+                          << "': " << error.GetExceptionName() << " - " << error.GetMessage();
+            }
             callback(outcome.IsSuccess());
         },
         nullptr);
