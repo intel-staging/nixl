@@ -49,6 +49,7 @@ Backend parameters are passed as a key-value map (`nixl_b_params_t`) when creati
 | `use_virtual_addressing` | Use virtual-hosted-style addressing (`true`/`false`) | `false` | No |
 | `req_checksum` | Request checksum validation (`required`/`supported`) | - | No |
 | `ca_bundle` | path to a custom certificate bundle | - | No |
+| `verify_ssl` | Verify TLS certificates for HTTPS endpoints (`true`/`false`) | `true` | No |
 
 \* If `access_key` and `secret_key` are not provided, the AWS SDK will attempt to use default credential providers (IAM roles, environment variables, credential files, etc.)
 
@@ -112,15 +113,21 @@ nixl_b_params_t params = {
     {"access_key", "minioadmin"},
     {"secret_key", "minioadmin"},
     {"bucket", "test-bucket"},
-    {"endpoint_override", "http://localhost:9000"},
+    {"endpoint_override", "http://localhost:9000"}, // accepts host:port or full http(s)://host:port
     {"scheme", "http"},
     {"region", "us-east-1"},
     {"use_virtual_addressing", "false"},
     {"req_checksum", "supported"},
-    {"ca_bundle", "/root/ca-certs/cacert.pem"}
+    {"ca_bundle", "/root/ca-certs/cacert.pem"},
+    {"verify_ssl", "false"} // optional: disable verification for testing self-signed endpoints
 };
 agent.createBackend("obj", params);
 ```
+
+Notes on `endpoint_override`:
+- Accepts `host[:port]` or `http(s)://host[:port]`.
+- Trailing slash is ignored; path components are not supported and will be rejected.
+- If a scheme is present in `endpoint_override`, it is respected; otherwise the `scheme` param applies.
 
 #### Environment Variable Configuration
 
@@ -163,6 +170,11 @@ The Object Storage backend supports read and write operations between local memo
   - If `metaInfo` is provided in the blob descriptor, it is used as the object key
   - Otherwise, the device ID is converted to a string and used as the object key
 - This mapping is used during transfer operations to locate the correct S3 object
+
+Important: `metaInfo` is the S3 object key within the configured bucket. It is not a URL.
+If you pass a value containing `://` (e.g., `http://host/bucket/key`), it will be used as a literal key
+string, which is almost certainly not what you want. Configure endpoint, region, and bucket via backend
+parameters or environment, and pass only the object key in `metaInfo`.
 
 ### Read Operations
 

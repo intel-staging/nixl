@@ -20,6 +20,8 @@
 #include <string>
 #include <stdexcept>
 #include <cstdlib>
+#include <cctype>
+#include <cstring>
 #include <aws/s3/model/PutObjectRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/PutObjectResult.h>
@@ -44,9 +46,8 @@ createClientConfiguration(nixl_b_params_t *custom_params) {
 
     if (!custom_params) return config;
 
-    auto endpoint_override_it = custom_params->find("endpoint_override");
-    if (endpoint_override_it != custom_params->end())
-        config.endpointOverride = endpoint_override_it->second;
+    // Track if scheme was explicitly provided via params
+    bool scheme_explicit = false;
 
     auto scheme_it = custom_params->find("scheme");
     if (scheme_it != custom_params->end()) {
@@ -56,6 +57,48 @@ createClientConfiguration(nixl_b_params_t *custom_params) {
             config.scheme = Aws::Http::Scheme::HTTPS;
         else
             throw std::runtime_error("Invalid scheme: " + scheme_it->second);
+        scheme_explicit = true;
+    }
+
+    // Normalize endpoint_override to a form acceptable by AWS SDK
+    // - Accepts either host[:port] or full URL http(s)://host[:port]
+    // - Removes trailing '/'
+    // - Rejects path components
+    auto endpoint_override_it = custom_params->find("endpoint_override");
+    if (endpoint_override_it != custom_params->end()) {
+        std::string eo = endpoint_override_it->second;
+        // Trim leading/trailing spaces
+        auto trim = [](std::string &s) {
+            auto not_space = [](int ch) { return !std::isspace(ch); };
+            s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+            s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+        };
+        trim(eo);
+
+        auto starts_with = [](const std::string &s, const char *pfx) {
+            return s.compare(0, std::strlen(pfx), pfx) == 0;
+        };
+
+        // Detect and extract scheme if provided
+        if (starts_with(eo, "http://")) {
+            if (!scheme_explicit) config.scheme = Aws::Http::Scheme::HTTP;
+            eo.erase(0, std::strlen("http://"));
+        } else if (starts_with(eo, "https://")) {
+            if (!scheme_explicit) config.scheme = Aws::Http::Scheme::HTTPS;
+            eo.erase(0, std::strlen("https://"));
+        }
+
+        // Remove single trailing slash
+        if (!eo.empty() && eo.back() == '/') eo.pop_back();
+
+        // Disallow path components
+        auto slash_pos = eo.find('/');
+        if (slash_pos != std::string::npos) {
+            throw std::runtime_error(
+                "Invalid endpoint_override: must not contain path component (use host[:port] or http(s)://host[:port])");
+        }
+
+        config.endpointOverride = eo;
     }
 
     auto region_it = custom_params->find("region");
@@ -76,6 +119,19 @@ createClientConfiguration(nixl_b_params_t *custom_params) {
 
     auto ca_bundle_it = custom_params->find("ca_bundle");
     if (ca_bundle_it != custom_params->end()) config.caFile = ca_bundle_it->second;
+
+    // Optional SSL verification toggle for custom endpoints/certs
+    auto verify_ssl_it = custom_params->find("verify_ssl");
+    if (verify_ssl_it != custom_params->end()) {
+        const std::string &v = verify_ssl_it->second;
+        if (v == "true")
+            config.verifySSL = true;
+        else if (v == "false")
+            config.verifySSL = false;
+        else
+            throw std::runtime_error(
+                "Invalid value for verify_ssl: '" + v + "'. Must be 'true' or 'false'");
+    }
 
     return config;
 }
@@ -225,7 +281,7 @@ awsS3Client::getObjectAsync(std::string_view key,
     Aws::S3::Model::GetObjectRequest request;
     request.WithBucket(bucketName_)
         .WithKey(Aws::String(key))
-        .WithRange(absl::StrFormat("bytes=%d-%d", offset, offset + data_len - 1));
+        .WithRange(absl::StrFormat("bytes=%zu-%zu", offset, offset + data_len - 1));
     request.SetResponseStreamFactory(*stream_factory.get());
 
     s3Client_->GetObjectAsync(

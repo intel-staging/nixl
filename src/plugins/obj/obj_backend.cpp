@@ -146,6 +146,10 @@ nixlObjEngine::registerMem(const nixlBlobDesc &mem,
     if (nixl_mem == OBJ_SEG) {
         std::unique_ptr<nixlObjMetadata> obj_md = std::make_unique<nixlObjMetadata>(
             nixl_mem, mem.devId, mem.metaInfo.empty() ? std::to_string(mem.devId) : mem.metaInfo);
+        // Warn if metaInfo looks like a URL; OBJ uses fixed bucket and treats metaInfo as key only
+        if (obj_md->objKey.find("://") != std::string::npos) {
+            NIXL_WARN << "OBJ metaInfo appears to be a URL; treating as object key only (bucket/endpoint are configured via backend params).";
+        }
         devIdToObjKey_[mem.devId] = obj_md->objKey;
         out = obj_md.release();
     } else {
