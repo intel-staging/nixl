@@ -97,7 +97,9 @@ DEFINE_int32(gds_mt_num_threads, 1, "Number of threads used by GDS MT plugin (De
 // For example- 0:mlx5_0,mlx5_1,mlx5_2,1:mlx5_3,mlx5_4, ...
 DEFINE_string(device_list, "all", "Comma-separated device name to use for \
 		      communication (only used with nixl worker)");
-DEFINE_string(etcd_endpoints, "http://localhost:2379", "ETCD server endpoints for communication");
+DEFINE_string(etcd_endpoints,
+              "",
+              "ETCD server endpoints for communication (optional for storage backends)");
 
 // POSIX options - only used when backend is POSIX
 DEFINE_string (posix_api_type,
@@ -120,6 +122,10 @@ DEFINE_string(obj_endpoint_override, "", "Endpoint override for S3 backend");
 DEFINE_string(obj_req_checksum,
               XFERBENCH_OBJ_REQ_CHECKSUM_SUPPORTED,
               "Required checksum for S3 backend [supported, required]");
+DEFINE_string(obj_ca_bundle, "", "Path to CA bundle for S3 backend");
+
+// HF3FS options - only used when backend is HF3FS
+DEFINE_int32(hf3fs_iopool_size, 64, "Size of io memory pool");
 
 std::string xferBenchConfig::runtime_type = "";
 std::string xferBenchConfig::worker_type = "";
@@ -166,6 +172,8 @@ std::string xferBenchConfig::obj_region = "";
 bool xferBenchConfig::obj_use_virtual_addressing = false;
 std::string xferBenchConfig::obj_endpoint_override = "";
 std::string xferBenchConfig::obj_req_checksum = "";
+std::string xferBenchConfig::obj_ca_bundle = "";
+int xferBenchConfig::hf3fs_iopool_size = 0;
 
 int
 xferBenchConfig::loadFromFlags() {
@@ -191,7 +199,6 @@ xferBenchConfig::loadFromFlags() {
         if (backend == XFERBENCH_BACKEND_GDS) {
             gds_batch_pool_size = FLAGS_gds_batch_pool_size;
             gds_batch_limit = FLAGS_gds_batch_limit;
-            storage_enable_direct = FLAGS_storage_enable_direct;
         }
 
         if (backend == XFERBENCH_BACKEND_GDS_MT) {
@@ -201,7 +208,6 @@ xferBenchConfig::loadFromFlags() {
         // Load POSIX-specific configurations if backend is POSIX
         if (backend == XFERBENCH_BACKEND_POSIX) {
             posix_api_type = FLAGS_posix_api_type;
-            storage_enable_direct = FLAGS_storage_enable_direct;
 
             // Validate POSIX API type
             if (posix_api_type != XFERBENCH_POSIX_API_AIO &&
@@ -219,7 +225,7 @@ xferBenchConfig::loadFromFlags() {
 
         // Load HD3FS-specific configurations if backend is HD3FS
         if (backend == XFERBENCH_BACKEND_HF3FS) {
-            storage_enable_direct = FLAGS_storage_enable_direct;
+            hf3fs_iopool_size = FLAGS_hf3fs_iopool_size;
         }
 
         // Load OBJ-specific configurations if backend is OBJ
@@ -233,6 +239,7 @@ xferBenchConfig::loadFromFlags() {
             obj_use_virtual_addressing = FLAGS_obj_use_virtual_addressing;
             obj_endpoint_override = FLAGS_obj_endpoint_override;
             obj_req_checksum = FLAGS_obj_req_checksum;
+            obj_ca_bundle = FLAGS_obj_ca_bundle;
 
             // Validate OBJ S3 scheme
             if (obj_scheme != XFERBENCH_OBJ_SCHEME_HTTP &&
@@ -274,6 +281,14 @@ xferBenchConfig::loadFromFlags() {
     posix_api_type = FLAGS_posix_api_type;
     storage_enable_direct = FLAGS_storage_enable_direct;
 
+    // Validate ETCD configuration
+    if (!isStorageBackend() && etcd_endpoints.empty()) {
+        // For non-storage backends, set default ETCD endpoint
+        etcd_endpoints = "http://localhost:2379";
+        std::cout << "Using default ETCD endpoint for non-storage backend: " << etcd_endpoints
+                  << std::endl;
+    }
+
     if (worker_type == XFERBENCH_WORKER_NVSHMEM) {
         if (!((XFERBENCH_SEG_TYPE_VRAM == initiator_seg_type) &&
               (XFERBENCH_SEG_TYPE_VRAM == target_seg_type) &&
@@ -307,15 +322,16 @@ xferBenchConfig::loadFromFlags() {
                   << std::endl;
         return -1;
     }
-    if (max_block_size > (total_buffer_size / num_threads)) {
-        std::cerr << "Incorrect buffer size configuration" << " max_block_size(" << max_block_size
-                  << ") >" << " (total_buffer_size / num_threads)("
+    if ((max_block_size * max_batch_size) > (total_buffer_size / num_threads)) {
+        std::cerr << "Incorrect buffer size configuration " << "(max_block_size * max_batch_size) "
+                  << "(" << (max_block_size * max_batch_size) << ")"
+                  << " is > (total_buffer_size / num_threads) ("
                   << (total_buffer_size / num_threads) << ")" << std::endl;
         return -1;
     }
 
-    if (large_blk_iter_ftr == 0 || large_blk_iter_ftr > num_iter) {
-        std::cerr << "iter_factor must not be 0 and must be lower than num_iter" << std::endl;
+    if (large_blk_iter_ftr <= 0) {
+        std::cerr << "iter_factor must be greater than 0" << std::endl;
         return -1;
     }
 
@@ -367,7 +383,11 @@ xferBenchConfig::printConfig() {
     printSeparator('*');
     printOption("Runtime (--runtime_type=[etcd])", runtime_type);
     if (runtime_type == XFERBENCH_RT_ETCD) {
-        printOption("ETCD Endpoint ", etcd_endpoints);
+        if (etcd_endpoints.empty()) {
+            printOption("ETCD Endpoint ", "disabled (storage backend)");
+        } else {
+            printOption("ETCD Endpoint ", etcd_endpoints);
+        }
     }
     printOption("Worker type (--worker_type=[nixl,nvshmem])", worker_type);
     if (worker_type == XFERBENCH_WORKER_NIXL) {
@@ -409,6 +429,7 @@ xferBenchConfig::printConfig() {
                         obj_endpoint_override);
             printOption("OBJ S3 required checksum (--obj_req_checksum=[supported, required])",
                         obj_req_checksum);
+            printOption("OBJ S3 CA bundle (--obj_ca_bundle=cert-path)", obj_ca_bundle);
         }
 
         if (xferBenchConfig::isStorageBackend()) {

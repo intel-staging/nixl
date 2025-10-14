@@ -187,6 +187,7 @@ private:
     std::mutex invalidated_agents_mutex;
     std::unordered_map<std::string, std::unique_ptr<etcd::Watcher>,
                         std::hash<std::string>, strEqual> agentWatchers;
+    std::chrono::microseconds watchTimeout_;
 
     // Helper function to create etcd key
     std::string makeKey(const std::string& agent_name,
@@ -197,7 +198,9 @@ private:
     }
 
 public:
-    nixlEtcdClient(const std::string& my_agent_name) {
+    nixlEtcdClient(const std::string &my_agent_name,
+                   const std::chrono::microseconds &timeout = std::chrono::microseconds(5000000))
+        : watchTimeout_(timeout) {
         const char* etcd_endpoints = std::getenv("NIXL_ETCD_ENDPOINTS");
         if (!etcd_endpoints || strlen(etcd_endpoints) == 0) {
             throw std::runtime_error("No etcd endpoints provided");
@@ -319,9 +322,15 @@ public:
             int64_t watch_index = response.index();
             std::promise<nixl_status_t> ret_prom;
             auto future = ret_prom.get_future();
+            std::atomic<bool> promise_set{false};
 
             // This lambda assumes lifetime only inside this method
             auto watcher_callback = [&](etcd::Response response) -> void {
+                if (promise_set.exchange(true)) {
+                    NIXL_DEBUG << "Ignoring subsequent watch event for key: " << metadata_key;
+                    return;
+                }
+
                 if (!response.is_ok()) {
                     NIXL_ERROR << "Watch failed for key: " << metadata_key << " : "
                                << response.error_message();
@@ -340,7 +349,7 @@ public:
 
             auto watcher = etcd::Watcher(*etcd, metadata_key, watch_index, watcher_callback);
 
-            auto status = future.wait_for(std::chrono::seconds(5));
+            auto status = future.wait_for(watchTimeout_);
             if (status == std::future_status::timeout) {
                 NIXL_ERROR << "Watch timed out for key: " << metadata_key;
                 return NIXL_ERR_BACKEND;
@@ -432,7 +441,7 @@ void nixlAgentData::commWorker(nixlAgent* myAgent){
     std::unique_ptr<nixlEtcdClient> etcdClient = nullptr;
     // useEtcd is set in nixlAgent constructor and is true if NIXL_ETCD_ENDPOINTS is set
     if(useEtcd) {
-        etcdClient = std::make_unique<nixlEtcdClient>(name);
+        etcdClient = std::make_unique<nixlEtcdClient>(name, config.etcdWatchTimeout);
     }
 #endif // HAVE_ETCD
 
@@ -661,6 +670,58 @@ void nixlAgentData::getCommWork(std::vector<nixl_comm_req_t> &req_list){
     std::lock_guard<std::mutex> lock(commLock);
     req_list = std::move(commQueue);
     commQueue.clear();
+}
+
+nixl_status_t
+nixlAgentData::loadConnInfo(const std::string &remote_name,
+                            const nixl_backend_t &backend,
+                            const nixl_blob_t &conn_info) {
+    if (backendEngines.count(backend) == 0) {
+        NIXL_DEBUG << "Agent " << name << " does not support a remote backend: " << backend;
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    // No need to reload same conn info, error if it changed
+    if ((remoteBackends.count(remote_name) != 0) &&
+        (remoteBackends[remote_name].count(backend) != 0)) {
+        if (remoteBackends[remote_name][backend] != conn_info) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+
+        return NIXL_SUCCESS;
+    }
+
+    nixlBackendEngine *eng = backendEngines[backend];
+    if (!eng->supportsRemote()) {
+        NIXL_DEBUG << backend << " does not support remote operations";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    const nixl_status_t ret = eng->loadRemoteConnInfo(remote_name, conn_info);
+    if (ret != NIXL_SUCCESS) {
+        return ret;
+    }
+
+    remoteBackends[remote_name].emplace(backend, conn_info);
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgentData::loadRemoteSections(const std::string &remote_name, nixlSerDes &sd) {
+    if (remoteSections.count(remote_name) == 0) {
+        remoteSections[remote_name] = new nixlRemoteSection(remote_name);
+    }
+
+    const nixl_status_t ret = remoteSections[remote_name]->loadRemoteData(&sd, backendEngines);
+    // TODO: can be more graceful, if just the new MD blob was improper
+    if (ret != NIXL_SUCCESS) {
+        delete remoteSections[remote_name];
+        remoteSections.erase(remote_name);
+        remoteBackends.erase(remote_name);
+        return ret;
+    }
+
+    return NIXL_SUCCESS;
 }
 
 nixl_status_t

@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ucx_backend_dep = declare_dependency(link_with: ucx_backend_lib, include_directories: [nixl_inc_dirs, utils_inc_dirs, '../../src/plugins/ucx'])
-
 desc_example = executable('desc_example',
            'desc_example.cpp',
            dependencies: [nixl_dep, nixl_infra],
@@ -36,7 +34,7 @@ nixl_test_app  = executable('nixl_test', 'nixl_test.cpp',
 
 plugin_test = executable('test_plugin',
                         'test_plugin.cpp',
-                        dependencies: [nixl_dep, cuda_dep],
+                        dependencies: [nixl_dep, nixl_common_dep, cuda_dep],
                         include_directories: [nixl_inc_dirs, utils_inc_dirs],
                         install: true)
 
