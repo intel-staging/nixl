@@ -27,7 +27,9 @@
 #include "serdes/serdes.h"
 #include <mutex>
 #include <vector>
-
+#ifdef HAVE_SYNAPSEAI
+#include "synapseai_utils.h"
+#endif
 #define NUM_TRANSFERS 2
 #define NUM_THREADS 4
 #define SIZE 1024
@@ -48,30 +50,39 @@ struct SharedNotificationState {
 static const std::string target("target");
 static const std::string initiator("initiator");
 
-static std::vector<std::unique_ptr<uint8_t[]>> initMem(nixlAgent &agent,
-                                                       nixl_reg_dlist_t &dram,
-                                                       nixl_opt_args_t *extra_params,
-                                                       uint8_t val) {
+static std::vector<std::unique_ptr<uint8_t[]>>
+initMem(nixlAgent &agent, nixl_reg_dlist_t &mem_dlist, nixl_opt_args_t *extra_params, uint8_t val) {
     std::vector<std::unique_ptr<uint8_t[]>> addrs;
 
     for (int i = 0; i < NUM_TRANSFERS; i++) {
         auto addr = std::make_unique<uint8_t[]>(SIZE);
-
         std::fill_n(addr.get(), SIZE, val);
-        std::cout << "Allocating : " << (void *)addr.get() << ", "
-                  << "Setting to 0x" << std::hex << (unsigned)val << std::dec << std::endl;
-        dram.addDesc(nixlBlobDesc((uintptr_t)(addr.get()), SIZE, 0, ""));
 
+#ifdef HAVE_SYNAPSEAI
+        auto device_buffer = Synapseaiutils::allocate_synapse_memory(SIZE, addr.get());
+
+        std::cout << "Allocating : " << addr.get() << ", " << "Setting to 0x" << std::hex
+                  << (unsigned)val << std::dec << std::endl;
+        mem_dlist.addDesc(nixlBlobDesc(
+            (uintptr_t)(device_buffer), SIZE, Synapseaiutils::get_device_handle(), ""));
+#else
+        mem_dlist.addDesc(nixlBlobDesc((uintptr_t)(addr.get()), SIZE, 0, ""));
+#endif
         addrs.push_back(std::move(addr));
     }
-    agent.registerMem(dram, extra_params);
+    agent.registerMem(mem_dlist, extra_params);
 
     return addrs;
 }
 
-static void targetThread(nixlAgent &agent, nixl_opt_args_t *extra_params, int thread_id) {
-    nixl_reg_dlist_t dram_for_ucx(DRAM_SEG);
-    auto addrs = initMem(agent, dram_for_ucx, extra_params, 0);
+static void
+targetThread(nixlAgent &agent, nixl_opt_args_t *extra_params, int thread_id, std::string backend) {
+#ifdef HAVE_SYNAPSEAI
+    nixl_reg_dlist_t mem_dlist(VRAM_SEG);
+#else
+    nixl_reg_dlist_t mem_dlist(DRAM_SEG);
+#endif
+    auto addrs = initMem(agent, mem_dlist, extra_params, 0);
 
     nixl_blob_t tgt_metadata;
     agent.getLocalMD(tgt_metadata);
@@ -79,47 +90,68 @@ static void targetThread(nixlAgent &agent, nixl_opt_args_t *extra_params, int th
     std::cout << "Thread " << thread_id << " Start Control Path metadata exchanges\n";
 
     std::cout << "Thread " << thread_id << " Desc List from Target to Initiator\n";
-    dram_for_ucx.print();
+    mem_dlist.print();
 
     /** Only send desc list */
     nixlSerDes serdes;
-    assert(dram_for_ucx.trim().serialize(&serdes) == NIXL_SUCCESS);
+    assert(mem_dlist.trim().serialize(&serdes) == NIXL_SUCCESS);
 
     std::cout << "Thread " << thread_id << " Wait for initiator and then send xfer descs\n";
     std::string message = serdes.exportStr();
-    while (agent.genNotif(initiator, message, extra_params) != NIXL_SUCCESS);
-    std::cout << "Thread " << thread_id << " End Control Path metadata exchanges\n";
+
+    while (agent.genNotif(initiator, message, extra_params) != NIXL_SUCCESS)
+        ;
 
     std::cout << "Thread " << thread_id << " Start Data Path Exchanges\n";
     std::cout << "Thread " << thread_id << " Waiting to receive Data from Initiator\n";
 
     bool rc = false;
     for (int n_tries = 0; !rc && n_tries < 100; n_tries++) {
-        //Only works with progress thread now, as backend is protected
+        // Only works with progress thread now, as backend is protected
         /** Sanity Check */
+#ifdef HAVE_SYNAPSEAI
+        for (int i = 0; i < mem_dlist.descCount(); ++i) {
+            nixlBlobDesc desc = mem_dlist[i];
+            Synapseaiutils::copy_from_device_buffer((uint64_t)desc.addr, addrs[i].get(), desc.len);
+        }
+#endif
         rc = std::all_of(addrs.begin(), addrs.end(), [](auto &addr) {
-            return std::all_of(addr.get(), addr.get() + SIZE, [](int x) {
-                return x == MEM_VAL;
-            });
+            return std::all_of(addr.get(), addr.get() + SIZE, [](int x) { return x == MEM_VAL; });
         });
-        if (!rc)
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (!rc) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     if (!rc)
-        std::cerr << "Thread " << thread_id << " UCX Transfer failed, buffers are different\n";
+        std::cerr << "Thread " << thread_id << " " << backend
+                  << " Transfer failed, buffers are different\n";
     else
-        std::cout << "Thread " << thread_id << " Transfer completed and Buffers match with Initiator\n"
-                  << "Thread " << thread_id << " UCX Transfer Success!!!\n";
+        std::cout << "Thread " << thread_id
+                  << " Transfer completed and Buffers match with Initiator\n"
+                  << "Thread " << thread_id << " " << backend << " Transfer Success!!!\n";
 
     std::cout << "Thread " << thread_id << " Cleanup..\n";
-    agent.deregisterMem(dram_for_ucx, extra_params);
+    agent.deregisterMem(mem_dlist, extra_params);
+#ifdef HAVE_SYNAPSEAI
+    for (int i = 0; i < mem_dlist.descCount(); ++i) {
+        nixlBlobDesc desc = mem_dlist[i];
+        Synapseaiutils::free_synapse_memory((uint64_t)desc.addr);
+    }
+#endif
 }
 
-static void initiatorThread(nixlAgent &agent, nixl_opt_args_t *extra_params,
-                          const std::string &target_ip, int target_port, int thread_id,
-                          SharedNotificationState &shared_state) {
-    nixl_reg_dlist_t dram_for_ucx(DRAM_SEG);
-    auto addrs = initMem(agent, dram_for_ucx, extra_params, MEM_VAL);
+static void
+initiatorThread(nixlAgent &agent,
+                nixl_opt_args_t *extra_params,
+                const std::string &target_ip,
+                int target_port,
+                int thread_id,
+                SharedNotificationState &shared_state,
+                std::string backend) {
+#ifdef HAVE_SYNAPSEAI
+    nixl_reg_dlist_t mem_dlist(VRAM_SEG);
+#else
+    nixl_reg_dlist_t mem_dlist(DRAM_SEG);
+#endif
+    auto addrs = initMem(agent, mem_dlist, extra_params, MEM_VAL);
 
     std::cout << "Thread " << thread_id << " Start Control Path metadata exchanges\n";
     std::cout << "Thread " << thread_id << " Exchange metadata with Target\n";
@@ -163,13 +195,15 @@ static void initiatorThread(nixlAgent &agent, nixl_opt_args_t *extra_params,
     }
 
     std::cout << "Thread " << thread_id << " Verify Deserialized Target's Desc List at Initiator\n";
-    nixl_xfer_dlist_t dram_target_ucx(&remote_serdes);
-    nixl_xfer_dlist_t dram_initiator_ucx = dram_for_ucx.trim();
-    dram_target_ucx.print();
+
+    nixl_xfer_dlist_t xfer_target_dlist(&remote_serdes);
+    nixl_xfer_dlist_t xfer_initiator_dlist = mem_dlist.trim();
+    xfer_target_dlist.print();
 
     std::cout << "Thread " << thread_id << " End Control Path metadata exchanges\n";
     std::cout << "Thread " << thread_id << " Start Data Path Exchanges\n\n";
-    std::cout << "Thread " << thread_id << " Create transfer request with UCX backend\n";
+    std::cout << "Thread " << thread_id << " Create transfer request with " << backend
+              << " backend\n";
 
     // Need to do this in a loop with NIXL_ERR_NOT_FOUND
     // UCX AM with desc list is faster than listener thread can recv/load MD with sockets
@@ -177,8 +211,8 @@ static void initiatorThread(nixlAgent &agent, nixl_opt_args_t *extra_params,
     nixlXferReqH *treq;
     nixl_status_t ret = NIXL_SUCCESS;
     do {
-        ret = agent.createXferReq(NIXL_WRITE, dram_initiator_ucx, dram_target_ucx,
-                                  target, treq, extra_params);
+        ret = agent.createXferReq(
+            NIXL_WRITE, xfer_initiator_dlist, xfer_target_dlist, target, treq, extra_params);
     } while (ret == NIXL_ERR_NOT_FOUND);
 
     if (ret != NIXL_SUCCESS) {
@@ -186,7 +220,7 @@ static void initiatorThread(nixlAgent &agent, nixl_opt_args_t *extra_params,
         exit(-1);
     }
 
-    std::cout << "Thread " << thread_id << " Post the request with UCX backend\n";
+    std::cout << "Thread " << thread_id << " Post the request with " << backend << " backend\n";
     ret = agent.postXferReq(treq);
     std::cout << "Thread " << thread_id << " Initiator posted Data Path transfer\n";
     std::cout << "Thread " << thread_id << " Waiting for completion\n";
@@ -195,88 +229,133 @@ static void initiatorThread(nixlAgent &agent, nixl_opt_args_t *extra_params,
         ret = agent.getXferStatus(treq);
         assert(ret >= 0);
     }
-    std::cout << "Thread " << thread_id << " Completed Sending Data using UCX backend\n";
+    std::cout << "Thread " << thread_id << " Completed Sending Data using " << backend
+              << " backend\n";
     agent.releaseXferReq(treq);
     agent.invalidateLocalMD(&md_extra_params);
 
     std::cout << "Thread " << thread_id << " Cleanup..\n";
-    agent.deregisterMem(dram_for_ucx, extra_params);
+    agent.deregisterMem(mem_dlist, extra_params);
+#ifdef HAVE_SYNAPSEAI
+    for (int i = 0; i < mem_dlist.descCount(); ++i) {
+        nixlBlobDesc desc = mem_dlist[i];
+        Synapseaiutils::free_synapse_memory((uint64_t)desc.addr);
+    }
+#endif
 }
 
-static void runTarget(const std::string &ip, int port, nixl_thread_sync_t sync_mode) {
+static void
+runTarget(const std::string &ip, int port, nixl_thread_sync_t sync_mode, std::string backend) {
     nixlAgentConfig cfg(true, true, port, sync_mode, 1, 0, 100000, false);
+
 
     std::cout << "Starting Agent for target\n";
     nixlAgent agent(target, cfg);
 
     nixl_b_params_t params = {
-        { "num_workers", "4" },
+        {"num_workers", "4"},
     };
-    nixlBackendH *ucx;
-    agent.createBackend("UCX", params, ucx);
+    nixlBackendH *nixl_backend;
+    agent.createBackend(backend, params, nixl_backend);
+
+#ifdef HAVE_SYNAPSEAI
+    Synapseaiutils::init_synapse_device();
+#endif
 
     nixl_opt_args_t extra_params;
-    extra_params.backends.push_back(ucx);
+    extra_params.backends.push_back(nixl_backend);
 
     std::vector<std::thread> threads;
     for (int i = 0; i < NUM_THREADS; i++)
-        threads.emplace_back(targetThread, std::ref(agent), &extra_params, i);
+        threads.emplace_back(targetThread, std::ref(agent), &extra_params, i, backend);
 
     for (auto &thread : threads)
         thread.join();
+#ifdef HAVE_SYNAPSEAI
+    Synapseaiutils::deinit_synapse_device();
+#endif
 }
 
-static void runInitiator(const std::string &target_ip, int target_port, nixl_thread_sync_t sync_mode) {
+static void
+runInitiator(const std::string &target_ip,
+             int target_port,
+             nixl_thread_sync_t sync_mode,
+             std::string backend) {
     nixlAgentConfig cfg(true, true, 0, sync_mode, 1, 0, 100000, false);
 
     std::cout << "Starting Agent for initiator\n";
     nixlAgent agent(initiator, cfg);
 
     nixl_b_params_t params = {
-        { "num_workers", "4" },
+        {"num_workers", "4"},
     };
-    nixlBackendH *ucx;
-    agent.createBackend("UCX", params, ucx);
+    nixlBackendH *nixl_backend;
+    agent.createBackend(backend, params, nixl_backend);
+
+#ifdef HAVE_SYNAPSEAI
+    Synapseaiutils::init_synapse_device();
+#endif
 
     nixl_opt_args_t extra_params;
-    extra_params.backends.push_back(ucx);
+    extra_params.backends.push_back(nixl_backend);
 
     SharedNotificationState shared_state;
 
     std::vector<std::thread> threads;
     for (int i = 0; i < NUM_THREADS; i++)
-        threads.emplace_back(initiatorThread, std::ref(agent), &extra_params,
-                             target_ip, target_port, i, std::ref(shared_state));
+        threads.emplace_back(initiatorThread,
+                             std::ref(agent),
+                             &extra_params,
+                             target_ip,
+                             target_port,
+                             i,
+                             std::ref(shared_state),
+                             backend);
 
     for (auto &thread : threads)
         thread.join();
+
+#ifdef HAVE_SYNAPSEAI
+    Synapseaiutils::deinit_synapse_device();
+#endif
 }
 
-int main(int argc, char *argv[]) {
+int
+main(int argc, char *argv[]) {
     /** Argument Parsing */
     if (argc < 4) {
-        std::cout <<"Enter the required arguments\n" << std::endl;
-        std::cout <<"<Role> " <<"<Target IP> <Target Port>"
-                  << std::endl;
+        std::cout << "Enter the required arguments\n" << std::endl;
+        std::cout << "<Role> " << "<Target IP> <Target Port>" << std::endl;
         exit(-1);
     }
 
     std::string role = std::string(argv[1]);
-    const char  *target_ip   = argv[2];
-    int         target_port = std::stoi(argv[3]);
+    const char *target_ip = argv[2];
+    int target_port = std::stoi(argv[3]);
 
     std::transform(role.begin(), role.end(), role.begin(), ::tolower);
 
     if (!role.compare(initiator) && !role.compare(target)) {
-            std::cerr << "Invalid role. Use 'initiator' or 'target'."
-                      << "Currently "<< role <<std::endl;
+        std::cerr << "Invalid role. Use 'initiator' or 'target'." << "Currently " << role
+                  << std::endl;
+        return 1;
+    }
+
+    std::string backend = "UCX"; // default
+    if (argc == 5) {
+        backend = argv[4];
+        std::transform(backend.begin(), backend.end(), backend.begin(), ::toupper);
+        if (backend != "UCX" && backend != "LIBFABRIC") {
+            std::cerr << "This test is support only for UCX/LIBFABRIC backend" << std::endl;
             return 1;
+        }
     }
 
     auto sync_mode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
-    if (argc == 5) {
-        std::string sync_mode_str{argv[4]};
-        std::transform(sync_mode_str.begin(), sync_mode_str.end(), sync_mode_str.begin(), ::tolower);
+    if (argc == 6) {
+        std::string sync_mode_str{argv[5]};
+        std::transform(
+            sync_mode_str.begin(), sync_mode_str.end(), sync_mode_str.begin(), ::tolower);
         if (sync_mode_str == "rw") {
             sync_mode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
             std::cout << "Using RW sync mode" << std::endl;
@@ -292,9 +371,9 @@ int main(int argc, char *argv[]) {
     /*** End - Argument Parsing */
 
     if (role == target)
-        runTarget(target_ip, target_port, sync_mode);
+        runTarget(target_ip, target_port, sync_mode, backend);
     else
-        runInitiator(target_ip, target_port, sync_mode);
+        runInitiator(target_ip, target_port, sync_mode, backend);
 
     return 0;
 }

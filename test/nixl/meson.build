@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 desc_example = executable('desc_example',
            'desc_example.cpp',
            dependencies: [nixl_dep, nixl_infra],
@@ -27,10 +28,20 @@ agent_example = executable('agent_example',
            link_with: [serdes_lib],
            install: true)
 
-nixl_test_app  = executable('nixl_test', 'nixl_test.cpp',
-                           dependencies: [nixl_dep, nixl_infra, stream_interface, thread_dep],
-                           include_directories: [nixl_inc_dirs, utils_inc_dirs, '../../src/utils/serdes'],
-                           link_with: [serdes_lib], install: true)
+if synapseai_dep.found()
+    compile_flags += ['-DHAVE_SYNAPSEAI']
+    nixl_test_app  = executable('nixl_test', 'nixl_test.cpp',
+                             cpp_args: compile_flags,
+                             dependencies: [nixl_dep, nixl_infra, stream_interface, thread_dep, test_synapseai_utils_dep],
+                             include_directories: [nixl_inc_dirs, utils_inc_dirs, '../../src/utils/serdes'],
+                             link_with: [serdes_lib], install: true)
+else
+    nixl_test_app  = executable('nixl_test', 'nixl_test.cpp',
+                             dependencies: [nixl_dep, nixl_infra, stream_interface, thread_dep],
+                             include_directories: [nixl_inc_dirs, utils_inc_dirs, '../../src/utils/serdes'],
+                             link_with: [serdes_lib], install: true)
+endif
+
 
 plugin_test = executable('test_plugin',
                         'test_plugin.cpp',
