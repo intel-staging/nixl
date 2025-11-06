@@ -7,7 +7,7 @@ import glob
 import shutil
 
 # --- Configuration ---
-WHEELS_CACHE_HOME = os.environ.get("WHEELS_CACHE_HOME", "/workspace/wheels_cache")
+WHEELS_CACHE_HOME = os.environ.get("WHEELS_CACHE_HOME", "/tmp/wheels_cache")
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 UCX_DIR = os.path.join('/tmp', 'ucx_source')
 LIBFABRIC_DIR = os.path.join('/tmp', 'libfabric_source')
@@ -74,7 +74,8 @@ def install_system_dependencies():
         "meson",
         "libtool",
         "libtool-bin",
-        "libhwloc-dev"
+        "libhwloc-dev",
+        "zip"
     ]
     run_command(['apt-get', 'update'])
     run_command(['apt-get', 'install', '-y'] + apt_packages)
