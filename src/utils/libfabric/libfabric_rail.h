@@ -31,8 +31,8 @@
 #include "libfabric/libfabric_common.h"
 
 #ifdef HAVE_SYNAPSEAI
-#include <habanalabs/synapse_api.h>
-#include <habanalabs/hlthunk.h>
+#include <synapse_api.h>
+#include <hlthunk.h>
 #endif
 
 // Forward declarations

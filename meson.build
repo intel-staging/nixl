@@ -105,13 +105,31 @@ else
 endif
 
 # SynapseAI (Habana Gaudi) dependency detection
-# Try to find both libSynapse and hl-thunk libraries
-synapse_lib = cpp.find_library('Synapse',
+synapse_inc_path = get_option('synapsepath_inc')
+synapse_lib_path = get_option('synapsepath_lib')
+
+if synapse_lib_path == ''
+    #use default path
+    # Try to find both libSynapse and hl-thunk libraries
+    synapse_lib = cpp.find_library('Synapse',
+                                 dirs: ['/usr/lib/habanalabs', '/usr/local/lib/habanalabs'],
+                               required: false)
+    hlthunk_lib = cpp.find_library('hl-thunk',
                                dirs: ['/usr/lib/habanalabs', '/usr/local/lib/habanalabs'],
                                required: false)
-hlthunk_lib = cpp.find_library('hl-thunk',
-                               dirs: ['/usr/lib/habanalabs', '/usr/local/lib/habanalabs'],
+else
+    synapse_lib = cpp.find_library('Synapse',
+                                 dirs: [synapse_lib_path],
                                required: false)
+    hlthunk_lib = cpp.find_library('hl-thunk',
+                               dirs: [synapse_lib_path],
+                               required: false)
+endif
+
+if synapse_inc_path == ''
+  #use default path
+  synapse_inc_path = '/usr/include/habanalabs'
+endif
 
 # SynapseAI support requires both libraries
 synapseai_dep = dependency('', required: false)  # Initialize as not found
@@ -127,8 +145,8 @@ if synapseai_dep.found()
     synapseai_dep = declare_dependency(
         dependencies: synapseai_dep,
         include_directories: [
-            include_directories('/usr/include/habanalabs'),
-            include_directories('/usr/include/drm')
+            include_directories('/usr/include/drm'),
+            include_directories(synapse_inc_path)
         ]
     )
     message('Found SynapseAI support for Habana Gaudi devices')

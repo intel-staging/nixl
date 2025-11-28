@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2025 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,11 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-subdir('utils')
+utils_inc = include_directories('.')
 
-# Re-export dependency to project root
-test_synapseai_utils_dep = test_synapseai_utils_dep
+synapseai_utils_lib = static_library(
+  'synapseai_utils',
+  ['synapseai_utils.cpp'],
+  include_directories: utils_inc,
+  dependencies: [ synapseai_dep ],
+)
 
-subdir('nixl')
-subdir('unit')
-subdir('gtest')
+synapseai_utils_dep = declare_dependency(
+  link_with: synapseai_utils_lib,
+  include_directories: utils_inc,
+  dependencies: [ synapseai_dep ],
+)
+
+# Export to parent (test/) scope
+test_synapseai_utils_dep = synapseai_utils_dep
+
