@@ -79,6 +79,7 @@ def test(sender_meta: NixlAgentMetadata, agent: NixlAgent, local_xfer_handle: st
     num_iterations = args.num_iterations if not is_warmup else 1
     logging.info(f"Starting transfer loop for {num_iterations} iterations...")
     logging.info(f"Each iteration transfers {args.blocks_per_xfer} blocks ({data_per_iteration / 1e6:.2f} MB)")
+    logging.info(f"Do extra h2d copy: {args.do_h2d_cp}")
 
     # Measure total elapsed time for sustained throughput calculation
     start_time = time.perf_counter()
@@ -89,9 +90,11 @@ def test(sender_meta: NixlAgentMetadata, agent: NixlAgent, local_xfer_handle: st
         end = start + args.blocks_per_xfer
         block_ids = list(range(start, end))
         iteration_history.append((start, end))
-        
-        # Transfer and measure time
-        latency_ms, data_transferred = read_blocks(block_ids, agent, local_xfer_handle, remote_xfer_handle, sender_meta)
+
+
+        # Transfer and measure time, h2d copy operation will enabled when do_h2d_cp=True
+        latency_ms, data_transferred = read_blocks(block_ids, agent, local_xfer_handle, remote_xfer_handle, sender_meta,
+                                                   args.do_h2d_cp, local_kv_cache, start, end)
         
         # Verify data_transferred matches expected amount
         assert data_transferred == data_per_iteration, f"Data mismatch: expected {data_per_iteration}, got {data_transferred}"
@@ -161,7 +164,8 @@ def create_xfer_descs(agent: NixlAgent, base_addr: int, num_blocks: int, block_l
 
 
 def read_blocks(block_ids: Iterator[int], agent: NixlAgent,
-                local_xfer_handle: str, remote_xfer_handle: str, sender_meta: NixlAgentMetadata):
+                local_xfer_handle: str, remote_xfer_handle: str, sender_meta: NixlAgentMetadata,
+                do_h2d_cp, local_kv_cache, start, end):
     """ Read blocks from the sender's KV cache using NIXL. """
     if not block_ids:
         logging.warning("No block IDs provided for transfer.")
@@ -191,7 +195,12 @@ def read_blocks(block_ids: Iterator[int], agent: NixlAgent,
         time.sleep(0.00001)
     agent.release_xfer_handle(xfer_handle)
     del xfer_handle
+
+    if do_h2d_cp:
+        local_kv_cache[start:end].to("hpu")
     t1 = time.perf_counter_ns()
+
+
     
     return (t1 - t0) / 1e6, len(local_ids) * sender_meta.block_len  # Return latency in ms
 
@@ -490,6 +499,8 @@ if __name__ == "__main__":
                         help="Role to run: sender or receiver")
     parser.add_argument("--zmq-host", type=str, default="127.0.0.1",
                         help="ZMQ host address (use sender's IP for receiver)")
+    parser.add_argument("--do-h2d-cp", action="store_true",
+                        help="Do extra h2d copy")
     args = parser.parse_args()
     #FI_LOG_LEVEL=debug NIXL_LOG_LEVEL=debug 
     # PT_HPU_POOL_STRATEGY=0 NIXL_PLUGIN_DIR=/workspace/nixl/nixl-nixl_libfabric/build/cp310/src/plugins/libfabric python ts_nixl/nixl_api.py  --device-type hpu --nixl_backend libfabric --nixl-memory-type DRAM
