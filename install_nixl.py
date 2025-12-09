@@ -134,6 +134,8 @@ def build_and_install_prerequisites(args):
     configure_command = [
         "./configure",
         f"--prefix={ucx_install_path}",
+        "--with-mlx5=no",
+        "--with-gaudi=yes",
         "--enable-shared",
         "--disable-static",
         "--disable-doxygen-doc",
@@ -146,6 +148,7 @@ def build_and_install_prerequisites(args):
     run_command(configure_command, cwd=ucx_source_path)
     run_command(["make", "-j", str(os.cpu_count() or 1)], cwd=ucx_source_path)
     run_command(["make", "install"], cwd=ucx_source_path)
+    run_command(["ldconfig"])
     print("--- UCX build and install complete ---", flush=True)
 
     # -- Step 2: Build Libfabric from source --
