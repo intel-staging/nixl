@@ -20,7 +20,8 @@ UCX_REPO_URL = "https://github.com/intel-staging/ucx.git"
 UCX_BRANCH = "intel_gaudi_gdr_enabling_0"
 LIBFABRIC_REPO_URL = "https://github.com/ofiwg/libfabric.git"
 LIBFABRIC_REF = "v1.21.0"  # Using a recent stable tag
-NIXL_REPO_URL = "https://github.com/intel-staging/nixl.git"
+# TODO: Change back nixl repo to an intel-staging branch
+NIXL_REPO_URL = "https://github.com/pi314ever/nixl.git"
 NIXL_BRANCH = "v0.6.0_UCX"
 
 
