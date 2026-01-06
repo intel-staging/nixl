@@ -25,6 +25,8 @@
 #include <mutex>
 #include <ostream>
 #include <stack>
+#include <chrono>
+#include <atomic>
 
 #include "nixl.h"
 #include "backend/backend_aux.h"
@@ -37,6 +39,7 @@
 
 // Forward declarations
 class nixlLibfabricConnection;
+
 
 /**
  * @brief Request structure for libfabric operations
@@ -61,6 +64,11 @@ struct nixlLibfabricReq {
     uint64_t remote_addr; ///< Remote memory address for transfers
     struct fid_mr *local_mr; ///< Local memory registration for transfers
     uint64_t remote_key; ///< Remote access key for transfers
+    uint64_t transfer_id;
+    size_t bytes;
+    std::chrono::steady_clock::time_point submit_start_ts;
+    std::chrono::steady_clock::time_point submit_end_ts;
+    std::chrono::steady_clock::time_point cq_ts;
 
     /** Default constructor initializing all fields */
     nixlLibfabricReq()
@@ -82,6 +90,9 @@ struct nixlLibfabricReq {
     }
 };
 
+// global monotonically increasing transfer id
+inline std::atomic<uint64_t> g_nixl_xfer_id{0};
+ 
 /** Thread-safe request pool with O(1) allocation/release */
 class RequestPool {
 public:

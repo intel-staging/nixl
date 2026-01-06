@@ -746,7 +746,6 @@ nixlLibfabricRail::progressCompletionQueue(bool use_blocking) const {
         NIXL_TRACE << "Completion received on rail " << rail_id << " flags: " << std::hex
                    << completion.flags << " data: " << completion.data
                    << " context: " << completion.op_context << std::dec;
-
         // Process completion using local data. Callbacks have their own thread safety
         nixl_status_t status = processCompletionQueueEntry(&completion);
         if (status != NIXL_SUCCESS) {
@@ -771,6 +770,29 @@ nixlLibfabricRail::processCompletionQueueEntry(struct fi_cq_data_entry *comp) co
                << " FI_WRITE: " << (flags & FI_WRITE)
                << " FI_REMOTE_WRITE: " << (flags & FI_REMOTE_WRITE) << std::dec;
 
+    nixlLibfabricReq *req = findRequestFromContext(comp->op_context);
+    if (req && req->in_use) { 
+    	req->cq_ts = std::chrono::steady_clock::now();
+    	using us = std::chrono::microseconds;
+        auto submit_us =
+          std::chrono::duration_cast<us>(
+                           req->submit_end_ts - req->submit_start_ts).count();
+   
+        auto total_us =
+          std::chrono::duration_cast<us>(
+                          req->cq_ts - req->submit_start_ts).count();
+   
+        auto inflight_us = total_us - submit_us;
+   
+       NIXL_INFO
+          << "NIXL_XFER "
+          << "rail=" << rail_id
+          << " id=" << req->xfer_id
+          << " op=" << req->operation_type
+          << " submit_us=" << submit_us
+          << " inflight_us=" << inflight_us
+         << " total_us=" << total_us;
+    }
     if (flags & FI_SEND) {
         // Local send completions (fi_senddata) - use context
         return processLocalSendCompletion(comp);
@@ -851,7 +873,6 @@ nixlLibfabricRail::processLocalSendCompletion(struct fi_cq_data_entry *comp) con
                    << " on rail " << rail_id;
         return NIXL_ERR_BACKEND;
     }
-
     return NIXL_SUCCESS;
 }
 
@@ -878,7 +899,6 @@ nixlLibfabricRail::processLocalTransferCompletion(struct fi_cq_data_entry *comp,
                    << comp->op_context << " on rail " << rail_id;
         return NIXL_ERR_BACKEND;
     }
-
     return NIXL_SUCCESS;
 }
 
@@ -1124,7 +1144,10 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
         NIXL_ERROR << "Invalid request for write on rail " << rail_id;
         return NIXL_ERR_INVALID_PARAM;
     }
-
+    req->submit_start_ts = std::chrono::steady_clock::now();
+    req->xfer_id = g_nixl_xfer_id.fetch_add(1, std::memory_order_relaxed);
+    req->bytes = length;
+    req->rail_id = rail_id;
     NIXL_TRACE << "Posting RDMA write on endpoint: " << std::hex << endpoint
                << " local_buffer: " << local_buffer << " length: " << length
                << " immediate_data: " << immediate_data << " dest_addr: " << dest_addr
@@ -1152,6 +1175,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
             NIXL_TRACE << "RDMA write posted successfully"
                        << (attempt > 0 ? " after " + std::to_string(attempt + 1) + " attempts" :
                                          "");
+	    req->submit_end_ts = std::chrono::steady_clock::now();
             return NIXL_SUCCESS;
         }
 
