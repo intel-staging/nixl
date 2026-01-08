@@ -314,7 +314,7 @@ private:
     std::unique_ptr<nixlLibfabricTopology> topology;
 
     // Fabric device to rail mapping
-    std::unordered_map<std::string, size_t> device_to_rail_map;
+    std::unordered_map<std::string, std::vector<size_t>> device_to_rail_map;
 
     // Active Rail Tracking System
     std::unordered_set<size_t> active_rails_;
