@@ -25,6 +25,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <stack>
+#include <thread>
 
 #ifdef HAVE_SYNAPSEAI
 #include <dlfcn.h>
@@ -700,8 +701,9 @@ nixlLibfabricRail::setXferIdCallback(std::function<void(uint32_t)> callback) {
 nixl_status_t
 nixlLibfabricRail::progressCompletionQueue(bool use_blocking) const {
     // Completion processing
-    struct fi_cq_data_entry completion;
-    memset(&completion, 0, sizeof(completion));
+    // Batch read to amortize lock and syscall overhead
+    struct fi_cq_data_entry entries[32];
+    memset(entries, 0, sizeof(entries));
 
     int ret;
 
@@ -711,10 +713,10 @@ nixlLibfabricRail::progressCompletionQueue(bool use_blocking) const {
 
         if (use_blocking && blocking_cq_sread_supported) {
             // Blocking read using fi_cq_sread (used by CM thread)
-            ret = fi_cq_sread(cq, &completion, 1, nullptr, NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_SEC);
+            ret = fi_cq_sread(cq, entries, 1, nullptr, NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_SEC);
         } else {
             // Non-blocking read (used by progress thread or fallback)
-            ret = fi_cq_read(cq, &completion, 1);
+            ret = fi_cq_read(cq, entries, 32);
         }
 
         if (ret < 0 && ret != -FI_EAGAIN) {
@@ -738,24 +740,25 @@ nixlLibfabricRail::progressCompletionQueue(bool use_blocking) const {
     }
     // CQ lock released here - completion is now local data
 
-    if (ret == -FI_EAGAIN) {
+    if (ret == -FI_EAGAIN || ret == 0) {
         return NIXL_IN_PROG; // No completions available
     }
 
-    if (ret == 1) {
-        NIXL_TRACE << "Completion received on rail " << rail_id << " flags: " << std::hex
-                   << completion.flags << " data: " << completion.data
-                   << " context: " << completion.op_context << std::dec;
 
-        // Process completion using local data. Callbacks have their own thread safety
-        nixl_status_t status = processCompletionQueueEntry(&completion);
-        if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to process completion on rail " << rail_id;
-            return status;
+    if (ret > 0) {
+        bool ok = true;
+        for (int i = 0; i < ret; ++i) {
+            NIXL_TRACE << "Completion received on rail " << rail_id << " flags=" << std::hex
+                       << entries[i].flags << " data=" << entries[i].data
+                       << " context=" << entries[i].op_context << std::dec;
+            nixl_status_t status = processCompletionQueueEntry(&entries[i]);
+            if (status != NIXL_SUCCESS) {
+                NIXL_ERROR << "Failed to process completion on rail " << rail_id;
+                ok = false;
+                break;
+            }
         }
-
-        NIXL_DEBUG << "Completion processed on rail " << rail_id;
-        return NIXL_SUCCESS;
+        return ok ? NIXL_SUCCESS : NIXL_ERR_BACKEND;
     }
 
     return NIXL_ERR_BACKEND; // Unexpected case
@@ -1077,7 +1080,7 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
 
         if (ret == -FI_EAGAIN) {
             // Resource temporarily unavailable - retry indefinitely for all providers
-            attempt++;
+            ++attempt;
 
             // Log every N attempts to avoid log spam
             if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {
@@ -1088,17 +1091,17 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
                            << ", retrying (attempt " << attempt << ")";
             }
 
-            // Exponential backoff with cap to avoid overwhelming the system
-            int delay_us = std::min(NIXL_LIBFABRIC_BASE_RETRY_DELAY_US * (1 + attempt / 10),
-                                    NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
-
-            // Progress completion queue to drain pending completions before retry
-            nixl_status_t progress_status = progressCompletionQueue(false);
-            if (progress_status == NIXL_SUCCESS) {
-                NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
+            // Progress CQ a few times before backing off
+            if (attempt <= 8) {
+                (void)progressCompletionQueue(false);
+            } else {
+                int delay_us = std::min(1000 * (attempt / 10 + 1), 100000); // 1ms..100ms
+                if (blocking_cq_sread_supported)
+                    (void)progressCompletionQueue(true);
+                else
+                    std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
             }
 
-            usleep(delay_us);
             continue;
         } else {
             // Other error - don't retry, fail immediately
@@ -1157,7 +1160,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
 
         if (ret == -FI_EAGAIN) {
             // Resource temporarily unavailable - retry indefinitely for all providers
-            attempt++;
+            ++attempt;
 
             // Log every N attempts to avoid log spam
             if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {
@@ -1168,17 +1171,16 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
                            << ", retrying (attempt " << attempt << ")";
             }
 
-            // Exponential backoff with cap to avoid overwhelming the system
-            int delay_us = std::min(NIXL_LIBFABRIC_BASE_RETRY_DELAY_US * (1 + attempt / 10),
-                                    NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
-
-            // Progress completion queue to drain pending completions before retry
-            nixl_status_t progress_status = progressCompletionQueue(false);
-            if (progress_status == NIXL_SUCCESS) {
-                NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
+            // Progress CQ a few times before backing off
+            if (attempt <= 8) {
+                (void)progressCompletionQueue(false);
+            } else {
+                int delay_us = std::min(1000 * (attempt / 10 + 1), 100000); // 1ms..100ms
+                if (blocking_cq_sread_supported)
+                    (void)progressCompletionQueue(true);
+                else
+                    std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
             }
-
-            usleep(delay_us);
             continue;
         } else {
             // Other error - don't retry, fail immediately
@@ -1245,17 +1247,16 @@ nixlLibfabricRail::postRead(void *local_buffer,
                            << ", retrying (attempt " << attempt << ")";
             }
 
-            // Exponential backoff with cap to avoid overwhelming the system
-            int delay_us = std::min(NIXL_LIBFABRIC_BASE_RETRY_DELAY_US * (1 + attempt / 10),
-                                    NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
-
-            // Progress completion queue to drain pending completions before retry
-            nixl_status_t progress_status = progressCompletionQueue(false);
-            if (progress_status == NIXL_SUCCESS) {
-                NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
+            // Progress CQ a few times before backing off
+            if (attempt <= 8) {
+                (void)progressCompletionQueue(false);
+            } else {
+                int delay_us = std::min(1000 * (attempt / 10 + 1), 100000); // 1ms..100ms
+                if (blocking_cq_sread_supported)
+                    (void)progressCompletionQueue(true);
+                else
+                    std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
             }
-
-            usleep(delay_us);
             continue;
         } else {
             // Other error - don't retry, fail immediately

@@ -658,11 +658,11 @@ nixlLibfabricRailManager::progressActiveDataRails() {
 }
 
 nixl_status_t
-nixlLibfabricRailManager::progressAllControlRails() {
+nixlLibfabricRailManager::progressAllControlRails(bool blocking) {
     bool any_completions = false;
     for (size_t rail_id = 0; rail_id < num_control_rails_; ++rail_id) {
-        nixl_status_t status =
-            control_rails_[rail_id]->progressCompletionQueue(true); // Blocking for control rails
+        nixl_status_t status = control_rails_[rail_id]->progressCompletionQueue(
+            blocking); // Blocking for control rails
         if (status == NIXL_SUCCESS) {
             any_completions = true;
             NIXL_DEBUG << "Processed completion on control rail " << rail_id;
