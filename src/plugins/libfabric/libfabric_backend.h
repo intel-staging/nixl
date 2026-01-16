@@ -192,6 +192,9 @@ private:
 
     mutable size_t total_transfer_size_;
 
+    // HMEM interface management
+    std::string default_hmem_iface_;  // Backend-wide default HMEM interface from custom params (default: "cuda")
+
     // Map of agent name to connection info
     // <remoteAgent, <connection>>
     mutable std::unordered_map<std::string, std::shared_ptr<nixlLibfabricConnection>> connections_;

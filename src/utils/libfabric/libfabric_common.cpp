@@ -29,6 +29,87 @@
 
 namespace LibfabricUtils {
 
+// Provider-specific configurations
+static const ProviderConfig PROVIDER_CONFIGS[] = {
+    {"efa",
+     FI_MSG | FI_RMA | FI_LOCAL_COMM | FI_REMOTE_COMM,
+     FI_CONTEXT | FI_CONTEXT2,
+     0, // let provider choose
+     FI_RM_UNSPEC,
+     FI_THREAD_SAFE},
+    {"verbs", // Matches both "verbs" and "verbs;ofi_rxm"
+     FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_RECV | FI_SEND | FI_REMOTE_READ | FI_REMOTE_WRITE |
+         FI_MULTI_RECV | FI_LOCAL_COMM | FI_REMOTE_COMM | FI_HMEM,
+     0, // no mode flags required
+     FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_HMEM,
+     FI_RM_ENABLED,
+     FI_THREAD_SAFE},
+    {"tcp",
+     FI_MSG | FI_RMA | FI_LOCAL_COMM | FI_REMOTE_COMM,
+     FI_CONTEXT | FI_CONTEXT2,
+     0, // basic MR mode, overridden in rail.cpp
+     FI_RM_UNSPEC,
+     FI_THREAD_UNSPEC},
+    {
+        "sockets",
+        FI_MSG | FI_RMA | FI_LOCAL_COMM | FI_REMOTE_COMM,
+        0,
+        0, // let provider choose
+        FI_RM_UNSPEC,
+        FI_THREAD_UNSPEC // default threading
+    }};
+
+static const size_t NUM_PROVIDER_CONFIGS = sizeof(PROVIDER_CONFIGS) / sizeof(PROVIDER_CONFIGS[0]);
+
+void
+configureHintsForProvider(struct fi_info *hints, const std::string &provider_name) {
+    const ProviderConfig *config = nullptr;
+
+    // Find matching config
+    // Match order: 1) exact match, 2) prefix match for composite providers (e.g., "verbs;ofi_rxm")
+    for (size_t i = 0; i < NUM_PROVIDER_CONFIGS; ++i) {
+        const std::string &config_name = PROVIDER_CONFIGS[i].name;
+
+        // Exact match
+        if (provider_name == config_name) {
+            config = &PROVIDER_CONFIGS[i];
+            break;
+        }
+
+        // Composite provider match (e.g., "verbs;ofi_rxm" matches "verbs")
+        // Check if provider_name starts with config_name followed by ";"
+        if (provider_name.rfind(config_name + ";", 0) == 0) {
+            config = &PROVIDER_CONFIGS[i];
+            break;
+        }
+    }
+
+    if (!config) {
+        // Default configuration
+        NIXL_DEBUG << "No specific config for provider '" << provider_name << "', using defaults";
+        hints->caps = FI_MSG | FI_RMA | FI_LOCAL_COMM | FI_REMOTE_COMM;
+        hints->mode = 0;
+        hints->ep_attr->type = FI_EP_RDM;
+        return;
+    }
+
+    // Apply provider-specific configuration
+    hints->caps = config->caps;
+    hints->mode = config->mode;
+    hints->ep_attr->type = FI_EP_RDM;
+
+    if (config->resource_mgmt != FI_RM_UNSPEC) {
+        hints->domain_attr->resource_mgmt = config->resource_mgmt;
+    }
+
+    if (config->mr_mode != 0) {
+        hints->domain_attr->mr_mode = config->mr_mode;
+    }
+
+    if (config->threading != FI_THREAD_UNSPEC) {
+        hints->domain_attr->threading = config->threading;
+    }
+}
 
 std::pair<std::string, std::vector<std::string>>
 getAvailableNetworkDevices() {
@@ -43,16 +124,24 @@ getAvailableNetworkDevices() {
         return {"none", {}};
     }
 
-    hints->caps = 0;
-    hints->caps = FI_MSG | FI_RMA; // Basic messaging and RMA
+    // Check if FI_PROVIDER environment variable is set
+    const char *env_provider = getenv("FI_PROVIDER");
+    std::string provider = env_provider && env_provider[0] != '\0' ? env_provider : "";
 
-    hints->caps |= FI_LOCAL_COMM | FI_REMOTE_COMM;
-    hints->mode = FI_CONTEXT;
-    hints->ep_attr->type = FI_EP_RDM;
+    if (!provider.empty()) {
+        hints->fabric_attr->prov_name = strdup(env_provider);
+        NIXL_INFO << "Using provider from FI_PROVIDER environment: " << env_provider;
+        // Configure hints based on provider
+        configureHintsForProvider(hints, provider);
+    } else {
+        // Auto-detect: start with default configuration
+        configureHintsForProvider(hints, "");
+    }
 
+    // Use FI_VERSION(1, 18) for DMABUF and HMEM support
     int ret = fi_getinfo(FI_VERSION(1, 18), NULL, NULL, 0, hints, &info);
     if (ret) {
-        NIXL_ERROR << "fi_getinfo failed " << fi_strerror(-ret);
+        NIXL_ERROR << "fi_getinfo failed: " << fi_strerror(-ret);
         fi_freeinfo(hints);
         return {"none", {}};
     }
@@ -85,8 +174,23 @@ getAvailableNetworkDevices() {
         }
     }
 
+    // Provider selection priority:
+    // 1. EFA (AWS Elastic Fabric Adapter)
+    // 2. verbs;ofi_rxm (explicit verbs with RXM)
+    // 3. verbs (plain verbs)
+    // 4. sockets (TCP fallback)
+
     if (provider_device_map.find("efa") != provider_device_map.end()) {
         return {"efa", provider_device_map["efa"]};
+    } else if (provider_device_map.find("verbs;ofi_rxm") != provider_device_map.end()) {
+        // Explicit verbs with RXM
+        NIXL_INFO << "Using verbs with RXM for RDM endpoint support";
+        return {"verbs;ofi_rxm", provider_device_map["verbs;ofi_rxm"]};
+    } else if (provider_device_map.find("verbs") != provider_device_map.end()) {
+        // Plain verbs - might not support RDM, but try it
+        NIXL_WARN << "Using plain verbs provider - may not support RDM endpoints. "
+                  << "Consider setting FI_PROVIDER=verbs;ofi_rxm for RDM support";
+        return {"verbs", provider_device_map["verbs"]};
     } else if (provider_device_map.find("sockets") != provider_device_map.end()) {
         return {"sockets", {provider_device_map["sockets"][0]}};
     }

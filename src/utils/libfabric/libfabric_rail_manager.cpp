@@ -74,14 +74,14 @@ nixlLibfabricRailManager::~nixlLibfabricRailManager() {
 }
 
 nixl_status_t
-nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_devices,
+nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &fabric_devices,
                                           const std::string &provider_name) {
-    num_data_rails_ = efa_devices.size();
+    num_data_rails_ = fabric_devices.size();
     // Pre-allocate to ensure contiguous memory allocation
     data_rails_.reserve(num_data_rails_);
 
-    // Build EFA device to rail index mapping for O(1) lookup
-    efa_device_to_rail_map.reserve(num_data_rails_);
+    // Build fabric device to rail index mapping for O(1) lookup
+    device_to_rail_map.reserve(num_data_rails_);
 
     try {
         data_rails_.clear();
@@ -89,13 +89,13 @@ nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_de
 
         for (size_t i = 0; i < num_data_rails_; ++i) {
             data_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i)));
+                fabric_devices[i], provider_name, static_cast<uint16_t>(i)));
 
-            // Initialize EFA device mapping
-            efa_device_to_rail_map[efa_devices[i]] = i;
+            // Initialize fabric device mapping
+            device_to_rail_map[fabric_devices[i]] = i;
 
-            NIXL_DEBUG << "Created data rail " << i << " (device=" << efa_devices[i]
-                       << ", provider=" << provider_name << ")";
+            NIXL_DEBUG << "Created data rail " << i << " (device: " << fabric_devices[i]
+                       << ", provider: " << provider_name << ")";
         }
     }
     catch (const std::exception &e) {
@@ -106,7 +106,7 @@ nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_de
 }
 
 nixl_status_t
-nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &efa_devices,
+nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &fabric_devices,
                                              const std::string &provider_name,
                                              size_t num_control_rails) {
     // Pre-allocate to ensure contiguous memory allocation
@@ -119,9 +119,9 @@ nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &efa
 
         for (size_t i = 0; i < num_control_rails_; ++i) {
             control_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i)));
-            NIXL_DEBUG << "Created control rail " << i << " (device=" << efa_devices[i]
-                       << ", provider=" << provider_name << ")";
+                fabric_devices[i], provider_name, static_cast<uint16_t>(i)));
+            NIXL_DEBUG << "Created control rail " << i << " (device: " << fabric_devices[i]
+                       << ", provider: " << provider_name << ")";
         }
     }
     catch (const std::exception &e) {
@@ -323,39 +323,39 @@ nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr,
                                                nixl_mem_t mem_type,
                                                int gpu_id) const {
     if (mem_type == VRAM_SEG) {
-#ifdef HAVE_CUDA
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI)
         if (gpu_id < 0) {
             NIXL_ERROR << "Invalid GPU ID " << gpu_id << " for VRAM memory " << mem_addr;
             return {}; // Return empty vector to indicate failure
         }
-        std::vector<std::string> gpu_efa_devices = topology->getEfaDevicesForGpu(gpu_id);
-        if (gpu_efa_devices.empty()) {
-            NIXL_ERROR << "No EFA devices found for GPU " << gpu_id;
+        std::vector<std::string> gpu_nics = topology->getNicsForGpu(gpu_id);
+        if (gpu_nics.empty()) {
+            NIXL_ERROR << "No NICs found for GPU " << gpu_id;
             return {}; // Return empty vector to indicate failure
         }
         std::vector<size_t> gpu_rails;
-        for (const std::string &efa_device : gpu_efa_devices) {
-            auto it = efa_device_to_rail_map.find(efa_device);
-            if (it != efa_device_to_rail_map.end()) {
+        for (const std::string &device_name : gpu_nics) {
+            auto it = device_to_rail_map.find(device_name);
+            if (it != device_to_rail_map.end()) {
                 // Bounds check: ensure rail index is valid
                 if (it->second < data_rails_.size()) {
                     gpu_rails.push_back(it->second);
                     NIXL_DEBUG << "VRAM memory " << mem_addr << " on GPU " << gpu_id
-                               << " mapped to rail " << it->second << " (EFA device=" << efa_device
+                               << " mapped to rail " << it->second << " (fabric device: " << device_name
                                << ")";
                 } else {
-                    NIXL_WARN << "EFA device " << efa_device << " maps to rail " << it->second
+                    NIXL_WARN << "Fabric device " << device_name << " maps to rail " << it->second
                               << " but only " << data_rails_.size() << " rails available";
                 }
             } else {
-                NIXL_WARN << "EFA device " << efa_device << " not found in rail mapping for GPU "
+                NIXL_WARN << "Fabric device " << device_name << " not found in rail mapping for GPU "
                           << gpu_id;
             }
         }
 
         if (gpu_rails.empty()) {
             NIXL_ERROR << "No valid rail mapping found for GPU " << gpu_id << " (checked "
-                       << gpu_efa_devices.size() << " EFA devices)";
+                       << gpu_nics.size() << " NICs)";
             return {};
         }
 
@@ -363,7 +363,7 @@ nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr,
                    << gpu_rails.size() << " rails total";
         return gpu_rails;
 #else
-        NIXL_ERROR << "VRAM memory type not supported without CUDA";
+        NIXL_ERROR << "VRAM memory type not supported without CUDA/SYNAPSEAI";
         return {};
 #endif
     }
@@ -390,6 +390,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
                                          size_t length,
                                          nixl_mem_t mem_type,
                                          int gpu_id,
+                                         const std::string &hmem_hint,
                                          std::vector<struct fid_mr *> &mr_list_out,
                                          std::vector<uint64_t> &key_list_out,
                                          std::vector<size_t> &selected_rails_out) {
@@ -410,7 +411,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
     key_list_out.resize(data_rails_.size(), 0);
     selected_rails_out = selected_rails; // Return which rails were selected
 
-    // Register memory on each selected rail
+    // Register memory on each selected rail with HMEM hint
     for (size_t i = 0; i < selected_rails.size(); ++i) {
         size_t rail_idx = selected_rails[i];
         if (rail_idx >= data_rails_.size()) {
@@ -428,8 +429,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
 
         struct fid_mr *mr;
         uint64_t key;
-        nixl_status_t status =
-            data_rails_[rail_idx]->registerMemory(buffer, length, mem_type, gpu_id, &mr, &key);
+        nixl_status_t status = data_rails_[rail_idx]->registerMemory(buffer, length, hmem_hint, gpu_id, &mr, &key);
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "Failed to register memory on rail " << rail_idx;
             // Cleanup already registered MRs
@@ -918,4 +918,20 @@ size_t
 nixlLibfabricRailManager::getActiveRailCount() const {
     std::lock_guard<std::mutex> lock(active_rails_mutex_);
     return active_rails_.size();
+}
+
+int
+nixlLibfabricRailManager::getNumNvidiaGpus() const {
+    if (topology) {
+        return topology->getNumNvidiaGpus();
+    }
+    return 0;
+}
+
+int
+nixlLibfabricRailManager::getNumIntelHpus() const {
+    if (topology) {
+        return topology->getNumIntelHpus();
+    }
+    return 0;
 }

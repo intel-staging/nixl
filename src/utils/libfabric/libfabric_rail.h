@@ -30,6 +30,11 @@
 #include "backend/backend_aux.h"
 #include "libfabric/libfabric_common.h"
 
+#ifdef HAVE_SYNAPSEAI
+#include <habanalabs/synapse_api.h>
+#include <habanalabs/hlthunk.h>
+#endif
+
 // Forward declarations
 class nixlLibfabricConnection;
 
@@ -274,14 +279,17 @@ public:
     isProperlyInitialized() const;
 
     // Memory registration methods
-    /** Register memory buffer with libfabric */
+    /** Register memory buffer with libfabric with HMEM support
+     * @param buffer Memory buffer to register
+     * @param length Buffer length in bytes
+     * @param hmem_hint HMEM interface hint ("cuda", "synapseai", or empty for auto-detection)
+     * @param device_id Device ID for GPU memory (used when hmem_hint is specified, -1 for host memory)
+     * @param mr_out Output memory registration handle
+     * @param key_out Output remote access key
+     * @return NIXL_SUCCESS on success, error code on failure
+     */
     nixl_status_t
-    registerMemory(void *buffer,
-                   size_t length,
-                   nixl_mem_t mem_type,
-                   int gpu_id,
-                   struct fid_mr **mr_out,
-                   uint64_t *key_out) const;
+    registerMemory(void *buffer, size_t length, const std::string &hmem_hint, int device_id, struct fid_mr **mr_out, uint64_t *key_out) const;
 
     /** Deregister memory from libfabric */
     nixl_status_t
@@ -375,6 +383,23 @@ public:
     nixlLibfabricReq *
     findRequestFromContext(void *context) const;
 
+#ifdef HAVE_SYNAPSEAI
+    // SynapseAI DMABUF registration helper
+    nixl_status_t
+    registerSynapseAIMemoryDmabuf(void *buffer, size_t length, int device_id, uint64_t provider_access_flags, struct fid_mr **mr_out) const;
+
+    // Static SynapseAI library handles (shared across all rails)
+    static void *synapseai_handle_;
+    static void *hlthunk_handle_;
+    static std::mutex synapseai_init_mutex_;
+
+    struct SynapseAIOps {
+        synStatus (*synDeviceGetInfoV2)(const synDeviceId deviceId, synDeviceInfoV2 *pDeviceInfo);
+        int (*hlthunk_device_mapped_memory_export_dmabuf_fd)(int fd, uint64_t addr, uint64_t size, uint64_t offset, uint32_t flags);
+    };
+    static SynapseAIOps synapseai_ops_;
+#endif
+
 private:
     // Core libfabric resources
     struct fi_info *info; // from rail_infos[rail_id]
@@ -412,6 +437,10 @@ private:
     processRecvCompletion(struct fi_cq_data_entry *comp) const;
     nixl_status_t
     processRemoteWriteCompletion(struct fi_cq_data_entry *comp) const;
+
+    // Memory registration helper
+    uint64_t
+    getMemoryRegistrationAccessFlags() const;
 };
 
 

@@ -44,14 +44,14 @@ main() {
             NIXL_INFO << "3. Testing GPU-specific queries (detected " << num_gpus << " GPUs)...";
             int test_gpus = std::min(num_gpus, 3); // Test up to 3 GPUs or all available
             for (int gpu_id = 0; gpu_id < test_gpus; ++gpu_id) {
-                auto gpu_devices = topology.getEfaDevicesForGpu(gpu_id);
+                auto gpu_devices = topology.getNicsForGpu(gpu_id);
                 std::string device_list;
                 for (const auto &device : gpu_devices) {
                     if (!device_list.empty()) device_list += " ";
                     device_list += device;
                 }
                 NIXL_INFO << "   GPU " << gpu_id << " mapped to " << gpu_devices.size()
-                          << " EFA devices: " << device_list;
+                          << " devices: " << device_list;
             }
         } else {
             NIXL_INFO << "3. Skipping GPU-specific tests (no GPUs detected)";

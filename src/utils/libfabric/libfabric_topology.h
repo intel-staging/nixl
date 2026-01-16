@@ -24,16 +24,16 @@
 #include <map>
 
 /**
- * @brief Topology discovery and management for AWS instances with EFA devices
+ * @brief Topology discovery and management for libfabric devices
  *
- * Automatically discovers system topology using hwloc and maps GPUs to EFA devices
- * based on PCIe proximity for optimal performance. Falls back to TCP/sockets
- * when EFA devices are not available.
+ * Automatically discovers system topology using hwloc and maps GPUs to NICs
+ * based on PCIe proximity for optimal performance. Supports EFA, verbs, and other
+ * RDMA providers. Falls back to TCP/sockets when RDMA devices are not available.
  */
 class nixlLibfabricTopology {
 private:
-    // GPU to EFA device mapping: GPU 0→[efa0,efa1], GPU 1→[efa2,efa3], etc.
-    std::map<int, std::vector<std::string>> gpu_to_efa_devices;
+    // GPU to NIC mapping for RDMA providers: GPU 0→[rdmap0s6-rdm,rdmap1s6-rdm], GPU 1→[rdmap2s6-rdm,rdmap3s6-rdm], etc.
+    std::map<int, std::vector<std::string>> gpu_to_nics;
 
     // All available network devices discovered on this system
     std::vector<std::string> all_devices;
@@ -42,7 +42,9 @@ private:
     std::string provider_name;
 
     // System information
-    int num_gpus;
+    int num_gpus;  // Total GPUs (NVIDIA + Intel HPU)
+    int num_nvidia_gpus;  // NVIDIA GPU count
+    int num_intel_hpus;   // Intel Habana HPU count
     int num_numa_nodes;
     int num_devices;
 
@@ -58,9 +60,11 @@ private:
 
     // Helper methods
     nixl_status_t
-    discoverEfaDevices();
+    discoverDevices();
     nixl_status_t
     discoverTopology();
+    bool
+    isRdmaProvider() const;
 
     // hwloc-based discovery methods
     nixl_status_t
@@ -72,9 +76,9 @@ private:
     nixl_status_t
     discoverGpusWithHwloc();
     nixl_status_t
-    discoverEfaDevicesWithHwloc();
+    discoverDevicesWithHwloc();
     nixl_status_t
-    buildGpuToEfaMapping();
+    buildGpuToNicMapping();
     void
     cleanupHwlocTopology();
 
@@ -117,9 +121,13 @@ private:
     std::string
     getPcieAddressFromHwlocObj(hwloc_obj_t obj) const;
     bool
+    isIntelHpu(hwloc_obj_t obj) const;
+    bool
     isNvidiaGpu(hwloc_obj_t obj) const;
     bool
     isEfaDevice(hwloc_obj_t obj) const;
+    bool
+    isMellanoxNic(hwloc_obj_t obj) const;
 
 public:
     nixlLibfabricTopology(); // Automatically discovers topology
@@ -127,12 +135,22 @@ public:
 
     // GPU-based queries (main interface)
     std::vector<std::string>
-    getEfaDevicesForGpu(int gpu_id) const;
+    getNicsForGpu(int gpu_id) const;
 
     // System information
     int
     getNumGpus() const {
         return num_gpus;
+    }
+
+    int
+    getNumNvidiaGpus() const {
+        return num_nvidia_gpus;
+    }
+
+    int
+    getNumIntelHpus() const {
+        return num_intel_hpus;
     }
 
     const std::vector<std::string> &
@@ -154,7 +172,7 @@ public:
     bool
     isValidGpuId(int gpu_id) const;
     bool
-    isValidDevice(const std::string &efa_device) const;
+    isValidDevice(const std::string &device_name) const;
 
     // Debug/info
     void
