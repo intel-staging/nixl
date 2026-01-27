@@ -13,27 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-utils_sources = [
-  'utils.cpp',
-  'utils.h',
-  'scope_guard.h'
+synapseaiutils_sources = [
+  'synapse_utils.cpp',
+  'synapse_utils.h',
 ]
 
-utils_deps = [
-  cuda_dep,
-  gflags_dep,
-  openmp_dep,
+synapseaiutils_deps = [
   synapseai_dep
 ]
 
-utils_lib = static_library('utils',
-  utils_sources,
-  dependencies: utils_deps,
+synapseaiutils_lib = static_library('synapseaiutils',
+  synapseaiutils_sources,
+  dependencies: synapseaiutils_deps,
   include_directories: inc_dir
 )
-utils_dep = declare_dependency(
-  link_with: utils_lib,
-  dependencies: [synapseaiutils_deps, utils_deps],
+synapseaiutils_dep = declare_dependency(
+  link_with: synapseaiutils_lib,
+  dependencies: synapseaiutils_deps,
   include_directories: inc_dir
 )
-

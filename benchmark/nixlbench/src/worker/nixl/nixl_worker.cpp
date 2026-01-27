@@ -23,6 +23,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #endif
+#ifdef HAVE_SYNAPSEAI
+#include "synapseai/synapse_utils.h"
+#endif
 #include <fcntl.h>
 #include <filesystem>
 #include <iomanip>
@@ -46,7 +49,7 @@
         }                                                                                       \
     } while (0)
 
-#if HAVE_CUDA
+#if HAVE_CUDA || HAVE_SYNAPSEAI
 #define HANDLE_VRAM_SEGMENT(_seg_type) _seg_type = VRAM_SEG;
 #else
 #define HANDLE_VRAM_SEGMENT(_seg_type)                                        \
@@ -207,6 +210,10 @@ xferBenchNixlWorker::xferBenchNixlWorker(int *argc, char ***argv, std::vector<st
     }
 
     agent->createBackend(backend_name, backend_params, backend_engine);
+#ifdef HAVE_SYNAPSEAI
+    std::cout << "initalizing synapse device" << std::endl;
+    Synapseaiutils::init_synapse_device();
+#endif
 }
 
 xferBenchNixlWorker::~xferBenchNixlWorker() {
@@ -421,6 +428,43 @@ xferBenchNixlWorker::initBasicDescVram(size_t buffer_size, int mem_dev_id) {
 }
 #endif /* HAVE_CUDA */
 
+#if HAVE_SYNAPSEAI
+static std::optional<xferBenchIOV>
+getVramDescSynapseai(int devid, size_t buffer_size, uint8_t memset_value) {
+    void *host_addr = calloc(1, buffer_size);
+    memset(host_addr, memset_value, buffer_size);
+    auto device_buffer = Synapseaiutils::allocate_synapse_memory(buffer_size, host_addr);
+
+    free(host_addr);
+    return std::optional<xferBenchIOV>(std::in_place, (uintptr_t)device_buffer, buffer_size, devid);
+}
+
+static std::optional<xferBenchIOV>
+getVramDesc(int devid, size_t buffer_size, bool isInit) {
+    uint8_t memset_value =
+        isInit ? XFERBENCH_INITIATOR_BUFFER_ELEMENT : XFERBENCH_TARGET_BUFFER_ELEMENT;
+
+    return getVramDescSynapseai(devid, buffer_size, memset_value);
+}
+
+std::optional<xferBenchIOV>
+xferBenchNixlWorker::initBasicDescVram(size_t buffer_size, int mem_dev_id) {
+    if (IS_PAIRWISE_AND_SG()) {
+        int devid = rt->getRank();
+
+        if (isTarget()) {
+            devid -= xferBenchConfig::num_initiator_dev;
+        }
+
+        if (devid != mem_dev_id) {
+            return std::nullopt;
+        }
+    }
+
+    return getVramDesc(mem_dev_id, buffer_size, isInitiator());
+}
+#endif /* HAVE_SYNAPSEAI */
+
 static std::vector<xferFileState>
 createFileFds(std::string name, int num_files) {
     std::vector<xferFileState> fds;
@@ -548,6 +592,13 @@ xferBenchNixlWorker::cleanupBasicDescVram(xferBenchIOV &iov) {
 }
 #endif /* HAVE_CUDA */
 
+#if HAVE_SYNAPSEAI
+void
+xferBenchNixlWorker::cleanupBasicDescVram(xferBenchIOV &iov) {
+    Synapseaiutils::free_synapse_memory((uint64_t)iov.addr);
+}
+#endif /* HAVE_SYNAPSEAI */
+
 void
 xferBenchNixlWorker::cleanupBasicDescFile(xferBenchIOV &iov) {
     close(iov.devId);
@@ -669,7 +720,7 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
             case DRAM_SEG:
                 basic_desc = initBasicDescDram(buffer_size, i);
                 break;
-#if HAVE_CUDA
+#if HAVE_CUDA || HAVE_SYNAPSEAI
             case VRAM_SEG:
                 basic_desc = initBasicDescVram(buffer_size, i);
                 break;
@@ -707,7 +758,7 @@ xferBenchNixlWorker::deallocateMemory(std::vector<std::vector<xferBenchIOV>> &io
             case DRAM_SEG:
                 cleanupBasicDescDram(iov);
                 break;
-#if HAVE_CUDA
+#if HAVE_CUDA || HAVE_SYNAPSEAI
             case VRAM_SEG:
                 cleanupBasicDescVram(iov);
                 break;

@@ -71,6 +71,15 @@ class SequentialCTPerftest(CTPerftest):
             logger.warning(
                 "Cuda buffers detected, but the env var CUDA_VISIBLE_DEVICES is not set, this will cause every process in the same host to use the same GPU device."
             )
+
+        if (
+            not os.environ.get("HABANA_VISIBLE_MODULES")
+            and self.traffic_pattern.mem_type == "hpu"
+        ):
+            logger.warning(
+                "hpu  buffers detected, but the env var HABANA_VISIBLE_DEVICES is not set, this will cause every process in the same host to use the same GPU device."
+            )
+
         assert "UCX" in self.nixl_agent.get_plugin_list(), "UCX plugin is not loaded"
 
         # NixlBuffer caches buffers and reuse them if they are big enough, let's initialize them once, with the largest needed size

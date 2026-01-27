@@ -70,7 +70,7 @@ class xferBenchNixlWorker: public xferBenchWorker {
         std::optional<xferBenchIOV>
         initBasicDescDram(size_t buffer_size, int mem_dev_id);
         void cleanupBasicDescDram(xferBenchIOV &basic_desc);
-#if HAVE_CUDA
+#if HAVE_CUDA || HAVE_SYNAPSEAI
         std::optional<xferBenchIOV> initBasicDescVram(size_t buffer_size, int mem_dev_id);
         void cleanupBasicDescVram(xferBenchIOV &basic_desc);
 #endif

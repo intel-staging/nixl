@@ -29,6 +29,9 @@
 #if HAVE_CUDA
 #include <cuda_runtime.h>
 #endif
+#if HAVE_SYNAPSEAI
+#include "src/synapseai/synapse_utils.h"
+#endif
 #include <fcntl.h>
 #include <filesystem>
 
@@ -391,7 +394,7 @@ xferBenchConfig::printConfig() {
     }
     printOption("Worker type (--worker_type=[nixl,nvshmem])", worker_type);
     if (worker_type == XFERBENCH_WORKER_NIXL) {
-        printOption("Backend (--backend=[UCX,UCX_MO,GDS,GDS_MT,POSIX,Mooncake,HF3FS,OBJ])",
+        printOption("Backend (--backend=[UCX,UCX_MO,GDS,GDS_MT,POSIX,Mooncake,HF3FS,OBJ,LIBFABRIC])",
                     backend);
         printOption ("Enable pt (--enable_pt=[0,1])", std::to_string (enable_pt));
         printOption("Progress threads (--progress_threads=N)", std::to_string(progress_threads));
@@ -476,6 +479,7 @@ std::vector<std::string> xferBenchConfig::parseDeviceList() {
     // TODO: Add support for other schemes
     if (xferBenchConfig::scheme == XFERBENCH_SCHEME_PAIRWISE &&
         xferBenchConfig::device_list != "all") {
+	    std::cout << "xferBenchConfig::device_list not  all" << std::endl;
 	    while (std::getline(ss, dev, ',')) {
             devices.push_back(dev);
 	    }
@@ -488,6 +492,7 @@ std::vector<std::string> xferBenchConfig::parseDeviceList() {
 	    	return {};
 	    }
     } else {
+	std::cout << "xferBenchConfig::device_list == all" << std::endl;
         devices.push_back("all");
     }
 
@@ -548,13 +553,19 @@ void xferBenchUtils::checkConsistency(std::vector<std::vector<xferBenchIOV>> &io
                 xferBenchConfig::backend == XFERBENCH_BACKEND_GPUNETIO) {
                 if (xferBenchConfig::op_type == XFERBENCH_OP_READ) {
                     if (xferBenchConfig::initiator_seg_type == XFERBENCH_SEG_TYPE_VRAM) {
-#if HAVE_CUDA
+#if HAVE_CUDA || HAVE_SYNAPSEAI
                         addr = calloc(1, len);
                         is_allocated = true;
-                        CHECK_CUDA_ERROR(cudaMemcpy(addr, (void *)iov.addr, len,
-                                                    cudaMemcpyDeviceToHost), "cudaMemcpy failed");
+#if HAVE_CUDA
+                        CHECK_CUDA_ERROR(
+                            cudaMemcpy(addr, (void *)iov.addr, len, cudaMemcpyDeviceToHost),
+                            "cudaMemcpy failed");
 #else
-                        std::cerr << "Failure in consistency check: VRAM segment type not supported without CUDA"
+                        Synapseaiutils::copy_from_device_buffer(uint64_t(iov.addr), addr, len);
+#endif
+#else
+                        std::cerr << "Failure in consistency check: VRAM segment type not "
+                                     "supported without CUDA"
                                   << std::endl;
                         exit(EXIT_FAILURE);
 #endif
@@ -595,16 +606,22 @@ void xferBenchUtils::checkConsistency(std::vector<std::vector<xferBenchIOV>> &io
                 // This will be called on target process in case of write and
                 // on initiator process in case of read
                 if ((xferBenchConfig::op_type == XFERBENCH_OP_WRITE &&
-                 xferBenchConfig::target_seg_type == XFERBENCH_SEG_TYPE_VRAM) ||
-                (xferBenchConfig::op_type == XFERBENCH_OP_READ &&
-                 xferBenchConfig::initiator_seg_type == XFERBENCH_SEG_TYPE_VRAM)) {
-#if HAVE_CUDA
+                     xferBenchConfig::target_seg_type == XFERBENCH_SEG_TYPE_VRAM) ||
+                    (xferBenchConfig::op_type == XFERBENCH_OP_READ &&
+                     xferBenchConfig::initiator_seg_type == XFERBENCH_SEG_TYPE_VRAM)) {
+#if HAVE_CUDA || HAVE_SYNAPSEAI
                     addr = calloc(1, len);
                     is_allocated = true;
-                    CHECK_CUDA_ERROR(cudaMemcpy(addr, (void *)iov.addr, len,
-                                                cudaMemcpyDeviceToHost), "cudaMemcpy failed");
+#if HAVE_CUDA
+                    CHECK_CUDA_ERROR(
+                        cudaMemcpy(addr, (void *)iov.addr, len, cudaMemcpyDeviceToHost),
+                        "cudaMemcpy failed");
 #else
-                    std::cerr << "Failure in consistency check: VRAM segment type not supported without CUDA"
+                    Synapseaiutils::copy_from_device_buffer(uint64_t(iov.addr), addr, len);
+#endif
+#else
+                    std::cerr << "Failure in consistency check: VRAM segment type not supported "
+                                 "without CUDA"
                               << std::endl;
                     exit(EXIT_FAILURE);
 #endif

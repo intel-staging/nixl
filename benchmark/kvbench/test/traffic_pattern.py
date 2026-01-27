@@ -35,7 +35,7 @@ class TrafficPattern:
     """
 
     matrix: np.ndarray
-    mem_type: Literal["cuda", "vram", "cpu", "dram"]
+    mem_type: Literal["cuda", "vram", "cpu", "dram","hpu"]
     xfer_op: Literal["WRITE", "READ"] = "WRITE"
     shards: int = 1
     dtype: torch.dtype = torch.int8
