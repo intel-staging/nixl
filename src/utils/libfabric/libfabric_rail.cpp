@@ -1340,6 +1340,11 @@ nixlLibfabricRail::registerMemory(void *buffer,
                 mr_attr.device.neuron = -1;
                 NIXL_DEBUG << "NEURON memory registration - iface: FI_HMEM_NEURON, device_id: "
                            << device_id;
+            } else if (iface == FI_HMEM_ZE) {
+                // device_id encodes driver<<16|device via fi_hmem_ze_device().
+                mr_attr.device.ze = device_id;
+                NIXL_DEBUG << "ZE (Intel XPU) memory registration - iface: FI_HMEM_ZE"
+                           << " device.ze: " << device_id;
             }
         } else {
             NIXL_WARN << "VRAM memory requested but provider does not support FI_HMEM - falling "

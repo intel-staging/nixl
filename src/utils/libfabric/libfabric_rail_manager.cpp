@@ -210,6 +210,10 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
         runtime_ = FI_HMEM_NEURON;
         NIXL_INFO << "System runtime: NEURON for " << topology->getNumAwsAccel()
                   << " AWS Trainium device(s)";
+    } else if (topology->getNumIntelXpuAccel() > 0) {
+        runtime_ = FI_HMEM_ZE;
+        NIXL_INFO << "System runtime: ZE for " << topology->getNumIntelXpuAccel()
+                  << " Intel XPU device(s)";
     } else {
         runtime_ = FI_HMEM_SYSTEM;
         NIXL_INFO << "System runtime: SYSTEM (no accelerators)";
@@ -739,7 +743,11 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
 
     enum fi_hmem_iface iface = FI_HMEM_SYSTEM;
     if (mem_type == VRAM_SEG) {
-        iface = topology->getMrAttrIface(device_id);
+        // For ZE runtime the iface comes from runtime_ directly; otherwise use topology helper.
+        if (runtime_ == FI_HMEM_ZE)
+            iface = FI_HMEM_ZE;
+        else
+            iface = topology->getMrAttrIface(device_id);
     }
 
     // Resize output vectors to match all rails

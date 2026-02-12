@@ -42,6 +42,10 @@
 #include <cuda_runtime.h>
 #endif
 
+#ifdef HAVE_ZE
+#include "backend/nixl_xpu_device.h"
+#endif
+
 // Forward declarations
 class nixlLibfabricEngine;
 
@@ -274,6 +278,10 @@ private:
     // CUDA context management
     std::unique_ptr<nixlLibfabricCudaCtx> cudaCtx_;
     bool cuda_addr_wa_; // CUDA address workaround flag
+#endif
+
+#ifdef HAVE_ZE
+    std::vector<XpuDevice> xpu_devices_;
 #endif
 
     void

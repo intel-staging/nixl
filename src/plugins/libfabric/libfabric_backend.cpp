@@ -325,6 +325,18 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
     }
 #endif
 
+#ifdef HAVE_ZE
+    xpu_devices_ = XpuDevice::detectDevices();
+    if (!xpu_devices_.empty()) {
+        NIXL_INFO << "Detected " << xpu_devices_.size() << " Intel XPU device(s):";
+        for (size_t i = 0; i < xpu_devices_.size(); ++i) {
+            NIXL_INFO << "  XPU[" << i << "] pci_bdf=" << xpu_devices_[i].pci_bdf;
+        }
+    } else {
+        NIXL_DEBUG << "No Intel XPU devices detected";
+    }
+#endif
+
     // Parse striping threshold parameter
     std::string threshold_str;
     striping_threshold_ = NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD;
@@ -682,7 +694,15 @@ nixlLibfabricEngine::getSupportedMems() const {
         NIXL_DEBUG << "Neuron runtime detected, adding VRAM support";
         mems.push_back(VRAM_SEG);
     } else {
-        NIXL_DEBUG << "No accelerator runtime, skipping VRAM support";
+#ifdef HAVE_ZE
+        if (runtime_ == FI_HMEM_ZE) {
+            NIXL_DEBUG << "Intel XPU (ZE) runtime detected, adding VRAM support";
+            mems.push_back(VRAM_SEG);
+        } else
+#endif
+        {
+            NIXL_DEBUG << "No accelerator runtime, skipping VRAM support";
+        }
     }
     return mems;
 }
@@ -757,6 +777,32 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
             NIXL_DEBUG << "Queried PCI bus ID: " << pci_bus_id << " for Neuron device "
                        << mem.devId;
         }
+#ifdef HAVE_ZE
+        if (runtime_ == FI_HMEM_ZE) {
+            if (xpu_devices_.empty()) {
+                NIXL_ERROR << "VRAM_SEG ZE registration requested but no Intel XPU devices found";
+                return NIXL_ERR_NOT_SUPPORTED;
+            }
+            ze_context_handle_t ze_ctx = xpu_devices_[0].context;
+            ze_device_handle_t ze_dev =
+                XpuDevice::getDeviceForPtr(ze_ctx, xpu_devices_, (void *)mem.addr);
+            if (!ze_dev) {
+                NIXL_ERROR << "Could not identify ZE device for pointer " << (void *)mem.addr;
+                return NIXL_ERR_BACKEND;
+            }
+            for (const auto &xpu : xpu_devices_) {
+                if (xpu.device == ze_dev) {
+                    pci_bus_id = xpu.pci_bdf;
+                    // Encode driver+device ordinal for mr_attr.device.ze
+                    priv->device_id_ =
+                        fi_hmem_ze_device((int)xpu.driver_index, (int)xpu.device_index);
+                    break;
+                }
+            }
+            NIXL_DEBUG << "ZE VRAM registration: pci_bdf=" << pci_bus_id
+                       << " ze_device_id=" << priv->device_id_;
+        }
+#endif
     }
 
     // Initialize vectors to accommodate all possible rails (for indexing consistency)
@@ -773,13 +819,13 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
 
     // Use Rail Manager for centralized memory registration with GPU Direct RDMA support
     NIXL_TRACE << "Registering memory: addr=" << (void *)mem.addr << " len=" << mem.len
-               << " mem_type=" << nixl_mem << " devId=" << mem.devId
+               << " mem_type=" << nixl_mem << " devId=" << priv->device_id_
                << (nixl_mem == VRAM_SEG ? " pci_bus_id=" + pci_bus_id : "");
 
     nixl_status_t status = rail_manager.registerMemory((void *)mem.addr,
                                                        mem.len,
                                                        nixl_mem,
-                                                       mem.devId,
+                                                       priv->device_id_,
                                                        pci_bus_id,
                                                        priv->rail_mr_list_,
                                                        priv->rail_key_list_,
@@ -795,8 +841,8 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
                << (nixl_mem == VRAM_SEG ? " with GPU Direct RDMA support" : "");
 
     NIXL_DEBUG << "Successfully registered memory on " << priv->selected_rails_.size()
-               << " rails for " << (nixl_mem == VRAM_SEG ? "accelerator" : "CPU") << " device "
-               << mem.devId;
+               << " rails for " << (nixl_mem == VRAM_SEG ? "VRAM" : "DRAM")
+               << " device " << mem.devId;
     out = priv.release();
     return NIXL_SUCCESS;
 }
