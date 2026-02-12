@@ -348,6 +348,23 @@ if get_option('disable_gds_backend')
     add_project_arguments('-DDISABLE_GDS_BACKEND', language: 'cpp')
 endif
 
+# Intel XPU (Level Zero) backend detection
+xpu_opt = get_option('enable_xpu_backend')
+libze_dep = disabler()
+if xpu_opt != 'false'
+    libze_dep = dependency('libze_loader', required: xpu_opt == 'true')
+    if libze_dep.found()
+        add_project_arguments('-DHAVE_ZE', language: 'cpp')
+        message('Intel XPU (Level Zero) support enabled')
+    else
+        if xpu_opt == 'auto'
+            message('libze_loader not found, Intel XPU support disabled')
+        endif
+    endif
+endif
+
+summary({'Intel XPU (Level Zero)': libze_dep.found()}, section: 'Accelerator Support', bool_yn: true)
+
 # Configure NDEBUG for release builds
 if get_option('buildtype') == 'release'
     # Used by Abseil to strip DCHECK assertions and DVLOG at compile time
