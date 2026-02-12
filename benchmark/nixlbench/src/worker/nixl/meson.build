@@ -22,6 +22,9 @@ nixl_worker_deps = [openmp_dep, nixl_lib, nixl_build, nixl_serdes, tomlplusplus_
 if cuda_available
   nixl_worker_deps += [cuda_dep]
 endif
+if libze_dep.found()
+  nixl_worker_deps += [libze_dep]
+endif
 
 nixl_worker_lib = static_library('nixl_worker',
   nixl_worker_sources,

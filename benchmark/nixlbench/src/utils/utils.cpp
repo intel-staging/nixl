@@ -64,12 +64,12 @@ NB_ARG_STRING(backend,
               "GUSLI, AZURE_BLOB] (only used with nixl worker)");
 NB_ARG_STRING(initiator_seg_type,
               XFERBENCH_SEG_TYPE_DRAM,
-              "Type of memory segment for initiator [DRAM, VRAM]. Note: Storage backends always "
-              "use DRAM locally.");
+              "Type of memory segment for initiator [DRAM, VRAM, XPU]. Note: Storage backends "
+              "always use DRAM locally.");
 NB_ARG_STRING(target_seg_type,
               XFERBENCH_SEG_TYPE_DRAM,
-              "Type of memory segment for target [DRAM, VRAM]. Note: Storage backends determine "
-              "remote type automatically.");
+              "Type of memory segment for target [DRAM, VRAM, XPU]. Note: Storage backends "
+              "determine remote type automatically.");
 NB_ARG_STRING(scheme, XFERBENCH_SCHEME_PAIRWISE, "Scheme: pairwise, manytoone, onetomany, tp");
 NB_ARG_STRING(mode, XFERBENCH_MODE_SG, "MODE: SG (Single GPU per proc), MG (Multi GPU per proc)");
 NB_ARG_STRING(op_type, XFERBENCH_OP_WRITE, "Op type: READ, WRITE");
@@ -693,8 +693,8 @@ xferBenchConfig::printConfig() {
                         gpunetio_oob_list);
         }
     }
-    printOption("Initiator seg type (--initiator_seg_type=[DRAM,VRAM])", initiator_seg_type);
-    printOption("Target seg type (--target_seg_type=[DRAM,VRAM])", target_seg_type);
+    printOption("Initiator seg type (--initiator_seg_type=[DRAM,VRAM,XPU])", initiator_seg_type);
+    printOption("Target seg type (--target_seg_type=[DRAM,VRAM,XPU])", target_seg_type);
     printOption("Scheme (--scheme=[pairwise,manytoone,onetomany,tp])", scheme);
     printOption("Mode (--mode=[SG,MG])", mode);
     printOption("Op type (--op_type=[READ,WRITE])", op_type);

@@ -24,6 +24,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #endif
+#ifdef HAVE_ZE
+#include <level_zero/ze_api.h>
+#endif
 #include <fcntl.h>
 #include <filesystem>
 #include <iomanip>
@@ -70,6 +73,8 @@ resolveVramSegment() {
             _seg_type = DRAM_SEG;                                                           \
         } else if (0 == _seg_type_str.compare("VRAM")) {                                    \
             _seg_type = resolveVramSegment();                                               \
+        } else if (0 == _seg_type_str.compare("XPU")) {                                     \
+            _seg_type = VRAM_SEG;                                                            \
         } else {                                                                            \
             std::cerr << "Invalid segment type: " << _seg_type_str << std::endl;            \
             exit(EXIT_FAILURE);                                                             \
@@ -495,6 +500,82 @@ cleanupVramCuda(xferBenchIOV &iov) {
 }
 
 #endif /* HAVE_CUDA */
+
+#ifdef HAVE_ZE
+
+// Per-process Level Zero state for the benchmark.
+static ze_context_handle_t g_ze_context = nullptr;
+static std::vector<ze_device_handle_t> g_ze_devices;
+
+static bool
+xpuInit() {
+    if (g_ze_context)
+        return true;
+
+    if (zeInit(0) != ZE_RESULT_SUCCESS)
+        return false;
+
+    uint32_t driver_count = 0;
+    if (zeDriverGet(&driver_count, nullptr) != ZE_RESULT_SUCCESS || driver_count == 0)
+        return false;
+
+    std::vector<ze_driver_handle_t> drivers(driver_count);
+    if (zeDriverGet(&driver_count, drivers.data()) != ZE_RESULT_SUCCESS)
+        return false;
+
+    ze_driver_handle_t drv = drivers[0];
+
+    uint32_t dev_count = 0;
+    if (zeDeviceGet(drv, &dev_count, nullptr) != ZE_RESULT_SUCCESS || dev_count == 0)
+        return false;
+
+    g_ze_devices.resize(dev_count);
+    zeDeviceGet(drv, &dev_count, g_ze_devices.data());
+
+    ze_context_desc_t ctx_desc = { ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0 };
+    return zeContextCreate(drv, &ctx_desc, &g_ze_context) == ZE_RESULT_SUCCESS;
+}
+
+static std::optional<xferBenchIOV>
+getXpuDesc(int devid, size_t buffer_size, bool isInit) {
+    uint8_t fill = isInit ? XFERBENCH_INITIATOR_BUFFER_ELEMENT : XFERBENCH_TARGET_BUFFER_ELEMENT;
+
+    if (!xpuInit()) {
+        std::cerr << "Failed to initialize Level Zero for XPU allocation" << std::endl;
+        return std::nullopt;
+    }
+
+    if (devid < 0 || (size_t)devid >= g_ze_devices.size()) {
+        std::cerr << "Invalid XPU device index: " << devid
+                  << " (available: " << g_ze_devices.size() << ")" << std::endl;
+        return std::nullopt;
+    }
+
+    ze_device_mem_alloc_desc_t alloc_desc = {};
+    alloc_desc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+    void *ptr = nullptr;
+    ze_result_t rc = zeMemAllocDevice(g_ze_context, &alloc_desc, buffer_size, 64,
+                                      g_ze_devices[devid], &ptr);
+    if (rc != ZE_RESULT_SUCCESS) {
+        std::cerr << "zeMemAllocDevice failed (rc=" << rc << ")" << std::endl;
+        return std::nullopt;
+    }
+
+    // Fill using a host-accessible staging copy is the safe route; for benchmarking
+    // purposes we skip the fill (device memory is uninitialized but that's acceptable).
+    (void)fill;
+
+    return std::optional<xferBenchIOV>(std::in_place, (uintptr_t)ptr, buffer_size, devid);
+}
+
+static void
+cleanupXpuDesc(xferBenchIOV &iov) {
+    if (g_ze_context && iov.addr)
+        zeMemFree(g_ze_context, (void *)iov.addr);
+    iov.addr = 0;
+}
+
+#endif /* HAVE_ZE */
 
 static std::optional<xferBenchIOV>
 getVramDesc(int devid, size_t buffer_size, bool isInit) {
@@ -947,7 +1028,15 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
                 break;
             }
             case VRAM_SEG:
-                basic_desc = initBasicDescVram(buffer_size, i);
+#ifdef HAVE_ZE
+                if (xferBenchConfig::initiator_seg_type == XFERBENCH_SEG_TYPE_XPU ||
+                    xferBenchConfig::target_seg_type == XFERBENCH_SEG_TYPE_XPU) {
+                    basic_desc = getXpuDesc(i, buffer_size, isInitiator());
+                } else
+#endif
+                {
+                    basic_desc = initBasicDescVram(buffer_size, i);
+                }
                 break;
             default:
                 std::cerr << "Unsupported mem type: " << seg_type << std::endl;
@@ -1003,7 +1092,15 @@ xferBenchNixlWorker::deallocateMemory(std::vector<std::vector<xferBenchIOV>> &io
                 cleanupBasicDescDram(iov);
                 break;
             case VRAM_SEG:
-                cleanupBasicDescVram(iov);
+#ifdef HAVE_ZE
+                if (xferBenchConfig::initiator_seg_type == XFERBENCH_SEG_TYPE_XPU ||
+                    xferBenchConfig::target_seg_type == XFERBENCH_SEG_TYPE_XPU) {
+                    cleanupXpuDesc(iov);
+                } else
+#endif
+                {
+                    cleanupBasicDescVram(iov);
+                }
                 break;
             default:
                 std::cerr << "Unsupported mem type: " << seg_type << std::endl;

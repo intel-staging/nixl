@@ -153,6 +153,15 @@ if cuda_fabric_available
     add_project_arguments('-DHAVE_CUDA_FABRIC', language: 'cpp')
 endif
 
+# Intel XPU (Level Zero) support - auto-detect libze_loader
+libze_dep = dependency('libze_loader', required: false)
+if libze_dep.found()
+    add_project_arguments('-DHAVE_ZE', language: 'cpp')
+    message('nixlbench: Intel XPU (Level Zero) support enabled')
+else
+    message('nixlbench: libze_loader not found, Intel XPU support disabled')
+endif
+
 # Subprojects
 subdir('src/utils')
 subdir('src/runtime')
@@ -188,6 +197,9 @@ if nvshmem_available
         '-lcudart',
         '-lcudadevrt',
     ]
+endif
+if libze_dep.found()
+    deps += [libze_dep]
 endif
 
 if nvshmem_available
