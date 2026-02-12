@@ -34,6 +34,14 @@ if cuda_dep.found()
     compile_flags += ['-DHAVE_CUDA']
 endif
 
+# Add Intel XPU (Level Zero) support if available
+xpu_sources = []
+if libze_dep.found()
+    libfabric_plugin_deps += [libze_dep]
+    compile_flags += ['-DHAVE_ZE']
+    xpu_sources += ['../../api/cpp/backend/nixl_xpu_device.cpp']
+endif
+
 # Build as static or shared library based on configuration
 if 'LIBFABRIC' in static_plugins
     libfabric_backend_lib = static_library(
@@ -41,6 +49,7 @@ if 'LIBFABRIC' in static_plugins
         'libfabric_backend.cpp',
         'libfabric_backend.h',
         'libfabric_plugin.cpp',
+        xpu_sources,
         dependencies: libfabric_plugin_deps,
         include_directories: [nixl_inc_dirs, utils_inc_dirs],
         install: false,
@@ -53,6 +62,7 @@ else
         'libfabric_backend.cpp',
         'libfabric_backend.h',
         'libfabric_plugin.cpp',
+        xpu_sources,
         dependencies: libfabric_plugin_deps,
         include_directories: [nixl_inc_dirs, utils_inc_dirs],
         install: true,
