@@ -29,6 +29,18 @@ logger = get_logger(__name__)
 DEFAULT_COMM_PORT = nixlBind.DEFAULT_COMM_PORT
 
 
+def _nixl_seg_type_for_device(device) -> str:
+    """Map a torch device to the corresponding NIXL segment type string.
+
+    Accelerator device memory (CUDA GPUs, Intel XPUs) registers as VRAM_SEG
+    so the backend selects the appropriate HMEM interface (FI_HMEM_CUDA,
+    FI_HMEM_ZE, etc.).  Host and all other devices use DRAM_SEG.
+    """
+    device_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
+    _DEVICE_VRAM_TYPES = {"cuda", "xpu"}
+    return "VRAM" if device_type in _DEVICE_VRAM_TYPES else "DRAM"
+
+
 """
 @brief Opaque handle wrapper for a prepared transfer descriptor list.
        Use release() to explicitly free resources; __del__ performs best-effort cleanup.
@@ -254,10 +266,11 @@ class nixl_agent:
         self.nixl_mems = {
             "DRAM": nixlBind.DRAM_SEG,
             "VRAM": nixlBind.VRAM_SEG,
+            "XPU": nixlBind.VRAM_SEG,   # Intel XPU uses VRAM_SEG at the NIXL API level
             "FILE": nixlBind.FILE_SEG,
             "BLOCK": nixlBind.BLK_SEG,
             "OBJ": nixlBind.OBJ_SEG,
-            "cpu": nixlBind.DRAM_SEG,
+            "cpu": nixlBind.DRAM_SEG,   # legacy aliases kept for backward compatibility
             "cuda": nixlBind.VRAM_SEG,
         }
         self.nixl_ops = {
@@ -981,7 +994,7 @@ class nixl_agent:
                 new_descs = None
         elif isinstance(descs, torch.Tensor):
             if descs.is_contiguous():
-                mem_type = "cuda" if str(descs.device).startswith("cuda") else "cpu"
+                mem_type = _nixl_seg_type_for_device(descs.device)
                 base_addr = descs.data_ptr()
                 region_len = descs.numel() * descs.element_size()
                 gpu_id = descs.get_device()
@@ -1009,7 +1022,7 @@ class nixl_agent:
                 if gpu_id == -1:  # DRAM
                     gpu_id = 0
                 dlist[i, :] = (base_addr, region_len, gpu_id)
-            mem_type = "cuda" if str(tensor_type).startswith("cuda") else "cpu"
+            mem_type = _nixl_seg_type_for_device(tensor_type)
             new_descs = nixlBind.nixlXferDList(self.nixl_mems[mem_type], dlist)
         else:
             new_descs = None
@@ -1064,7 +1077,7 @@ class nixl_agent:
                 new_descs = None
         elif isinstance(descs, torch.Tensor):
             if descs.is_contiguous():
-                mem_type = "cuda" if str(descs.device).startswith("cuda") else "cpu"
+                mem_type = _nixl_seg_type_for_device(descs.device)
                 base_addr = descs.data_ptr()
                 region_len = descs.numel() * descs.element_size()
                 gpu_id = descs.get_device()
@@ -1092,7 +1105,7 @@ class nixl_agent:
                 if gpu_id == -1:  # DRAM
                     gpu_id = 0
                 dlist[i, :] = (base_addr, region_len, gpu_id)
-            mem_type = "cuda" if str(tensor_type).startswith("cuda") else "cpu"
+            mem_type = _nixl_seg_type_for_device(tensor_type)
             new_descs = nixlBind.nixlRegDList(self.nixl_mems[mem_type], dlist)
         else:
             new_descs = None
