@@ -36,6 +36,7 @@
 nixlLibfabricTopology::nixlLibfabricTopology()
     : num_aws_accel(0),
       num_nvidia_accel(0),
+      num_intel_xpu_accel(0),
       num_numa_nodes(0),
       num_devices(0),
       topology_discovered(false),
@@ -252,7 +253,8 @@ nixlLibfabricTopology::getNumaRailCount() const {
 void
 nixlLibfabricTopology::printTopologyInfo() const {
     NIXL_INFO << "Topology: " << num_numa_nodes << " NUMA nodes, " << num_devices << " NICs, "
-              << num_nvidia_accel << " NVIDIA GPUs, " << num_aws_accel << " AWS accelerators";
+              << num_nvidia_accel << " NVIDIA GPUs, " << num_aws_accel << " AWS accelerators, "
+              << num_intel_xpu_accel << " Intel XPU accelerators";
     if (avg_nic_speed > 0) {
         NIXL_INFO << "Avg NIC bandwidth: " << avg_nic_speed << " Gbps";
     }
@@ -398,6 +400,7 @@ nixl_status_t
 nixlLibfabricTopology::discoverAccelWithHwloc() {
     num_aws_accel = 0;
     num_nvidia_accel = 0;
+    num_intel_xpu_accel = 0;
     // Find all PCI devices and log detailed information
     static const char *vendor_names[2] = {"NEURON", "NVIDIA"};
     hwloc_obj_t pci_obj = nullptr;
@@ -416,6 +419,14 @@ nixlLibfabricTopology::discoverAccelWithHwloc() {
 
             num_aws_accel++;
             num_nvidia_accel += is_nvidia_accel;
+        } else if (isIntelXpuAccel(pci_obj)) {
+            std::string pcie_addr = getPcieAddressFromHwlocObj(pci_obj);
+            uint16_t vendor_id = pci_obj->attr->pcidev.vendor_id;
+            uint16_t device_id = pci_obj->attr->pcidev.device_id;
+            NIXL_TRACE << "Found Intel XPU accelerator " << num_intel_xpu_accel << ": "
+                       << pcie_addr << " (vendor=" << std::hex << vendor_id
+                       << ", device=" << device_id << std::dec << ")";
+            num_intel_xpu_accel++;
         }
     }
 
@@ -745,6 +756,20 @@ nixlLibfabricTopology::isNeuronAccel(hwloc_obj_t obj) const {
     return std::find(std::begin(NEURON_DEVICE_IDS),
                      std::end(NEURON_DEVICE_IDS),
                      obj->attr->pcidev.device_id) != std::end(NEURON_DEVICE_IDS);
+}
+
+bool
+nixlLibfabricTopology::isIntelXpuAccel(hwloc_obj_t obj) const {
+    if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE)
+        return false;
+    if (obj->attr->pcidev.vendor_id != 0x8086)
+        return false;
+    // Class 0x0380 = Display Controller (Other). All Intel discrete GPUs (Arc, Data Center GPU
+    // Max/Flex/PVC, CRI, BMG) enumerate as 0x0380. Intel integrated graphics use 0x0300 (VGA
+    // Compatible) and are excluded. Gaudi/Habana uses 0x1200 (Processing Accelerator) and is
+    // also excluded. This covers all current and future Intel discrete GPU SKUs without
+    // requiring a device-ID whitelist.
+    return obj->attr->pcidev.class_id == 0x0380;
 }
 
 bool

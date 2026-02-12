@@ -44,6 +44,7 @@ private:
     // System information
     int num_aws_accel; // AWS Trainium accelerators
     int num_nvidia_accel; // NVIDIA GPU accelerators
+    int num_intel_xpu_accel; // Intel XPU (Level Zero) accelerators
     int num_numa_nodes;
     int num_devices;
 
@@ -145,6 +146,8 @@ private:
     bool
     isNeuronAccel(hwloc_obj_t obj) const;
     bool
+    isIntelXpuAccel(hwloc_obj_t obj) const;
+    bool
     isEfaDevice(hwloc_obj_t obj) const;
 
     // retrieves line speed of NIC from map
@@ -208,6 +211,11 @@ public:
     int
     getNumNvidiaAccel() const {
         return num_nvidia_accel;
+    }
+
+    int
+    getNumIntelXpuAccel() const {
+        return num_intel_xpu_accel;
     }
 
     const std::vector<std::string> &
