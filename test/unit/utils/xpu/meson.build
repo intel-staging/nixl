@@ -13,11 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-subdir('common')
-if libfabric_dep.found()
-    subdir('libfabric')
+# XPU device detection unit test — only built when Level Zero is available.
+
+if not libze_dep.found()
+    subdir_done()
 endif
-subdir('serdes')
-if libze_dep.found()
-    subdir('xpu')
-endif
+
+xpu_detect_test_bin = executable('test_xpu_detect',
+    'test_xpu_detect.cpp',
+    '../../../../src/api/cpp/backend/nixl_xpu_device.cpp',
+    dependencies: [libze_dep, nixl_common_dep],
+    include_directories: [nixl_inc_dirs, utils_inc_dirs],
+    cpp_args: ['-DHAVE_ZE'],
+    install: true,
+)
+
+test('test_xpu_detect', xpu_detect_test_bin)
