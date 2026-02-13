@@ -111,13 +111,35 @@ A key underlying abstraction for NIXL library is a descriptor list, that is made
 * For transfers: (addr, len, devID, metadata), where metadata is a pointer to an nixlBackendMD object relevant to the registered memory that this descriptor falls within.
 * For registration, (addr, len, devID, str) where str is an optional byte-array for extra information. The table below shows the meaning of devID for different memory spaces, as well as optional meaning for File and Object-Store.
 
-| mem type | addr   | len  | devID         | str (byte-array)           |
-| -------- | ------ | ---- | ------------- | -------------------------- |
-| DRAM     |        |      | 0 (or region) |        -                   |
-| VRAM     |        |      | GPU ID        |        -                   |
-| BLK      |        |      | Vol ID        |        -                   |
-| FILE     | offset | Or 0 | fd            | Path + (access mode)       |
-| OBJ      | offset | Or 0 | key           | Extended key (+ bucket ID) |
+| mem type | addr   | len  | devID                     | str (byte-array)           |
+| -------- | ------ | ---- | ------------------------- | -------------------------- |
+| DRAM     |        |      | 0 (or region)             |        -                   |
+| VRAM     |        |      | GPU ID                    |        -                   |
+| XPU      |        |      | 0 (driver/device resolved by backend) |  -            |
+| BLK      |        |      | Vol ID                    |        -                   |
+| FILE     | offset | Or 0 | fd                        | Path + (access mode)       |
+| OBJ      | offset | Or 0 | key                       | Extended key (+ bucket ID) |
+
+### LIBFABRIC plugin: memory registration for accelerator memory
+
+The LIBFABRIC backend uses `fi_mr_regattr()` with HMEM interface hints so that the EFA/verbs provider can set up GPU Direct RDMA correctly.
+
+**NVIDIA GPU (`VRAM_SEG`):**
+```cpp
+mr_attr.iface      = FI_HMEM_CUDA;
+mr_attr.device.cuda = device_id;  // CUDA device ordinal
+fi_mr_regattr(domain, &mr_attr, 0, &mr);
+```
+
+**Intel XPU (`XPU_SEG`, Level Zero):**
+```cpp
+// device.ze encodes driver and device index via fi_hmem_ze_device().
+mr_attr.iface     = FI_HMEM_ZE;
+mr_attr.device.ze = fi_hmem_ze_device(driver_index, device_index);
+fi_mr_regattr(domain, &mr_attr, 0, &mr);
+```
+
+The `device.ze` field must be computed with `fi_hmem_ze_device(driver_index, device_index)` (defined in `<rdma/fi_domain.h>`), where `driver_index` and `device_index` are the Level Zero ordinal values from `zeDriverGet()` and `zeDeviceGet()` respectively. The NIXL libfabric backend queries these via `XpuDevice::getDeviceForPtr()` at registration time.
 
 ## Plugin Manager API
 

@@ -108,6 +108,27 @@ $ cmake ..
 $ make -j$(nproc) && make install
 ```
 
+### Intel XPU (optional)
+
+To enable Intel XPU (Level Zero) support in the LIBFABRIC backend, install the
+Level Zero loader library before building:
+
+```bash
+# Ubuntu (Intel GPU driver repository)
+sudo apt install libze-loader libze-dev
+
+# Or build from source:
+# https://github.com/oneapi-src/level-zero
+```
+
+Then build NIXL with XPU support enabled (auto-detected by default):
+
+```bash
+meson setup build -Denable_xpu_backend=auto
+```
+
+See [docs/intel_xpu.md](docs/intel_xpu.md) for full documentation.
+
 ### Additional plugins
 
 Some plugins may have additional build requirements, see them here:

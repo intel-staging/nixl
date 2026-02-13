@@ -43,7 +43,16 @@ Using these components, the NIXL Transfer Agent provides the desired interface b
 A NIXL agent is instantiated within each inference conductor process that may be managing one or more GPU devices. For instance, on a DGX server, a single agent in the main conductor process can access several GPUs and other memory or storage nodes. Each agent is identified by a unique and global ID/name assigned by the inference platform.
 
 ### Memory Sections
-A Memory Section is a mixture of address ranges (segments) registered with the agent. NIXL supports multiple segment types, including DRAM, VRAM, NVMe-oF, Object storage, and File. The Memory Section comprises the local information required by the transfer backend engines as well the required identifiers for remote agents to access the corresponding segments.
+A Memory Section is a mixture of address ranges (segments) registered with the agent. NIXL supports multiple segment types, including DRAM, VRAM, Intel XPU (Level Zero device memory), NVMe-oF, Object storage, and File. The Memory Section comprises the local information required by the transfer backend engines as well the required identifiers for remote agents to access the corresponding segments.
+
+| Enum value  | Memory kind                        | Backend(s) that support it          |
+|-------------|-------------------------------------|--------------------------------------|
+| `DRAM_SEG`  | Host RAM                            | UCX, LIBFABRIC, and most backends    |
+| `VRAM_SEG`  | NVIDIA / AWS Trainium GPU memory    | UCX, LIBFABRIC (FI_HMEM_CUDA/NEURON) |
+| `XPU_SEG`   | Intel XPU (Level Zero device mem)   | LIBFABRIC (FI_HMEM_ZE)               |
+| `BLK_SEG`   | Block / NVMe-oF storage             | POSIX, GDS, HF3FS, GUSLI             |
+| `OBJ_SEG`   | Object storage (S3, Azure Blob)     | OBJ, AZURE_BLOB                      |
+| `FILE_SEG`  | POSIX file system                   | POSIX, GDS, GDS_MT                   |
 
 ### Transfer Backend Interface
 Each transfer backend must be initialized for the corresponding transfer agent. This process enables the transfer agent to keep track of the available transfer engines.
