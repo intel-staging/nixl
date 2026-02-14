@@ -55,6 +55,8 @@ class NixlBuffer:
         self.nixl_agent = nixl_agent
         if mem_type in ("cuda", "vram"):
             device = torch.device("cuda")
+        else mem_type in ("hpu", "vram"):
+            device = torch.device("hpu")
         elif mem_type in ("cpu", "dram"):
             device = torch.device("cpu")
         else:
@@ -95,6 +97,8 @@ class NixlBuffer:
         if hasattr(self.buf, "is_cuda") and self.buf.is_cuda:
             del self.buf
             torch.cuda.empty_cache()
+        if hasattr(self.buf, "is_hpu") and self.buf.is_hpu:
+            del self.buf
 
 
 class CTPerftest:
@@ -122,6 +126,15 @@ class CTPerftest:
             logger.warning(
                 "Cuda buffers detected, but the env var CUDA_VISIBLE_DEVICES is not set, this will cause every process in the same host to use the same GPU device."
             )
+
+        if (
+            not os.environ.get("HABANA_VISIBLE_MODULES")
+            and self.traffic_pattern.mem_type == "hpu"
+        ):
+            logger.warning(
+                "hpu  buffers detected, but the env var HABANA_VISIBLE_DEVICES is not set, this will cause every process in the same host to use the same GPU device."
+            )
+
 
         """Initialize the buffers, one big send and recv buffer is used for all the transfers
         it has to be chunked inside each transfer to get buffers per ranks
@@ -250,7 +263,7 @@ class CTPerftest:
         self,
         iters=15,
         fill_value: int = 100000,
-        mem_type: Literal["cuda", "vram", "cpu", "dram"] = "cuda",
+        mem_type: Literal["cuda", "vram", "cpu", "dram", "hpu", "vram"] = "cuda",
     ):
         full_matrix = np.full((self.world_size, self.world_size), fill_value=fill_value)
         tp = TrafficPattern(matrix=full_matrix, mem_type=mem_type)

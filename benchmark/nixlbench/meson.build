@@ -103,16 +103,87 @@ if cuda_available
     endif
 endif
 
+# SynapseAI (Habana Gaudi) dependency detection
+synapse_inc_path = get_option('synapsepath_inc')
+synapse_lib_path = get_option('synapsepath_lib')
+
+if synapse_lib_path == ''
+    #use default path
+    # Try to find both libSynapse and hl-thunk libraries
+    synapse_lib = cpp.find_library('Synapse',
+                                 dirs: ['/usr/lib/habanalabs', '/usr/local/lib/habanalabs'],
+                               required: false)
+    hlthunk_lib = cpp.find_library('hl-thunk',
+                               dirs: ['/usr/lib/habanalabs', '/usr/local/lib/habanalabs'],
+                               required: false)
+else
+    synapse_lib = cpp.find_library('Synapse',
+                                 dirs: [synapse_lib_path],
+                               required: false)
+    hlthunk_lib = cpp.find_library('hl-thunk',
+                               dirs: [synapse_lib_path],
+                               required: false)
+endif
+
+if synapse_inc_path == ''
+  #use default path
+  synapse_inc_path = '/usr/include/habanalabs/'
+endif
+
+# SynapseAI support requires both libraries
+synapseai_dep = dependency('', required: false)  # Initialize as not found
+if synapse_lib.found() and hlthunk_lib.found()
+    synapseai_dep = declare_dependency(dependencies: [synapse_lib, hlthunk_lib])
+elif hlthunk_lib.found()
+    # Fallback to just hl-thunk if libSynapse not available
+    synapseai_dep = hlthunk_lib
+endif
+
+if synapseai_dep.found()
+    # Create proper dependency with include paths (including DRM path for habanalabs headers)
+    synapseai_dep = declare_dependency(
+        dependencies: synapseai_dep,
+        include_directories: [
+            include_directories('/usr/include/drm'),
+            include_directories(synapse_inc_path)
+        ]
+    )
+    message('Found SynapseAI support for Habana Gaudi devices')
+    synapseai_available = true
+else
+    synapseai_available = false
+    warning('SynapseAI not found. Habana Gaudi device support will be disabled.')
+endif
+
 # GFlags
 gflags_dep = dependency('gflags', required: true)
 
 # OpenMP
 openmp_dep = dependency('openmp', required: true)
-
-# Check for etcd-cpp-api - use multiple methods for discovery
+# Try pkg-config first
 etcd_dep = dependency('etcd-cpp-api', required : false)
+if not etcd_dep.found()
+    # Fallback: manual configuration
+    #   message('etcd-cpp-api not found via pkg-config, using manual configuration')
 
-# Ensure etcd is available
+    # Check if we have the library files
+    etcd_lib = meson.get_compiler('cpp').find_library('etcd-cpp-api',
+                    dirs: ['/usr/local/lib'],
+                                  required: false)
+
+      if etcd_lib.found()
+            etcd_dep = declare_dependency(
+                    include_directories: include_directories('/usr/local/include'),
+                          dependencies: [etcd_lib],
+            # Add any required dependencies for etcd-cpp-api
+            link_args: []  # Add any additional link args if needed
+            )
+            message('etcd-cpp-api found manually in /usr/local/lib')
+       else
+            etcd_dep = disabler()
+            message('etcd-cpp-api not found anywhere')
+      endif
+endif
 etcd_available = etcd_dep.found()
 if etcd_available
     add_project_arguments('-DHAVE_ETCD', language: 'cpp')
@@ -148,7 +219,14 @@ if cuda_fabric_available
     add_project_arguments('-DHAVE_CUDA_FABRIC', language: 'cpp')
 endif
 
+if synapseai_available
+    add_project_arguments('-DHAVE_SYNAPSEAI', language: 'cpp')
+endif
+
 # Subprojects
+if synapseai_available
+   subdir('src/synapseai')
+endif
 subdir('src/utils')
 subdir('src/runtime')
 subdir('src/worker')
@@ -161,6 +239,7 @@ configure_file(
         'HAVE_NVSHMEM': nvshmem_available ? '1' : '0',
         'HAVE_CUDA': cuda_available ? '1' : '0',
         'HAVE_CUDA_FABRIC': cuda_fabric_available ? '1' : '0',
+        'HAVE_SYNAPSEAI': synapseai_available ? '1' : '0',
     },
     install: true,
     install_dir: get_option('includedir') / 'nixlbench'
@@ -174,6 +253,11 @@ endif
 if cuda_available
     deps += [cuda_dep]
 endif
+
+if synapseai_available
+    deps += [synapseai_dep]
+    message('add synapseai_dep')
+endif
 if nvshmem_available
     deps += [nvshmem_lib]
     args += [
@@ -185,9 +269,9 @@ if nvshmem_available
     ]
 endif
 
-if not etcd_available
-    error('No runtime available or not found')
-endif
+#if not etcd_available
+#    error('No runtime available or not found')
+#endif
 
 if nvshmem_available
     # Use nvcc directly for compilation and linking
@@ -240,11 +324,21 @@ if nvshmem_available
         install_dir: get_option('bindir'),
         depends: [nixlbench_runtimes, utils_lib, worker_libs])
 else
-    executable('nixlbench', 'src/main.cpp',
-                include_directories: inc_dir,
-                link_with: [nixlbench_runtimes, utils_lib, worker_libs],
-                dependencies: deps,
-                link_args: args,
-                install: true,
-                install_dir: get_option('bindir'))
+   if synapseai_available
+       executable('nixlbench', 'src/main.cpp',
+                   include_directories: inc_dir,
+                   link_with: [nixlbench_runtimes, utils_lib, worker_libs, synapseaiutils_lib],
+                   dependencies: deps,
+                   link_args: args,
+                   install: true,
+                   install_dir: get_option('bindir'))
+     else
+       executable('nixlbench', 'src/main.cpp',
+                   include_directories: inc_dir,
+                   link_with: [nixlbench_runtimes, utils_lib, worker_libs],
+                   dependencies: deps,
+                   link_args: args,
+                   install: true,
+                   install_dir: get_option('bindir'))
+     endif
 endif

@@ -21,6 +21,7 @@
 #include "libfabric/libfabric_topology.h"
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
+#include <poll.h>
 
 // Forward declaration for LibfabricUtils namespace
 namespace LibfabricUtils {
@@ -912,4 +913,32 @@ nixlLibfabricRailManager::getNumIntelHpus() const {
         return topology->getNumIntelHpus();
     }
     return 0;
+}
+
+bool
+nixlLibfabricRailManager::usesPollMode() const {
+    for (auto &r : data_rails_) {
+        if (r->progress_mode() == CqProgressMode::POLL) return true;
+    }
+    return false;
+}
+
+void
+nixlLibfabricRailManager::pollAndProgress() {
+    std::vector<pollfd> pfds;
+    for (auto &r : data_rails_) {
+        if (r->progress_mode() == CqProgressMode::POLL) pfds.push_back({r->cq_fd(), POLLIN, 0});
+    }
+
+    int rc = poll(pfds.data(), pfds.size(), -1);
+    if (rc <= 0) return;
+
+    progressActiveDataRails();
+}
+
+void
+nixlLibfabricRailManager::waitAndProgress() {
+    std::unique_lock<std::mutex> lk(global_cv_mtx_);
+    global_cv_.wait_for(lk, std::chrono::microseconds(50));
+    progressActiveDataRails();
 }

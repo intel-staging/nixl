@@ -300,6 +300,12 @@ public:
         const std::string &serialized_data,
         std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &data_endpoints_out,
         std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &control_endpoints_out) const;
+    bool
+    usesPollMode() const;
+    void
+    pollAndProgress();
+    void
+    waitAndProgress();
 
 private:
     size_t striping_threshold_;
@@ -335,6 +341,9 @@ private:
         const std::string &key_prefix,
         size_t expected_count,
         std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints_out) const;
+
+    std::mutex global_cv_mtx_;
+    std::condition_variable global_cv_;
 };
 
 #endif // NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_MANAGER_H

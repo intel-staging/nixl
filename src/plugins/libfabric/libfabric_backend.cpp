@@ -1368,18 +1368,10 @@ nixlLibfabricEngine::progressThread() {
     NIXL_DEBUG << "Progress thread started successfully for data rails only";
     // Main progress loop - continuously process completions only on data rails
     while (!progress_thread_stop_.load()) {
-        // Process completions only on data rails (non-blocking)
-        bool any_completions = false;
-        nixl_status_t status = rail_manager.progressActiveDataRails();
-        if (status == NIXL_SUCCESS) {
-            any_completions = true;
-            NIXL_DEBUG << "Processed completions on data rails";
-        } else if (status != NIXL_IN_PROG && status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to process completions on data rails";
-            // Don't return error, continue for robustness
-        }
-        if (!any_completions) {
-            std::this_thread::sleep_for(progress_thread_delay_);
+        if (rail_manager.usesPollMode()) {
+            rail_manager.pollAndProgress();
+        } else {
+            rail_manager.waitAndProgress();
         }
     }
     NIXL_DEBUG << "Progress thread exiting cleanly";

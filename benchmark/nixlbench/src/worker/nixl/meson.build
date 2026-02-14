@@ -23,9 +23,12 @@ if cuda_available
   nixl_worker_deps += [cuda_dep]
 endif
 
+if synapseai_available
+  nixl_worker_deps += [synapseai_dep]
+endif
 nixl_worker_lib = static_library('nixl_worker',
   nixl_worker_sources,
   include_directories: inc_dir,
-  dependencies: nixl_worker_deps,
+  dependencies: [synapseaiutils_deps, nixl_worker_deps],
   install: true,
 )

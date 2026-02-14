@@ -116,7 +116,6 @@ int xferBenchWorker::synchronize() {
 
 xferBenchWorker::xferBenchWorker(int *argc, char ***argv) {
     terminate = 0;
-
     rt = createRT(&terminate);
     if (!rt) {
         std::cerr << "Failed to create runtime object" << std::endl;

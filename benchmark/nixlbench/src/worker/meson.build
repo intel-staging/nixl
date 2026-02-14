@@ -22,7 +22,8 @@ worker_deps = [
   cuda_dep,
   gflags_dep,
   openmp_dep,
-  etcd_dep
+  etcd_dep,
+  synapseai_dep
 ]
 
 worker_lib = static_library('worker',

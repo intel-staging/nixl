@@ -25,6 +25,7 @@
 #include <mutex>
 #include <ostream>
 #include <stack>
+#include <condition_variable>
 
 #include "nixl.h"
 #include "backend/backend_aux.h"
@@ -246,6 +247,15 @@ operator<<(std::ostream &os, const ConnectionState &state) {
     }
 }
 
+enum class CqProgressMode { POLL, NOPOLL };
+
+struct RailCredits {
+    std::mutex mtx;
+    std::condition_variable cv;
+    int credits = 0;
+    bool shutting_down = false;
+};
+
 /** Individual libfabric rail managing fabric, domain, endpoint, CQ, and AV */
 class nixlLibfabricRail {
 public:
@@ -399,6 +409,20 @@ public:
     };
     static SynapseAIOps synapseai_ops_;
 #endif
+    CqProgressMode
+    progress_mode() const {
+        return progress_mode_;
+    }
+
+    int
+    cq_fd() const {
+        return cq_fd_;
+    }
+
+    void
+    notifyProgress() {
+        credits_.cv.notify_one();
+    }
 
 private:
     // Core libfabric resources
@@ -438,6 +462,11 @@ private:
     // Memory registration helper
     uint64_t
     getMemoryRegistrationAccessFlags() const;
+
+    CqProgressMode progress_mode_ = CqProgressMode::NOPOLL;
+    int cq_fd_ = -1;
+
+    mutable RailCredits credits_;
 };
 
 

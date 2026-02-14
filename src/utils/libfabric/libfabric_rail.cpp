@@ -468,29 +468,51 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         // Create CQ for this rail
         struct fi_cq_attr cq_attr = {};
         cq_attr.format = FI_CQ_FORMAT_DATA;
-        cq_attr.wait_obj = FI_WAIT_UNSPEC;
         cq_attr.size = 12288;
-        ret = fi_cq_open(domain, &cq_attr, &cq, NULL);
+
+        // Try POLL mode first
+        cq_attr.wait_obj = FI_WAIT_FD;
+        ret = fi_cq_open(domain, &cq_attr, &cq, nullptr);
+
+        if (ret == 0) {
+            ret = fi_control(&cq->fid, FI_GETWAIT, &cq_fd_);
+            if (ret == 0 && cq_fd_ >= 0) {
+                progress_mode_ = CqProgressMode::POLL;
+                NIXL_INFO << "Rail " << rail_id << ": using POLL CQ";
+            } else {
+                fi_close(&cq->fid);
+                cq = nullptr;
+                ret = -FI_ENOSYS;
+            }
+        }
+        // Fallback: NO-POLL
         if (ret) {
-            NIXL_INFO << "fi_cq_open failed for rail " << rail_id << ": " << fi_strerror(-ret)
-                      << " - trying FI_WAIT_NONE for " << info->fabric_attr->name << " provider";
-            if (ret == -FI_ENOSYS) {
-                NIXL_TRACE << "FI_WAIT_UNSPEC not supported, falling back to FI_WAIT_NONE for rail "
-                           << rail_id;
-                blocking_cq_sread_supported = false;
-                // If fi_cq_open fails due to FI_WAIT_UNSPEC not supported, we fall back to
-                // FI_WAIT_NONE and use fi_cq_read in control rails
-                cq_attr.wait_obj = FI_WAIT_NONE;
-                ret = fi_cq_open(domain, &cq_attr, &cq, NULL);
-                if (ret) {
-                    NIXL_ERROR << "fi_cq_open with FI_WAIT_NONE failed for rail " << rail_id << ": "
-                               << fi_strerror(-ret);
-                    throw std::runtime_error("fi_cq_open with FI_WAIT_NONE failed for rail " +
+            cq_attr.wait_obj = FI_WAIT_NONE;
+            ret = fi_cq_open(domain, &cq_attr, &cq, NULL);
+            if (ret) {
+                NIXL_INFO << "fi_cq_open failed for rail " << rail_id << ": " << fi_strerror(-ret)
+                          << " - trying FI_WAIT_NONE for " << info->fabric_attr->name
+                          << " provider";
+                if (ret == -FI_ENOSYS) {
+                    NIXL_TRACE
+                        << "FI_WAIT_UNSPEC not supported, falling back to FI_WAIT_NONE for rail "
+                        << rail_id;
+                    blocking_cq_sread_supported = false;
+                    // If fi_cq_open fails due to FI_WAIT_UNSPEC not supported, we fall back to
+                    // FI_WAIT_NONE and use fi_cq_read in control rails
+                    cq_attr.wait_obj = FI_WAIT_NONE;
+                    ret = fi_cq_open(domain, &cq_attr, &cq, NULL);
+                    if (ret) {
+                        NIXL_ERROR << "fi_cq_open with FI_WAIT_NONE failed for rail " << rail_id
+                                   << ": " << fi_strerror(-ret);
+                        throw std::runtime_error("fi_cq_open with FI_WAIT_NONE failed for rail " +
+                                                 std::to_string(rail_id));
+                    }
+                    NIXL_TRACE << "fi_cq_open with FI_WAIT_NONE succeeded for rail " << rail_id;
+                } else {
+                    throw std::runtime_error("fi_cq_open failed for rail " +
                                              std::to_string(rail_id));
                 }
-                NIXL_TRACE << "fi_cq_open with FI_WAIT_NONE succeeded for rail " << rail_id;
-            } else {
-                throw std::runtime_error("fi_cq_open failed for rail " + std::to_string(rail_id));
             }
         }
         // Verify CQ was properly created
@@ -499,6 +521,8 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             throw std::runtime_error("CQ creation returned success but pointer is null for rail " +
                                      std::to_string(rail_id));
         }
+        credits_.credits = cq_attr.size;
+
         // Create AV for this rail
         struct fi_av_attr av_attr = {};
         ret = fi_av_open(domain, &av_attr, &av, NULL);
@@ -704,61 +728,22 @@ nixlLibfabricRail::progressCompletionQueue(bool use_blocking) const {
     memset(&completion, 0, sizeof(completion));
 
     int ret;
-
-    // Only protect libfabric CQ hardware operations
-    {
-        std::lock_guard<std::mutex> cq_lock(cq_progress_mutex_);
-
-        if (use_blocking && blocking_cq_sread_supported) {
-            // Blocking read using fi_cq_sread (used by CM thread)
-            ret = fi_cq_sread(cq, &completion, 1, nullptr, NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_SEC);
-        } else {
-            // Non-blocking read (used by progress thread or fallback)
-            ret = fi_cq_read(cq, &completion, 1);
+    while ((ret = fi_cq_read(cq, &completion, 1)) == 1) {
+        {
+            std::lock_guard<std::mutex> lk(credits_.mtx);
+            credits_.credits++;
         }
+        credits_.cv.notify_one();
 
-        if (ret < 0 && ret != -FI_EAGAIN) {
-            NIXL_ERROR << "fi_cq_read returned error " << ret << " on rail " << rail_id << ": "
-                       << fi_strerror(-ret);
-
-            // Handle error - but be careful about fi_cq_readerr
-            struct fi_cq_err_entry err_entry;
-            memset(&err_entry, 0, sizeof(err_entry));
-
-            int err_ret = fi_cq_readerr(cq, &err_entry, 0);
-            if (err_ret > 0) {
-                NIXL_ERROR << "CQ read failed on rail " << rail_id
-                           << " with error: " << fi_strerror(err_entry.err)
-                           << " prov_errno: " << err_entry.prov_errno << " len: " << err_entry.len;
-            } else {
-                NIXL_ERROR << "fi_cq_readerr failed with " << err_ret;
-            }
-            return NIXL_ERR_BACKEND;
-        }
-    }
-    // CQ lock released here - completion is now local data
-
-    if (ret == -FI_EAGAIN) {
-        return NIXL_IN_PROG; // No completions available
+        nixl_status_t st = processCompletionQueueEntry(&completion);
+        if (st != NIXL_SUCCESS) return st;
     }
 
-    if (ret == 1) {
-        NIXL_TRACE << "Completion received on rail " << rail_id << " flags: " << std::hex
-                   << completion.flags << " data: " << completion.data
-                   << " context: " << completion.op_context << std::dec;
+    if (ret == -FI_EAGAIN) return NIXL_IN_PROG;
 
-        // Process completion using local data. Callbacks have their own thread safety
-        nixl_status_t status = processCompletionQueueEntry(&completion);
-        if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to process completion on rail " << rail_id;
-            return status;
-        }
+    if (ret < 0) return NIXL_ERR_BACKEND;
 
-        NIXL_DEBUG << "Completion processed on rail " << rail_id;
-        return NIXL_SUCCESS;
-    }
-
-    return NIXL_ERR_BACKEND; // Unexpected case
+    return NIXL_SUCCESS;
 }
 
 // Route completion to appropriate handler (rail-specific)
@@ -1062,8 +1047,26 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
     int ret = -FI_EAGAIN;
     int attempt = 0;
 
-    while (true) {
+    while (ret == -FI_EAGAIN) {
+        std::unique_lock<std::mutex> lk(credits_.mtx);
+        credits_.cv.wait(lk, [&] { return credits_.credits > 0 || credits_.shutting_down; });
+
+        if (credits_.shutting_down) return NIXL_ERR_BACKEND;
+
+        credits_.credits--;
         // Libfabric fi_senddata call
+        ret = fi_senddata(
+            endpoint, req->buffer, req->buffer_size, desc, immediate_data, dest_addr, &req->ctx);
+        if (ret == 0) {
+            // Success
+            NIXL_TRACE << "Send posted successfully"
+                       << (attempt > 0 ? " after " + std::to_string(attempt + 1) + " attempts" :
+                                         "");
+            return NIXL_SUCCESS;
+        }
+    }
+    /*while (true) {
+       // Libfabric fi_senddata call
         ret = fi_senddata(
             endpoint, req->buffer, req->buffer_size, desc, immediate_data, dest_addr, &req->ctx);
 
@@ -1104,7 +1107,7 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
             // Other error - don't retry, fail immediately
             break;
         }
-    }
+    }*/
 
     NIXL_ERROR << "fi_senddata failed on rail " << rail_id << ": " << fi_strerror(-ret);
     return NIXL_ERR_BACKEND;
@@ -1135,7 +1138,33 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
     int ret = -FI_EAGAIN;
     int attempt = 0;
 
-    while (true) {
+    while (ret == -FI_EAGAIN) {
+        std::unique_lock<std::mutex> lk(credits_.mtx);
+        credits_.cv.wait(lk, [&] { return credits_.credits > 0 || credits_.shutting_down; });
+
+        if (credits_.shutting_down) return NIXL_ERR_BACKEND;
+
+        credits_.credits--;
+        // Libfabric fi_writedata call
+        ret = fi_writedata(endpoint,
+                           local_buffer,
+                           length,
+                           local_desc,
+                           immediate_data,
+                           dest_addr,
+                           remote_addr,
+                           remote_key,
+                           &req->ctx);
+
+        if (ret == 0) {
+            // Success
+            NIXL_TRACE << "RDMA write posted successfully"
+                       << (attempt > 0 ? " after " + std::to_string(attempt + 1) + " attempts" :
+                                         "");
+            return NIXL_SUCCESS;
+        }
+    }
+    /*while (true) {
         // Libfabric fi_writedata call
         ret = fi_writedata(endpoint,
                            local_buffer,
@@ -1184,7 +1213,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
             // Other error - don't retry, fail immediately
             break;
         }
-    }
+    }*/
 
     NIXL_ERROR << "fi_writedata failed on rail " << rail_id << ": " << fi_strerror(-ret);
     return NIXL_ERR_BACKEND;
@@ -1213,7 +1242,32 @@ nixlLibfabricRail::postRead(void *local_buffer,
     int ret = -FI_EAGAIN;
     int attempt = 0;
 
-    while (true) {
+    while (ret == -FI_EAGAIN) {
+        std::unique_lock<std::mutex> lk(credits_.mtx);
+        credits_.cv.wait(lk, [&] { return credits_.credits > 0 || credits_.shutting_down; });
+
+        if (credits_.shutting_down) return NIXL_ERR_BACKEND;
+
+        credits_.credits--;
+        // Libfabric fi_read call
+        ret = fi_read(endpoint,
+                      local_buffer,
+                      length,
+                      local_desc,
+                      dest_addr,
+                      remote_addr,
+                      remote_key,
+                      &req->ctx);
+
+        if (ret == 0) {
+            // Success
+            NIXL_TRACE << "RDMA read posted successfully"
+                       << (attempt > 0 ? " after " + std::to_string(attempt + 1) + " attempts" :
+                                         "");
+            return NIXL_SUCCESS;
+        }
+    }
+    /*while (true) {
         // Libfabric fi_read call
         ret = fi_read(endpoint,
                       local_buffer,
@@ -1261,7 +1315,7 @@ nixlLibfabricRail::postRead(void *local_buffer,
             // Other error - don't retry, fail immediately
             break;
         }
-    }
+    }*/
 
     NIXL_ERROR << "fi_read failed on rail " << rail_id << ": " << fi_strerror(-ret);
     return NIXL_ERR_BACKEND;
