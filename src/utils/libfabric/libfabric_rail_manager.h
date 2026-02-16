@@ -222,7 +222,7 @@ public:
      * @return NIXL_SUCCESS if completions processed, NIXL_IN_PROG if none, error on failure
      */
     nixl_status_t
-    progressAllControlRails();
+    progressAllControlRails(bool blocking);
     /** Validate that all rails are properly initialized
      * @return NIXL_SUCCESS if all rails initialized, error code otherwise
      */

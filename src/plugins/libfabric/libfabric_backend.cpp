@@ -1339,20 +1339,42 @@ nixlLibfabricEngine::cmThread() {
     NIXL_DEBUG << "ConnectionManagement thread started successfully";
     NIXL_DEBUG << "Initial receives already posted in main thread, entering progress loop";
 
-    // Main progress loop - continuously process completions on all rails
-    while (!cm_thread_stop_.load()) {
+    NIXL_DEBUG << "CM: Thread started";
 
-        nixl_status_t status = rail_manager.progressAllControlRails();
+    // Adaptive backoff state (per-thread)
+    static thread_local int backoff_us = 50; // start at 50 µs
+    static thread_local const int backoff_us_max = 2000; // cap at 2 ms
+
+    // Prefer blocking progress if supported (verbs with FI_WAIT_FD)
+    const bool blocking_supported = (rail_manager.getNumControlRails() > 0) &&
+        rail_manager.getControlRail(0).blocking_cq_sread_supported;
+
+    while (!cm_thread_stop_.load(std::memory_order_relaxed)) {
+        nixl_status_t status;
+        if (blocking_supported) {
+            // With blocking control CQ progress, rely on rail_manager to block up to its timeout
+            status = rail_manager.progressAllControlRails(true); // blocking=true inside rail path
+        } else {
+            // Non-blocking path: progress and adaptively back off on idle
+            status = rail_manager.progressAllControlRails(false);
+        }
+
         if (status == NIXL_SUCCESS) {
-            NIXL_DEBUG << "Processed completions on control rails";
-        } else if (status != NIXL_IN_PROG && status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to process completions on control rails";
-            return NIXL_ERR_BACKEND;
+            // Work was done reset backoff
+            backoff_us = 50;
+            // Optionally continue immediately to drain more completions
+            continue;
         }
-        // Sleep briefly to avoid spinning too aggressively when blocking cq read is not used
-        if (!rail_manager.getControlRail(0).blocking_cq_sread_supported) {
-            std::this_thread::sleep_for(std::chrono::nanoseconds(10));
+        if (status == NIXL_IN_PROG) {
+            // No completions available sleep adaptively
+            std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+            backoff_us = std::min(backoff_us * 2, backoff_us_max);
+            continue;
         }
+
+        // Unexpected error log and exit
+        NIXL_ERROR << "CM: Failed to process completions on control rails, status=" << status;
+        return NIXL_ERR_BACKEND;
     }
     NIXL_DEBUG << "ConnectionManagement thread exiting cleanly";
     return NIXL_SUCCESS;
@@ -1366,24 +1388,33 @@ nixlLibfabricEngine::cmThread() {
 nixl_status_t
 nixlLibfabricEngine::progressThread() {
     NIXL_DEBUG << "Progress thread started successfully for data rails only";
-    // Main progress loop - continuously process completions only on data rails
-    while (!progress_thread_stop_.load()) {
-        // Process completions only on data rails (non-blocking)
-        bool any_completions = false;
-        nixl_status_t status = rail_manager.progressActiveDataRails();
+
+    // Adaptive backoff layered over configured delay
+    static thread_local int backoff_us = static_cast<int>(progress_thread_delay_.count());
+    static thread_local const int backoff_us_min = 50; // floor at 50 µs
+    static thread_local const int backoff_us_max = 5000; // cap at 5 ms
+    if (backoff_us <= 0) backoff_us = backoff_us_min;
+
+    while (!progress_thread_stop_.load(std::memory_order_relaxed)) {
+        nixl_status_t status = rail_manager.progressActiveDataRails(); // non-blocking
         if (status == NIXL_SUCCESS) {
-            any_completions = true;
-            NIXL_DEBUG << "Processed completions on data rails";
-        } else if (status != NIXL_IN_PROG && status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to process completions on data rails";
-            // Don't return error, continue for robustness
+            // Completions processed reset backoff and continue draining
+            backoff_us = std::max(backoff_us_min, static_cast<int>(progress_thread_delay_.count()));
+            continue;
         }
-        if (!any_completions) {
-            std::this_thread::sleep_for(progress_thread_delay_);
+        if (status == NIXL_IN_PROG) {
+            // Idle sleep adaptively, increasing up to cap
+            std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+            backoff_us = std::min(backoff_us * 2, backoff_us_max);
+            continue;
         }
+        // Error log and keep going for robustness (do not kill the PT)
+        NIXL_ERROR << "PT: Failed to process completions on data rails, status=" << status;
+        std::this_thread::sleep_for(std::chrono::microseconds(backoff_us_min));
     }
-    NIXL_DEBUG << "Progress thread exiting cleanly";
+    NIXL_DEBUG << "PT: Thread exiting";
     return NIXL_SUCCESS;
+
 }
 
 void
