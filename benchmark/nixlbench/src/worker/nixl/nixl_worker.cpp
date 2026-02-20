@@ -107,6 +107,14 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
     : xferBenchWorker() {
     seg_type = GET_SEG_TYPE(isInitiator());
 
+#ifndef HAVE_ZE
+    if (xferBenchConfig::initiator_seg_type == XFERBENCH_SEG_TYPE_XPU ||
+        xferBenchConfig::target_seg_type == XFERBENCH_SEG_TYPE_XPU) {
+        std::cerr << "XPU seg type requires NIXL built with Level Zero (HAVE_ZE)" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+#endif
+
     int rank;
     std::string backend_name;
     nixl_b_params_t backend_params;
