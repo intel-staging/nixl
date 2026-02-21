@@ -1,3 +1,9 @@
+<!---
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 Intel Corporation. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Intel XPU Support in NIXL
 
 NIXL supports Intel XPU devices (Intel Data Center GPU Max and Flex series) through the
