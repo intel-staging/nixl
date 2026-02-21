@@ -104,17 +104,20 @@ nixlLibfabricTopology::discoverTopology() {
             }
         }
     } else {
-        // For TCP/sockets devices, bypass complex topology discovery
+        // For TCP/sockets devices, bypass EFA-specific topology discovery but
+        // still enumerate accelerators so XPU/CUDA detection works correctly.
         NIXL_INFO << "Using simplified topology for " << provider_name
-                  << " devices (no topology mapping needed)";
+                  << " devices (no EFA topology mapping needed)";
 
-        // Set basic values without hwloc discovery
-        num_nvidia_accel = 0; // TCP doesn't need accelerator topology
-        num_aws_accel = 0; // TCP doesn't need accelerator topology
         num_numa_nodes = 1; // Simple fallback
 
-        // For TCP/sockets devices, no accelerator-mapping required.
-        NIXL_INFO << "TCP devices available globally - no accelerator-specific mapping required";
+        // Still discover accelerators via hwloc so num_nvidia_accel /
+        // num_intel_xpu_accel are populated for runtime_ selection.
+        status = discoverAccelWithHwloc();
+        if (status != NIXL_SUCCESS) {
+            NIXL_WARN << "Failed to discover accelerators with hwloc on non-EFA system";
+            // Non-fatal: proceed without accelerator info.
+        }
     }
     topology_discovered = true;
     NIXL_TRACE << "Topology discovery completed successfully";
@@ -764,12 +767,12 @@ nixlLibfabricTopology::isIntelXpuAccel(hwloc_obj_t obj) const {
         return false;
     if (obj->attr->pcidev.vendor_id != 0x8086)
         return false;
-    // Class 0x0380 = Display Controller (Other). All Intel discrete GPUs (Arc, Data Center GPU
-    // Max/Flex/PVC, CRI, BMG) enumerate as 0x0380. Intel integrated graphics use 0x0300 (VGA
-    // Compatible) and are excluded. Gaudi/Habana uses 0x1200 (Processing Accelerator) and is
-    // also excluded. This covers all current and future Intel discrete GPU SKUs without
-    // requiring a device-ID whitelist.
-    return obj->attr->pcidev.class_id == 0x0380;
+    // 0x0380 = Display Controller (Other): Data Center GPU Max/Flex, Arc A-series, BMG B57x
+    // 0x0300 = VGA Compatible Controller: BMG B58x/B70 and some other Arc discrete SKUs
+    // Both classes are used by Intel discrete GPUs depending on SKU/BIOS.
+    // 0x1200 (Gaudi/Habana) and 0x0106/0x0108 (SATA/NVMe) are intentionally excluded.
+    uint16_t cls = obj->attr->pcidev.class_id;
+    return cls == 0x0380 || cls == 0x0300;
 }
 
 bool

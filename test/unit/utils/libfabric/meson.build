@@ -24,6 +24,10 @@ endif
 
 if get_option('buildtype') != 'release'
 
+    # Compute libfabric lib dir for LD_LIBRARY_PATH injection in test envs.
+    # Required when libfabric_path points to a non-system install.
+    lf_lib_dir = libfabric_path != '' ? libfabric_path + '/lib' : ''
+
     # mock function calls for testing
     libfabric_test_link_args = [
         '-Wl,--wrap=fi_getinfo',
@@ -60,6 +64,37 @@ if get_option('buildtype') != 'release'
                link_args: rail_active_refcount_test_link_args,
                install: true)
 
-    test('rail_active_refcount_test', rail_active_refcount_test_bin)
+    rail_test_env = environment()
+    if lf_lib_dir != ''
+        rail_test_env.prepend('LD_LIBRARY_PATH', lf_lib_dir)
+    endif
+
+    test('rail_active_refcount_test', rail_active_refcount_test_bin,
+         env: rail_test_env)
+
+    # Intel XPU topology detection test — validates isIntelXpuAccel() using
+    # hwloc XML files from real Intel GPU systems.
+    xpu_topo_test_link_args = [
+        '-Wl,--wrap=fi_getinfo',
+        '-Wl,--wrap=fi_fabric' ]
+
+    libfabric_xpu_topology_test_bin = executable('libfabric_xpu_topology_test',
+               'libfabric_xpu_topology_test.cpp',
+               dependencies: libfabric_utils_dep,
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               link_with: libfabric_utils_lib,
+               cpp_args: libfabric_test_cpp_args,
+               link_args: xpu_topo_test_link_args,
+               install: true)
+
+    xpu_topo_test_env = environment()
+    if lf_lib_dir != ''
+        xpu_topo_test_env.prepend('LD_LIBRARY_PATH', lf_lib_dir)
+    endif
+
+    test('libfabric_xpu_topology_test',
+         libfabric_xpu_topology_test_bin,
+         workdir: meson.current_source_dir() / 'topo',
+         env: xpu_topo_test_env)
 
 endif
