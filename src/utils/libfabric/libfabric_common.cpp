@@ -102,6 +102,19 @@ getAvailableNetworkDevices() {
         return {"cxi", provider_device_map["cxi"]};
     } else if (provider_device_map.find("efa") != provider_device_map.end()) {
         return {"efa", provider_device_map["efa"]};
+    } else if (provider_device_map.find("verbs") != provider_device_map.end()) {
+        // RoCE/IB: de-duplicate domain names (fi_getinfo returns one entry per ep_type)
+        const auto &verbs_devs = provider_device_map["verbs"];
+        std::vector<std::string> unique_devs;
+        std::unordered_set<std::string> seen;
+        for (const auto &d : verbs_devs) {
+            // Skip -xrc and -dgram variants; keep only base domain names
+            if (d.find('-') == std::string::npos && seen.insert(d).second)
+                unique_devs.push_back(d);
+        }
+        if (!unique_devs.empty())
+            return {"verbs", unique_devs};
+        return {"verbs", {verbs_devs[0]}};
     } else if (provider_device_map.find("tcp") != provider_device_map.end()) {
         return {"tcp", {provider_device_map["tcp"][0]}};
     } else if (provider_device_map.find("sockets") != provider_device_map.end()) {

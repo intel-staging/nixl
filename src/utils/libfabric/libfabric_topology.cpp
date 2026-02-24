@@ -76,13 +76,14 @@ nixlLibfabricTopology::discoverTopology() {
     if (status != NIXL_SUCCESS) {
         return status;
     }
-    // For EFA devices, build PCIe to Libfabric device mapping and full topology
-    if (provider_name == "efa") {
-        // Build PCIe to Libfabric device mapping
+    // For EFA and RoCE/verbs devices, build full PCIe topology with accel-to-NIC mapping.
+    // For TCP/sockets, skip NIC topology but still enumerate accelerators.
+    if (provider_name == "efa" || provider_name == "verbs" || provider_name == "cxi") {
+        // Build PCIe address → libfabric device name mapping from fi_getinfo
         status = buildPcieToLibfabricMapping();
         if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to build PCIe to Libfabric mapping - this is required for EFA "
-                          "topology discovery";
+            NIXL_ERROR << "Failed to build PCIe to Libfabric mapping for provider "
+                       << provider_name;
             return status;
         }
         // Discover hardware topology using hwloc
@@ -92,31 +93,28 @@ nixlLibfabricTopology::discoverTopology() {
             return status;
         }
 
-        // build nic info map regardless of accelerator to EFA mapping
+        // Build NIC info map (NUMA node, PCIe switch, speeds) for all discovered NICs
         buildNicInfoMap();
 
-        // Build nVidia accelerator to EFA mapping based on PCIe topology
-        if (num_nvidia_accel > 0) {
-            status = buildAccelToEfaMapping();
+        // Build accelerator → NIC proximity mapping when accelerators are present
+        if (num_nvidia_accel > 0 || num_intel_xpu_accel > 0) {
+            status = buildAccelToNicMapping();
             if (status != NIXL_SUCCESS) {
-                NIXL_ERROR << "Failed to build accelerator to EFA mapping";
+                NIXL_ERROR << "Failed to build accelerator to NIC mapping";
                 return status;
             }
         }
     } else {
-        // For TCP/sockets devices, bypass EFA-specific topology discovery but
-        // still enumerate accelerators so XPU/CUDA detection works correctly.
+        // For TCP/sockets devices, bypass topology discovery but still
+        // enumerate accelerators so runtime_ is set correctly.
         NIXL_INFO << "Using simplified topology for " << provider_name
-                  << " devices (no EFA topology mapping needed)";
+                  << " devices (no NIC topology mapping needed)";
 
-        num_numa_nodes = 1; // Simple fallback
+        num_numa_nodes = 1;
 
-        // Still discover accelerators via hwloc so num_nvidia_accel /
-        // num_intel_xpu_accel are populated for runtime_ selection.
         status = discoverAccelWithHwloc();
         if (status != NIXL_SUCCESS) {
-            NIXL_WARN << "Failed to discover accelerators with hwloc on non-EFA system";
-            // Non-fatal: proceed without accelerator info.
+            NIXL_WARN << "Failed to discover accelerators with hwloc on non-fabric system";
         }
     }
     topology_discovered = true;
@@ -152,7 +150,7 @@ nixlLibfabricTopology::discoverProviderWithDevices() {
 }
 
 std::vector<std::string>
-nixlLibfabricTopology::getEfaDevicesForPci(const std::string &pci_bus_id) const {
+nixlLibfabricTopology::getNicsForPci(const std::string &pci_bus_id) const {
     // Normalize PCI bus ID format to match hwloc format
     // CUDA format: "0000:59:00.0" → hwloc format: "0:59:00.0"
     unsigned int domain, bus, device, function;
@@ -255,7 +253,8 @@ nixlLibfabricTopology::getNumaRailCount() const {
 
 void
 nixlLibfabricTopology::printTopologyInfo() const {
-    NIXL_INFO << "Topology: " << num_numa_nodes << " NUMA nodes, " << num_devices << " NICs, "
+    NIXL_INFO << "Topology: " << num_numa_nodes << " NUMA nodes, " << num_devices
+              << " NICs (provider=" << provider_name << "), "
               << num_nvidia_accel << " NVIDIA GPUs, " << num_aws_accel << " AWS accelerators, "
               << num_intel_xpu_accel << " Intel XPU accelerators";
     if (avg_nic_speed > 0) {
@@ -378,24 +377,34 @@ nixlLibfabricTopology::discoverHwlocTopology() {
         NIXL_ERROR << "hwloc topology not initialized";
         return NIXL_ERR_BACKEND;
     }
-    // Discover accelerators and EFA devices using hwloc
+    // Discover accelerators using hwloc (always, regardless of NIC type)
     nixl_status_t status = discoverAccelWithHwloc();
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Failed to discover accelerators with hwloc";
         return status;
     }
-    status = discoverEfaDevicesWithHwloc();
-    if (status != NIXL_SUCCESS) {
-        NIXL_ERROR << "Failed to discover EFA devices with hwloc";
-        return status;
+    // Discover NIC devices — use the appropriate method for the provider
+    if (provider_name == "verbs") {
+        status = discoverRoceDevicesWithHwloc();
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to discover RoCE devices with hwloc";
+            return status;
+        }
+    } else {
+        status = discoverEfaDevicesWithHwloc();
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to discover EFA devices with hwloc";
+            return status;
+        }
     }
     // Discover NUMA topology
     num_numa_nodes = hwloc_get_nbobjs_by_type(hwloc_topology, HWLOC_OBJ_NUMANODE);
     if (num_numa_nodes == 0) {
-        num_numa_nodes = 1; // Fallback to single NUMA node
+        num_numa_nodes = 1;
     }
-    NIXL_TRACE << "Discovered " << num_aws_accel << " AWS accelerators and " << num_numa_nodes
-               << " NUMA nodes via hwloc";
+    NIXL_TRACE << "Discovered " << num_aws_accel << " AWS accelerators, "
+               << num_intel_xpu_accel << " Intel XPU accelerators, "
+               << num_numa_nodes << " NUMA nodes via hwloc";
     return NIXL_SUCCESS;
 }
 
@@ -554,18 +563,7 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
 
 nixl_status_t
 nixlLibfabricTopology::buildAccelToEfaMapping() {
-    pci_to_efa_devices.clear();
-    // Implement NIXL's topology-aware accelerator-EFA grouping algorithm
-    nixl_status_t status = buildTopologyAwareGrouping();
-    if (status != NIXL_SUCCESS) {
-        NIXL_WARN << "Topology-aware grouping failed, using fallback to use all available devices";
-        return buildFallbackMapping();
-    }
-
-    NIXL_TRACE << "Built PCI→EFA mapping for " << pci_to_efa_devices.size()
-               << " accelerators using topology-aware algorithm";
-
-    return NIXL_SUCCESS;
+    return buildAccelToNicMapping();
 }
 
 nixl_status_t
@@ -578,10 +576,10 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
         discovered_nics.push_back(entry.second);
     }
 
-    // Step 2: Discover accelerators
+    // Step 2: Discover accelerators — NVIDIA GPUs and Intel XPUs
     hwloc_obj_t pci_obj = nullptr;
     while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
-        if (isNvidiaAccel(pci_obj)) {
+        if (isNvidiaAccel(pci_obj) || isIntelXpuAccel(pci_obj)) {
             AccelInfo accel;
             accel.hwloc_node = pci_obj;
             accel.domain_id = pci_obj->attr->pcidev.domain;
@@ -786,6 +784,60 @@ nixlLibfabricTopology::isEfaDevice(hwloc_obj_t obj) const {
     // Amazon EFA vendor ID is 0x1d0f, device ID matches 0xefa* (wildcard for any EFA device)
     return obj->attr->pcidev.vendor_id == 0x1d0f &&
         (obj->attr->pcidev.device_id & 0xfff0) == 0xefa0;
+}
+
+bool
+nixlLibfabricTopology::isRoceDevice(hwloc_obj_t obj) const {
+    if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE)
+        return false;
+    // Mellanox/NVIDIA Network vendor ID 0x15b3.
+    // 0x0207 = InfiniBand controller (IB mode)
+    // 0x0200 = Ethernet controller (RoCE/Ethernet mode, e.g. ConnectX-6 Dx)
+    // Both classes appear on ConnectX-4/5/6/7 adapters depending on firmware config.
+    if (obj->attr->pcidev.vendor_id != 0x15b3)
+        return false;
+    uint16_t cls = obj->attr->pcidev.class_id;
+    return cls == 0x0207 || cls == 0x0200;
+}
+
+nixl_status_t
+nixlLibfabricTopology::discoverRoceDevicesWithHwloc() {
+    // Count RoCE/IB PCI devices visible in hwloc and cross-check against
+    // what libfabric reported.  We don't need the count to be exact; the
+    // real NIC enumeration comes from pcie_to_libfabric_map built in
+    // buildPcieToLibfabricMapping(), which is already populated before
+    // this function is called.
+    int hwloc_roce_count = 0;
+    hwloc_obj_t pci_obj = nullptr;
+    while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
+        if (isRoceDevice(pci_obj)) {
+            hwloc_roce_count++;
+            NIXL_TRACE << "Found RoCE device via hwloc: "
+                       << getPcieAddressFromHwlocObj(pci_obj);
+        }
+    }
+
+    NIXL_DEBUG << "hwloc found " << hwloc_roce_count
+               << " RoCE devices, libfabric reported " << num_devices;
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlLibfabricTopology::buildAccelToNicMapping() {
+    // Unified accelerator-to-NIC proximity mapping for both EFA and RoCE providers.
+    // Delegates to buildTopologyAwareGrouping() which is already provider-agnostic:
+    // it works on the nic_info_map (populated from pcie_to_libfabric_map) and
+    // the hwloc accelerator list, producing pci_to_efa_devices entries.
+    pci_to_efa_devices.clear();
+    nixl_status_t status = buildTopologyAwareGrouping();
+    if (status != NIXL_SUCCESS) {
+        NIXL_WARN << "Topology-aware grouping failed for provider " << provider_name
+                  << ", using fallback (all NICs for every accelerator)";
+        return buildFallbackMapping();
+    }
+    NIXL_DEBUG << "Built accel→NIC mapping for " << pci_to_efa_devices.size()
+               << " accelerators (provider=" << provider_name << ")";
+    return NIXL_SUCCESS;
 }
 
 size_t

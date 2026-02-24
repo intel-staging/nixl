@@ -83,7 +83,11 @@ private:
     nixl_status_t
     discoverEfaDevicesWithHwloc();
     nixl_status_t
+    discoverRoceDevicesWithHwloc();
+    nixl_status_t
     buildAccelToEfaMapping();
+    nixl_status_t
+    buildAccelToNicMapping();
     void
     buildNicInfoMap();
     void
@@ -149,6 +153,8 @@ private:
     isIntelXpuAccel(hwloc_obj_t obj) const;
     bool
     isEfaDevice(hwloc_obj_t obj) const;
+    bool
+    isRoceDevice(hwloc_obj_t obj) const;
 
     // retrieves line speed of NIC from map
     size_t
@@ -199,8 +205,14 @@ public:
     ~nixlLibfabricTopology();
 
     // Accelerator-based queries (main interface)
+    // getNicsForPci: provider-agnostic; returns NIC names closest to the given GPU BDF.
     std::vector<std::string>
-    getEfaDevicesForPci(const std::string &pci_bus_id) const;
+    getNicsForPci(const std::string &pci_bus_id) const;
+    // Backward-compatible alias for EFA callers.
+    std::vector<std::string>
+    getEfaDevicesForPci(const std::string &pci_bus_id) const {
+        return getNicsForPci(pci_bus_id);
+    }
 
     // System information
     int
