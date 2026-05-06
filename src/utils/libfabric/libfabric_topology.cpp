@@ -765,12 +765,21 @@ nixlLibfabricTopology::isIntelXpuAccel(hwloc_obj_t obj) const {
         return false;
     if (obj->attr->pcidev.vendor_id != 0x8086)
         return false;
+
+    // Display-class Intel discrete GPUs (Arc, Data Center GPU Max/Flex, BMG).
     // 0x0380 = Display Controller (Other): Data Center GPU Max/Flex, Arc A-series, BMG B57x
-    // 0x0300 = VGA Compatible Controller: BMG B58x/B70 and some other Arc discrete SKUs
-    // Both classes are used by Intel discrete GPUs depending on SKU/BIOS.
-    // 0x1200 (Gaudi/Habana) and 0x0106/0x0108 (SATA/NVMe) are intentionally excluded.
+    // 0x0300 = VGA Compatible Controller: BMG B58x/B70 and some discrete Arc SKUs
     uint16_t cls = obj->attr->pcidev.class_id;
-    return cls == 0x0380 || cls == 0x0300;
+    if (cls == 0x0380 || cls == 0x0300)
+        return true;
+
+    // CRI devices have no display hardware and are not exposed as class 0x03xx.
+    // Match by device ID only (vendor already verified above).
+    static const uint16_t kCriDeviceIds[] = {
+        0x674c, // Intel CRI
+    };
+    return std::find(std::begin(kCriDeviceIds), std::end(kCriDeviceIds),
+                     obj->attr->pcidev.device_id) != std::end(kCriDeviceIds);
 }
 
 bool
