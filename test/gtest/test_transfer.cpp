@@ -30,24 +30,156 @@
 #include <chrono>
 #include <thread>
 #include <vector>
-#include <thread>
 #include <mutex>
 
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
 #endif
 
+#ifdef HAVE_ZE
+#include <level_zero/ze_api.h>
+#include <cstdlib>
+#endif
+
 constexpr auto min_chrono_time = std::chrono::steady_clock::time_point::min();
 
 namespace gtest {
+
+namespace {
+// Backend-agnostic VRAM helpers. Test code only ever sees DRAM_SEG / VRAM_SEG;
+// the choice between CUDA and Level Zero lives entirely inside this namespace
+// and is decided once per process by whichever runtime initializes first.
+
+#ifdef HAVE_ZE
+// Level Zero has no implicit primary context, unlike CUDA. Allocating device
+// memory requires an explicit ze_context_handle_t, so the test owns one
+// process-wide context that is initialized on first VRAM allocation and
+// torn down at exit.
+ze_context_handle_t g_ze_ctx = nullptr;
+ze_device_handle_t g_ze_dev = nullptr;
+
+bool zeInitOnce()
+{
+    static std::once_flag once;
+    std::call_once(once, []() {
+        if (zeInit(ZE_INIT_FLAG_GPU_ONLY) != ZE_RESULT_SUCCESS) {
+            return;
+        }
+
+        uint32_t driver_count = 1;
+        ze_driver_handle_t driver = nullptr;
+        if (zeDriverGet(&driver_count, &driver) != ZE_RESULT_SUCCESS ||
+            driver_count == 0) {
+            return;
+        }
+
+        uint32_t device_count = 1;
+        if (zeDeviceGet(driver, &device_count, &g_ze_dev) != ZE_RESULT_SUCCESS ||
+            device_count == 0) {
+            g_ze_dev = nullptr;
+            return;
+        }
+
+        ze_context_desc_t desc{ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0};
+        if (zeContextCreate(driver, &desc, &g_ze_ctx) != ZE_RESULT_SUCCESS) {
+            g_ze_ctx = nullptr;
+            g_ze_dev = nullptr;
+            return;
+        }
+
+        std::atexit([]() {
+            if (g_ze_ctx != nullptr) {
+                zeContextDestroy(g_ze_ctx);
+                g_ze_ctx = nullptr;
+            }
+        });
+    });
+
+    return g_ze_ctx != nullptr;
+}
+#endif
+
+#ifdef HAVE_CUDA
+void *cudaVramAlloc(size_t size)
+{
+    void *ptr = nullptr;
+    return cudaSuccess == cudaMalloc(&ptr, size) ? ptr : nullptr;
+}
+
+void cudaVramFree(void *ptr)
+{
+    cudaFree(ptr);
+}
+#endif
+
+#ifdef HAVE_ZE
+void *zeVramAlloc(size_t size)
+{
+    ze_device_mem_alloc_desc_t desc{ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC,
+                                    nullptr, 0, 0};
+    void *ptr = nullptr;
+    return ZE_RESULT_SUCCESS ==
+               zeMemAllocDevice(g_ze_ctx, &desc, size, 0, g_ze_dev, &ptr)
+        ? ptr : nullptr;
+}
+
+void zeVramFree(void *ptr)
+{
+    zeMemFree(g_ze_ctx, ptr);
+}
+#endif
+
+struct vramOps {
+    void *(*alloc)(size_t) = nullptr;
+    void (*free)(void *) = nullptr;
+};
+
+const vramOps &getVramOps()
+{
+    static const vramOps ops = []() {
+#ifdef HAVE_CUDA
+        if (cudaSetDevice(0) == cudaSuccess) {
+            return vramOps{cudaVramAlloc, cudaVramFree};
+        }
+#endif
+#ifdef HAVE_ZE
+        if (zeInitOnce()) {
+            return vramOps{zeVramAlloc, zeVramFree};
+        }
+#endif
+        return vramOps{};
+    }();
+    return ops;
+}
+
+bool vramAvailable()
+{
+    return getVramOps().alloc != nullptr;
+}
+
+void *vramAlloc(size_t size)
+{
+    auto fn = getVramOps().alloc;
+    return fn != nullptr ? fn(size) : nullptr;
+}
+
+void vramFree(void *ptr)
+{
+    if (ptr == nullptr) {
+        return;
+    }
+    auto fn = getVramOps().free;
+    if (fn != nullptr) {
+        fn(ptr);
+    }
+}
+} // namespace
 
 class MemBuffer : std::shared_ptr<void> {
 public:
     MemBuffer(size_t size, nixl_mem_t mem_type = DRAM_SEG) :
         std::shared_ptr<void>(allocate(size, mem_type),
-                              [mem_type](void *ptr) {
-                                  release(ptr, mem_type);
-                              }),
+                              [mem_type](void *ptr) { release(ptr, mem_type); }),
         size(size)
     {
     }
@@ -68,11 +200,8 @@ private:
         switch (mem_type) {
         case DRAM_SEG:
             return malloc(size);
-#ifdef HAVE_CUDA
         case VRAM_SEG:
-            void *ptr;
-            return cudaSuccess == cudaMalloc(&ptr, size)? ptr : nullptr;
-#endif
+            return vramAlloc(size);
         default:
             return nullptr; // TODO
         }
@@ -84,11 +213,9 @@ private:
         case DRAM_SEG:
             free(ptr);
             break;
-#ifdef HAVE_CUDA
         case VRAM_SEG:
-            cudaFree(ptr);
+            vramFree(ptr);
             break;
-#endif
         default:
             return; // TODO
         }
@@ -144,10 +271,6 @@ protected:
 
     void SetUp() override
     {
-#ifdef HAVE_CUDA
-        m_cuda_device = (cudaSetDevice(0) == cudaSuccess);
-#endif
-
         // Disabling Telemetry until the corresponding test
         env.addVar("NIXL_TELEMETRY_ENABLE", "n");
 
@@ -470,7 +593,6 @@ protected:
         return absl::StrFormat("agent_%d", idx);
     }
 
-    bool m_cuda_device = false;
     gtest::ScopedEnv env;
     std::vector<nixlBackendH *> backend_handles;
 
@@ -574,7 +696,7 @@ TEST_P(TestTransfer, remoteMDFromSocket)
     std::vector<MemBuffer> src_buffers, dst_buffers;
     constexpr size_t size = 16 * 1024;
     constexpr size_t count = 4;
-    nixl_mem_t mem_type = m_cuda_device? VRAM_SEG : DRAM_SEG;
+    nixl_mem_t mem_type = vramAvailable() ? VRAM_SEG : DRAM_SEG;
 
     createRegisteredMem(getAgent(0), size, count, mem_type, src_buffers);
     createRegisteredMem(getAgent(1), size, count, mem_type, dst_buffers);
