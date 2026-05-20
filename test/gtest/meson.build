@@ -84,6 +84,9 @@ if rocm_dep.found()
 elif cuda_dep.found()
     gpu_dependencies = [cuda_dep]
     cpp_flags += ['-DHAVE_GPU', '-DHAVE_CUDA']
+elif libze_dep.found()
+    gpu_dependencies = [libze_dep]
+    cpp_flags += ['-DHAVE_GPU', '-DHAVE_ZE']
 endif
 
 subdir('unit')
