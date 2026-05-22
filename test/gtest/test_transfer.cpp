@@ -154,7 +154,23 @@ const vramOps &getVramOps()
 
 bool vramAvailable()
 {
-    return getVramOps().alloc != nullptr;
+    static const bool available = []() {
+        const auto &ops = getVramOps();
+
+        if (ops.alloc == nullptr || ops.free == nullptr) {
+            return false;
+        }
+
+        void *probe = ops.alloc(1);
+        if (probe == nullptr) {
+            return false;
+        }
+
+        ops.free(probe);
+        return true;
+    }();
+
+    return available;
 }
 
 void *vramAlloc(size_t size)
