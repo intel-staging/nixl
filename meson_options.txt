@@ -18,7 +18,7 @@ option('libfabric_path', type: 'string', value: '', description: 'Path to LIBFAB
 option('etcd_inc_path', type: 'string', value: '', description: 'Path to ETCD Headers')
 option('etcd_lib_path', type: 'string', value: '', description: 'Path to ETCD Libraries')
 option('disable_gds_backend', type : 'boolean', value : false, description : 'disable gds backend')
-option('enable_xpu_backend', type: 'combo', choices: ['auto', 'true', 'false'], value: 'auto', description: 'Enable Intel XPU (Level Zero) backend support (auto: detect libze_loader)')
+option('enable_ze_backend', type: 'combo', choices: ['auto', 'true', 'false'], value: 'auto', description: 'Enable Intel Level Zero backend support (auto: detect libze_loader)')
 option('disable_mooncake_backend', type : 'boolean', value : false, description : 'disable mooncake backend')
 option('install_headers', type : 'boolean', value : true, description : 'install headers')
 option('gds_path', type: 'string', value: '/usr/local/cuda/', description: 'Path to GDS CuFile install')
