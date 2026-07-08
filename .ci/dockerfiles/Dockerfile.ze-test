@@ -1,0 +1,196 @@
+# NIXL ZE Test Environment
+#
+# Intel XPU (Level Zero) testing container with UCX built against the
+# oneAPI Level Zero stack. Used by the ze-ci workflow.
+#
+# The image bakes the Level Zero null driver (libze_null.so) so the Level Zero
+# loader enumerates a synthetic device on runners without a real Intel GPU.
+# The null-driver RUN block below mirrors the UCX ze-builder image and is
+# swappable for the published UCX base image once that image is available (that
+# image bakes only the null driver + deps; NIXL builds its own UCX).
+#
+# Usage:
+#   docker build -f .ci/dockerfiles/Dockerfile.ze-test -t nixl-ze-test .
+#
+
+ARG BASE_IMAGE=intel/oneapi-toolkit:2026.0.0-devel-ubuntu24.04
+
+FROM ${BASE_IMAGE}
+
+# UCX is pinned to a specific master commit because the Level Zero (ZE)
+# features required for Intel XPU support have not yet landed in a UCX
+# release. When a UCX release ships with the required ZE features, switch to
+# a release tag and drop UCX_COMMIT. Bump deliberately; do not float on master.
+ARG UCX_REPO_URL=https://github.com/openucx/ucx.git
+ARG UCX_COMMIT=36333b9b1f263c82b2893fc8f05ad1596f325237
+ARG UCX_SRC_DIR=/tmp/ucx_source
+ARG UCX_INSTALL_DIR=/usr
+ARG WORKSPACE=/workspace/nixl
+ARG XPU_LIB_DEB_URL=https://github.com/intel/xpumanager/releases/download/v2.0.0/libxpum2_2.0.0-238.24.04_amd64.deb
+ARG XPU_LIB_DEB_SHA256=3bf16ef35016e8818223ea05bf77101e99611c831239f513d09d51a98b97591b
+ARG XPU_SMI_DEB_URL=https://github.com/intel/xpumanager/releases/download/v2.0.0/xpu-smi_2.0.0-238.24.04_amd64.deb
+ARG XPU_SMI_DEB_SHA256=f2b64bcd514980e4b3d37b14783a600a414be815658608ba900e6f6d0e4683df
+
+# Tag of the level-zero source to build the null driver from. Must match the
+# loader version the base image ships (intel/oneapi-toolkit:2026.0.0 ships
+# loader 1.27.0). The build detects the image loader version and FAILS if this
+# pin disagrees, so a base-image bump cannot silently build a stale driver.
+# If set empty (ARG L0_TAG=), the build auto-detects the tag from the image's
+# libze_loader.so.1 soname instead of using this default.
+# Override: docker build --build-arg L0_TAG=v1.30.0
+ARG L0_TAG=v1.27.0
+
+# Labels for documentation
+LABEL maintainer="NVIDIA NIXL Team"
+LABEL description="Intel XPU (Level Zero) ZE test environment for NIXL development"
+LABEL version="1.0"
+
+# The base image ships with the oneAPI apt source configured, but oneAPI is
+# already installed. Remove it to avoid unnecessary network hits that can
+# cause apt-get update to fail when apt.repos.intel.com is unreachable.
+RUN rm -f /etc/apt/sources.list.d/*oneapi*.list \
+          /etc/apt/sources.list.d/*oneAPI*.list
+
+# Install build/runtime dependencies.
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        python3.12-dev \
+        python3-pip \
+        autoconf \
+        automake \
+        cmake \
+        git \
+        libtool \
+        m4 \
+        ninja-build \
+        libcjson-dev \
+        linux-libc-dev \
+        libaio-dev \
+        librdmacm-dev \
+        librdmacm1 \
+        ibverbs-utils \
+        libibverbs-dev \
+        libibverbs1 \
+        rdma-core \
+        numactl \
+        libgtest-dev && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 100 && \
+    python3 -m pip config set global.break-system-packages true && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install xpu-smi from the upstream .deb release.
+# Kept separate so a release URL change does not invalidate the apt cache layer.
+RUN wget -O /tmp/libxpum2.deb ${XPU_LIB_DEB_URL} && \
+    wget -O /tmp/xpu-smi.deb ${XPU_SMI_DEB_URL} && \
+    echo "${XPU_LIB_DEB_SHA256}  /tmp/libxpum2.deb" | sha256sum -c - && \
+    echo "${XPU_SMI_DEB_SHA256}  /tmp/xpu-smi.deb" | sha256sum -c - && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends /tmp/libxpum2.deb /tmp/xpu-smi.deb && \
+    rm -f /tmp/libxpum2.deb /tmp/xpu-smi.deb && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build the Level Zero null driver and install ONLY libze_null.so.*.
+#
+# The null driver is NOT shipped by any release/runtime package; it only
+# builds with BUILD_L0_LOADER_TESTS=1 + INSTALL_NULL_DRIVER=1. We build it
+# from the level-zero source tag that MATCHES the loader already present in
+# this image, then install only libze_null.so.* so the image's loader stays
+# authoritative. The match matters: the loader dlopens
+# "libze_null.so.<loader_version>", so a version-mismatched null driver would
+# not load.
+#
+# This mirrors the UCX ze-builder image; swap for the published UCX base
+# image (which bakes the null driver + deps) once it is available.
+RUN set -eux; \
+    # 1. Locate the versioned loader the image ships. Prefer the ldconfig
+    #    cache, then fall back to a filesystem search (oneAPI may install
+    #    outside the default linker path).
+    loader_real="$(ldconfig -p | awk '/libze_loader\.so\.1 /{print $NF; exit}')"; \
+    loader_real="$([ -n "${loader_real}" ] && readlink -f "${loader_real}" || true)"; \
+    case "${loader_real}" in \
+        *libze_loader.so.[0-9]*.[0-9]*.[0-9]*) ;; \
+        *) loader_real="$(find / -xdev -name 'libze_loader.so.[0-9]*.[0-9]*.[0-9]*' 2>/dev/null | head -n1)" ;; \
+    esac; \
+    test -n "${loader_real}" || { echo "ERROR: image has no versioned libze_loader.so"; exit 1; }; \
+    img_ver="$(printf '%s' "${loader_real}" | sed -nE 's/.*libze_loader\.so\.([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')"; \
+    echo "Image loader: ${loader_real} (version ${img_ver:-unknown})"; \
+    # 2. Pick the source tag: explicit ARG wins, else the detected vX.Y.Z.
+    tag="${L0_TAG:-${img_ver:+v${img_ver}}}"; \
+    test -n "${tag}" || { echo "ERROR: could not detect loader version; pass --build-arg L0_TAG=vX.Y.Z"; exit 1; }; \
+    # Drift guard: if an explicit L0_TAG was given AND we detected the image
+    # loader version, they must agree. The loader dlopens
+    # "libze_null.so.<loader_version>", so a stale pin would build a driver the
+    # loader silently ignores. Fail here (at build) instead of later at runtime.
+    if [ -n "${L0_TAG}" ] && [ -n "${img_ver}" ] && [ "${L0_TAG}" != "v${img_ver}" ]; then \
+        echo "ERROR: L0_TAG=${L0_TAG} does not match image loader v${img_ver}."; \
+        echo "       Bump L0_TAG to v${img_ver} (or pass --build-arg L0_TAG= to autodetect)."; \
+        exit 1; \
+    fi; \
+    echo "Building null driver from level-zero ${tag}"; \
+    # 3. Clone that exact tag (fail loudly if the tag does not exist upstream).
+    git clone --depth 1 --branch "${tag}" \
+        https://github.com/oneapi-src/level-zero.git /tmp/level-zero; \
+    # 4. Configure with the test/null-driver targets enabled.
+    cmake -S /tmp/level-zero -B /tmp/level-zero/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_L0_LOADER_TESTS=1 \
+        -DINSTALL_NULL_DRIVER=1; \
+    # 5. Build ONLY the null driver (we do NOT run `install` — that would
+    #    overwrite the image loader).
+    cmake --build /tmp/level-zero/build --target ze_null; \
+    # 6. Install just the null driver shared object + symlinks.
+    cp -P /tmp/level-zero/build/lib/libze_null.so* /usr/local/lib/; \
+    ldconfig; \
+    # 7. Hard build-time gate: the versioned null-driver soname must resolve.
+    ldconfig -p | grep -F 'libze_null.so.1'; \
+    # 8. Clean up source tree (driver already installed).
+    rm -rf /tmp/level-zero
+
+# Build and install UCX from pinned commit.
+# Source is removed in the same RUN to avoid bloating the image layer.
+RUN git clone ${UCX_REPO_URL} ${UCX_SRC_DIR} && \
+    cd ${UCX_SRC_DIR} && \
+    git checkout ${UCX_COMMIT} && \
+    ./autogen.sh && \
+    ./configure \
+        --prefix=${UCX_INSTALL_DIR} \
+        --with-ze=yes \
+        --enable-examples \
+        --enable-shared \
+        --disable-static \
+        --disable-doxygen-doc \
+        --enable-optimizations \
+        --enable-cma \
+        --enable-mt \
+        --with-verbs \
+        --with-rdmacm && \
+    make -j$(nproc) && \
+    make -j install-strip && \
+    ldconfig && \
+    rm -rf ${UCX_SRC_DIR}
+
+# Set working directory
+WORKDIR ${WORKSPACE}
+COPY . .
+
+# Build and install NIXL.
+# GDS backend is disabled because it is NVIDIA-specific.
+RUN set -eux; \
+    pip install --no-cache-dir meson ninja pybind11; \
+    meson setup build -Dinstall_headers=true -Ddisable_gds_backend=true; \
+    cd build; \
+    ninja; \
+    ninja install; \
+    test -f /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu/libnixl.so
+
+# Library and Python paths for NIXL.
+ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu"
+# PYTHONPATH is intentionally optional: preserve it if the selected base image defines it.
+ENV PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}/opt/nvidia/nvda_nixl/lib/python3/dist-packages"
+
+ENTRYPOINT ["/bin/bash", "-c", "exec \"$@\"", "--"]
+
+# Default command
+CMD ["/bin/bash"]
