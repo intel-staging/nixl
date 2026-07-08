@@ -1,0 +1,193 @@
+name: NIXL ZE GTest
+
+# This is a reusable workflow normally invoked by ze-ci.yml after the
+# ZE image has been built. Current CI runs on a single machine, so the
+# build and test jobs share the same host Docker daemon.
+#
+# When invoked manually via workflow_dispatch, the image must already
+# exist on that host. Either run the "NIXL ZE CI" workflow first, or
+# pass an explicit image_tag input pointing at an existing local image.
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        required: false
+        type: string
+      gtest_filter:
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Docker image tag to test (must already exist on the runner)
+        required: false
+        type: string
+      gtest_filter:
+        description: GTest filter override (default = UCX-on-ZE subset)
+        required: false
+        type: string
+
+jobs:
+  ze-gtest:
+    name: Run gtest in Dockerfile.ze-test container
+    runs-on: xpu-nixl-test
+    timeout-minutes: 180
+
+    permissions:
+      contents: read
+
+    env:
+      IMAGE_TAG: ${{ inputs.image_tag || format('nixl-ze-test:sha-{0}', github.sha) }}
+      CONTAINER_NAME: nixl-ze-gtest-${{ github.run_id }}-${{ github.run_attempt }}
+      BUILD_DIR: /tmp/nixl-build
+      # Filter to UCX-on-ZE specific test groups. Other gtest suites
+      # depend on hardware/transports not present in the ZE CI
+      # environment (CUDA, EFA, etc.). Override via workflow_dispatch
+      # input or by passing gtest_filter from a calling workflow.
+      # UCX backend test groups. These require a real ZE transport (Intel GPU);
+      # they are NOT run against the null driver — see the smoke step note below.
+      GTEST_FILTER: ${{ inputs.gtest_filter || 'UcxBackendParams.*:*/TestErrorHandling.*' }}
+
+    steps:
+      - name: Verify ZE image is available locally
+        shell: bash
+        run: docker image inspect "${IMAGE_TAG}" > /dev/null
+
+      - name: Start ZE container
+        shell: bash
+        run: |
+          # Mount the Intel GPU render nodes only when the host exposes them.
+          # docker run --device=/dev/dri fails outright if the node is absent,
+          # so on a no-GPU runner we omit it and fall back to the Level Zero
+          # null driver baked into the image (see the smoke step below).
+          gpu_args=()
+          if [ -e /dev/dri ]; then
+            gpu_args+=(--device=/dev/dri)
+          else
+            echo "No /dev/dri on host; using Level Zero null driver."
+          fi
+          docker run -itd \
+            --name "${CONTAINER_NAME}" \
+            --shm-size="32g" \
+            "${gpu_args[@]}" \
+            -w /workspace/nixl \
+            "${IMAGE_TAG}" \
+            bash
+
+      # Enumeration smoke ONLY: with a real Intel GPU, confirms UCX exposes the
+      # ZE memory domain + copy transport. Without a GPU, confirms the baked
+      # Level Zero null driver enumerates through the loader. The null driver is
+      # not a UCX ze_copy substitute: UCX currently rejects it because it lacks
+      # the PCI/sub-device shape UCX expects from real hardware.
+      - name: ZE enumeration smoke (ucx_info)
+        shell: bash
+        run: |
+          docker exec "${CONTAINER_NAME}" bash -lc '
+            set -eux
+            # Probe for a real Intel GPU first: query ZE without the null
+            # driver. If the ze_copy transport enumerates a device, real
+            # hardware is present and we use it as-is.
+            info="$(ucx_info -d 2>/dev/null || true)"
+            if echo "${info}" | grep -q "Transport: ze_copy"; then
+              echo "${info}"
+              echo "${info}" | grep -q "ze_cpy"
+              exit 0
+            fi
+
+            if [ -e /dev/dri ]; then
+              echo "${info}"
+              echo "ERROR: /dev/dri is present, but UCX did not enumerate ze_copy."
+              exit 1
+            fi
+
+            cat >/tmp/ze_null_probe.c <<"EOF"
+            #include <level_zero/ze_api.h>
+            #include <stdio.h>
+
+            int main(void) {
+              ze_result_t res = zeInit(0);
+              if (res != ZE_RESULT_SUCCESS) {
+                printf("zeInit failed: %d\n", res);
+                return 1;
+              }
+
+              uint32_t drivers = 0;
+              res = zeDriverGet(&drivers, NULL);
+              if (res != ZE_RESULT_SUCCESS || drivers == 0) {
+                printf("zeDriverGet count failed: res=%d count=%u\n", res, drivers);
+                return 2;
+              }
+
+              ze_driver_handle_t driver;
+              res = zeDriverGet(&drivers, &driver);
+              if (res != ZE_RESULT_SUCCESS) {
+                printf("zeDriverGet failed: %d\n", res);
+                return 3;
+              }
+
+              uint32_t devices = 0;
+              res = zeDeviceGet(driver, &devices, NULL);
+              if (res != ZE_RESULT_SUCCESS || devices == 0) {
+                printf("zeDeviceGet count failed: res=%d count=%u\n", res, devices);
+                return 4;
+              }
+
+              ze_device_handle_t device;
+              res = zeDeviceGet(driver, &devices, &device);
+              if (res != ZE_RESULT_SUCCESS) {
+                printf("zeDeviceGet failed: %d\n", res);
+                return 5;
+              }
+
+              ze_device_properties_t props = { .stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES };
+              res = zeDeviceGetProperties(device, &props);
+              if (res != ZE_RESULT_SUCCESS) {
+                printf("zeDeviceGetProperties failed: %d\n", res);
+                return 6;
+              }
+
+              printf("Level Zero null device: type=%u name=%s\n", props.type, props.name);
+              return 0;
+            }
+          EOF
+
+            gcc /tmp/ze_null_probe.c -lze_loader -o /tmp/ze_null_probe
+            ZE_ENABLE_NULL_DRIVER=1 ZE_ENABLE_LOADER_DEBUG_TRACE=1 /tmp/ze_null_probe
+          '
+
+      - name: Configure Meson build
+        shell: bash
+        run: |
+          docker exec -e BUILD_DIR="${BUILD_DIR}" "${CONTAINER_NAME}" bash -lc '
+            meson setup "${BUILD_DIR}" /workspace/nixl \
+              -Dinstall_headers=true \
+              -Ddisable_gds_backend=true \
+              --buildtype=debug \
+              -Denable_plugins=UCX \
+              -Dbuild_tests=true \
+              -Dbuild_examples=true
+          '
+
+      - name: Compile gtest target
+        shell: bash
+        run: |
+          docker exec -e BUILD_DIR="${BUILD_DIR}" "${CONTAINER_NAME}" bash -lc '
+            meson compile -C "${BUILD_DIR}" gtest
+          '
+
+      - name: Run gtest target
+        shell: bash
+        run: |
+          docker exec -e BUILD_DIR="${BUILD_DIR}" -e GTEST_FILTER="${GTEST_FILTER}" "${CONTAINER_NAME}" bash -lc '
+            meson test -C "${BUILD_DIR}" gtest \
+              --verbose \
+              --print-errorlogs \
+              --timeout-multiplier 10 \
+              --test-args="--gtest_filter=${GTEST_FILTER}"
+          '
+
+      - name: Remove ZE container
+        if: always()
+        shell: bash
+        run: docker rm -f "${CONTAINER_NAME}"

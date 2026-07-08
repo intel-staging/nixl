@@ -1,4 +1,4 @@
-name: NIXL XPU CI
+name: NIXL ZE CI
 
 on:
   pull_request:
@@ -11,13 +11,13 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build-xpu-dockerfile:
-    name: Build .ci/dockerfiles/Dockerfile.xpu
+  build-ze-dockerfile:
+    name: Build .ci/dockerfiles/Dockerfile.ze-test
     runs-on: xpu-nixl-build
     timeout-minutes: 120
 
     env:
-      IMAGE_TAG: nixl-xpu:sha-${{ github.sha }}
+      IMAGE_TAG: nixl-ze-test:sha-${{ github.sha }}
 
     permissions:
       contents: read
@@ -31,11 +31,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image from Dockerfile.xpu
+      - name: Build Docker image from Dockerfile.ze-test
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: .ci/dockerfiles/Dockerfile.xpu
+          file: .ci/dockerfiles/Dockerfile.ze-test
           load: true
           push: false
           tags: ${{ env.IMAGE_TAG }}
@@ -49,8 +49,8 @@ jobs:
         shell: bash
         run: docker image inspect "${IMAGE_TAG}" > /dev/null
 
-  xpu-gtest:
-    needs: build-xpu-dockerfile
-    uses: ./.github/workflows/xpu-gtest.yml
+  ze-gtest:
+    needs: build-ze-dockerfile
+    uses: ./.github/workflows/ze-gtest.yml
     with:
-      image_tag: nixl-xpu:sha-${{ github.sha }}
+      image_tag: nixl-ze-test:sha-${{ github.sha }}
