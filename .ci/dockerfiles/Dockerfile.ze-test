@@ -13,7 +13,7 @@
 #   docker build -f .ci/dockerfiles/Dockerfile.ze-test -t nixl-ze-test .
 #
 
-ARG BASE_IMAGE=intel/oneapi-toolkit:2026.0.0-devel-ubuntu24.04
+ARG BASE_IMAGE=intel/oneapi-toolkit:2026.1.0-devel-ubuntu24.04
 
 FROM ${BASE_IMAGE}
 
@@ -32,13 +32,13 @@ ARG XPU_SMI_DEB_URL=https://github.com/intel/xpumanager/releases/download/v2.0.0
 ARG XPU_SMI_DEB_SHA256=f2b64bcd514980e4b3d37b14783a600a414be815658608ba900e6f6d0e4683df
 
 # Tag of the level-zero source to build the null driver from. Must match the
-# loader version the base image ships (intel/oneapi-toolkit:2026.0.0 ships
-# loader 1.27.0). The build detects the image loader version and FAILS if this
+# loader version the base image ships (intel/oneapi-toolkit:2026.1.0 ships
+# loader 1.28.2). The build detects the image loader version and FAILS if this
 # pin disagrees, so a base-image bump cannot silently build a stale driver.
 # If set empty (ARG L0_TAG=), the build auto-detects the tag from the image's
 # libze_loader.so.1 soname instead of using this default.
 # Override: docker build --build-arg L0_TAG=v1.30.0
-ARG L0_TAG=v1.27.0
+ARG L0_TAG=v1.28.2
 
 # Labels for documentation
 LABEL maintainer="NVIDIA NIXL Team"
