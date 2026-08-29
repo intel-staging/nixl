@@ -37,55 +37,35 @@
 #include "libfabric/libfabric_common.h"
 #include "libfabric_connection.h"
 
-#ifdef HAVE_CUDA
-#include <cuda.h>
-#include <cuda_runtime.h>
-#endif
-
 // Forward declarations
 class nixlLibfabricEngine;
 class nixlLibfabricPostThreadPool;
 
-#ifdef HAVE_CUDA
-/** CUDA context management for libfabric backend */
-class nixlLibfabricCudaCtx {
-private:
-    CUcontext pthrCudaCtx_;
-    int myDevId_;
-
-public:
-    nixlLibfabricCudaCtx() {
-        pthrCudaCtx_ = NULL;
-        myDevId_ = -1;
-    }
-
-    /** Reset CUDA context pointer to initial state */
-    void
-    cudaResetCtxPtr();
-
-    /** Update CUDA context pointer for given memory address and device */
-    int
-    cudaUpdateCtxPtr(void *address, int expected_dev, bool &was_updated);
-
-    /** Set the current CUDA context */
-    int
-    cudaSetCtx();
-};
-#endif
 
 /** Private metadata for locally registered memory */
 class nixlLibfabricPrivateMetadata : public nixlBackendMD {
 private:
     void *buffer_; // Local memory buffer address
     size_t length_; // Buffer length in bytes
-    int device_id_; // Device ID for VRAM, -1 for DRAM
+    int device_id_; // nixl device index for VRAM, -1 for DRAM
+    /**
+     * What the HMEM shim said about this buffer when it was registered.
+     *
+     * Kept rather than re-derived so the post path can bind the right accelerator device without
+     * probing the pointer again -- and so it binds using libfabric's own device ordinal rather than
+     * @ref device_id_, which is a nixl index and only coincides with the runtime's numbering when
+     * the two happen to enumerate devices the same way.
+     */
+    struct nfi_hmem_info hmem_info_;
     std::vector<struct fid_mr *> rail_mr_list_; // Memory registrations, one per rail
     std::vector<uint64_t> rail_key_list_; // Remote access keys, one per rail
     std::vector<char *> src_ep_names_; // Source endpoint names, one per rail
     std::vector<size_t> selected_rails_; // Rails selected based on memory topology
 
 public:
-    nixlLibfabricPrivateMetadata() : nixlBackendMD(true), device_id_(-1) {}
+    nixlLibfabricPrivateMetadata() : nixlBackendMD(true), device_id_(-1), hmem_info_{} {
+        hmem_info_.iface = FI_HMEM_SYSTEM;
+    }
     friend class nixlLibfabricEngine;
 };
 
@@ -200,7 +180,9 @@ private:
     mutable std::mutex connection_state_mutex_;
 
 
-    // System runtime type (set during initialization from rail_manager_)
+    // Accelerator runtime to assume, from rail_manager_. Only labels a log line and supplies the
+    // last-resort fallback for an unattributable pointer; which runtime owns a given buffer is the
+    // HMEM shim's answer, per pointer.
     fi_hmem_iface runtime_;
 
     void
@@ -278,12 +260,6 @@ private:
                                 uint32_t &total_message_length,
                                 std::vector<BinaryNotification> &fragments_out) const;
 
-#ifdef HAVE_CUDA
-    // CUDA context management
-    std::unique_ptr<nixlLibfabricCudaCtx> cudaCtx_;
-    bool cuda_addr_wa_; // CUDA address workaround flag
-    mutable std::mutex cuda_ctx_mutex_; // Protects cudaCtx_ and cuda_addr_wa_.
-#endif
 
     void
     postShutdownCompletion();
@@ -350,23 +326,6 @@ private:
               int rail_id,
               const std::vector<int> &last_desc_idx_per_rail,
               std::vector<int> &posts_since_flush) const;
-
-#ifdef HAVE_CUDA
-    // CUDA context management methods
-    void
-    vramInitCtx();
-    int
-    vramUpdateCtx(void *address, uint64_t devId, bool &restart_reqd);
-    int
-    vramApplyCtx();
-    void
-    vramFiniCtx();
-
-    // same as vramApplyCtx, but with additional output parameter
-    nixl_status_t
-    vramApplyCtxEx(bool &use_cuda_addr_wa) const;
-    friend class nixlLibfaricCudaCtxEngineMediator;
-#endif
 
 public:
     /** Initialize multi-rail libfabric backend engine */

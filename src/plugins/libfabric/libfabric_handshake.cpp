@@ -71,7 +71,9 @@ nixlLibfabricEngine::sendHandshakeTo(const nixlLibfabricConnection &conn) const 
         return NIXL_ERR_BACKEND;
     }
 
-    constexpr size_t kRailId = 0;
+    // Departure rail chosen so the message arrives on the peer's rail 0, where the handshake
+    // callback lives; see nixlLibfabricConnection::control_rail_.
+    const size_t kRailId = conn.control_rail_;
     nixlLibfabricReq *req = rail_manager_.getRail(kRailId).allocateControlRequest(
         payload.size(), LibfabricUtils::getNextXferId());
     if (!req) {

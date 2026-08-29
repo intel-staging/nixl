@@ -194,26 +194,27 @@ private:
 
 nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
     : striping_threshold_(striping_threshold),
-      runtime_(FI_HMEM_CUDA) {
+      runtime_(FI_HMEM_SYSTEM) {
     NIXL_DEBUG << "Creating rail manager with striping threshold: " << striping_threshold_
                << " bytes";
 
     // Initialize topology system
     topology = std::make_unique<nixlLibfabricTopology>();
 
-    // Determine system runtime type once at initialization
-    if (topology->getNumNvidiaAccel() > 0) {
-        runtime_ = FI_HMEM_CUDA;
-        NIXL_INFO << "System runtime: CUDA for " << topology->getNumNvidiaAccel()
-                  << " NVIDIA GPU(s)";
-    } else if (topology->getNumAwsAccel() > 0) {
-        runtime_ = FI_HMEM_NEURON;
-        NIXL_INFO << "System runtime: NEURON for " << topology->getNumAwsAccel()
-                  << " AWS Trainium device(s)";
-    } else {
-        runtime_ = FI_HMEM_SYSTEM;
-        NIXL_INFO << "System runtime: SYSTEM (no accelerators)";
-    }
+    /*
+     * Which runtime to name in logs and to fall back to when a VRAM pointer cannot be attributed.
+     * Not a claim that this host has exactly one accelerator vendor: detectHmemIface() decides per
+     * pointer, and getSupportedMems() asks hmemAnyIfaceAvailable().
+     *
+     * Asks the vendor SDKs rather than the topology's accelerator counts, because those counts are
+     * only populated for the providers that do proximity-based rail selection -- see
+     * discoverTopology(), which zeroes them for tcp and sockets. The SDK answer is
+     * provider-independent, which is what enablement needs to be.
+     */
+    runtime_ = nfi_hmem_primary_iface();
+    NIXL_INFO << "System runtime: " << nfi_hmem_iface_name(runtime_)
+              << (runtime_ == FI_HMEM_SYSTEM ? " (no accelerator runtime available)" : "")
+              << ", accelerators found by hwloc: " << topology->accelCountsString();
 
     // Get network devices from topology and create rails automatically
     std::vector<std::string> all_devices = topology->getAllDevices();
@@ -330,9 +331,9 @@ nixlLibfabricRailManager::init(const nixl_b_params_t &custom_params) {
 }
 
 nixl_status_t
-nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_devices,
+nixlLibfabricRailManager::createRails(const std::vector<std::string> &nic_devices,
                                       const std::string &provider_name) {
-    num_rails_ = efa_devices.size();
+    num_rails_ = nic_devices.size();
     if (num_rails_ == 0) {
         NIXL_ERROR << "No network devices discovered; cannot create rails";
         return NIXL_ERR_BACKEND;
@@ -341,8 +342,8 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
     rails_.reserve(num_rails_);
 
     // Build EFA device to rail index mapping for O(1) lookup
-    efa_device_to_rail_map.clear();
-    efa_device_to_rail_map.reserve(num_rails_);
+    nic_device_to_rail_map.clear();
+    nic_device_to_rail_map.reserve(num_rails_);
     clearActiveRails();
 
     try {
@@ -351,12 +352,12 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
 
         for (size_t i = 0; i < num_rails_; ++i) {
             rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i)));
+                nic_devices[i], provider_name, static_cast<uint16_t>(i)));
 
             // Initialize EFA device mapping
-            efa_device_to_rail_map[efa_devices[i]] = i;
+            nic_device_to_rail_map[nic_devices[i]] = i;
 
-            NIXL_DEBUG << "Created rail " << i << " (device=" << efa_devices[i]
+            NIXL_DEBUG << "Created rail " << i << " (device=" << nic_devices[i]
                        << ", provider=" << provider_name << ")";
         }
     }
@@ -383,6 +384,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     const std::vector<struct fid_mr *> &local_mrs,
     const std::vector<uint64_t> &remote_keys,
     const std::vector<size_t> &remote_selected_endpoints,
+    const std::vector<size_t> &peer_rail_for_local_rail,
     const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
     uint16_t agent_idx,
     uint16_t xfer_id,
@@ -391,8 +393,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     int desc_idx,
     size_t base_offset,
     bool apply_fi_more,
-    int device_id,
-    bool is_cuda_vram) {
+    const struct nfi_hmem_info &hmem_info) {
     // Initialize output parameter
     submitted_count_out = 0;
 
@@ -400,6 +401,29 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
         NIXL_ERROR << "No rails selected for transfer";
         return NIXL_ERR_INVALID_PARAM;
     }
+
+    /*
+     * Which peer rail this local rail should post to. Prefers the fabric-matched peer rail, so a
+     * transfer never posts to a NIC on a segment this rail cannot reach. Falls back to the old
+     * position-based choice when there is no match -- either the provider's addresses are
+     * unreadable, or the peer genuinely has nothing on this rail's fabric, and a possibly
+     * unreachable address is still better than dropping the transfer.
+     *
+     * The fabric-matched rail also has to have registered the buffer; remote_selected_endpoints is
+     * the set that did, so a match outside it is unusable.
+     */
+    const auto pick_remote_ep = [&](size_t rail_id, size_t fallback_rr_idx) -> size_t {
+        if (rail_id < peer_rail_for_local_rail.size()) {
+            const size_t peer = peer_rail_for_local_rail[rail_id];
+            if (peer != NIXL_LF_NO_PEER_RAIL &&
+                std::find(remote_selected_endpoints.begin(),
+                          remote_selected_endpoints.end(),
+                          peer) != remote_selected_endpoints.end()) {
+                return peer;
+            }
+        }
+        return remote_selected_endpoints[fallback_rr_idx % remote_selected_endpoints.size()];
+    };
 
     // Determine striping strategy
     bool use_striping = usesStriping(transfer_size, selected_rails.size());
@@ -413,10 +437,10 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
         const size_t rail_sel_idx =
             railSelectionIndex(base_offset, desc_idx, batch_write, selected_rails.size());
         const size_t rail_id = selected_rails[rail_sel_idx];
-        // The remote endpoint round-robins over its own count, which can differ from the
-        // local rail count.
-        const size_t remote_ep_id = remote_selected_endpoints[railSelectionIndex(
-            base_offset, desc_idx, batch_write, remote_selected_endpoints.size())];
+        const size_t remote_ep_id = pick_remote_ep(
+            rail_id,
+            railSelectionIndex(
+                base_offset, desc_idx, batch_write, remote_selected_endpoints.size()));
         const uint64_t fi_flags = (batch_write && apply_fi_more) ? FI_MORE : 0;
         NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id " << remote_ep_id;
         // Allocate request
@@ -454,8 +478,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                  xfer_id,
                                  fi_flags,
                                  dest_addrs.at(rail_id)[remote_ep_id],
-                                 device_id,
-                                 is_cuda_vram,
+                                 hmem_info,
                                  rail_id,
                                  req);
             status = NIXL_SUCCESS;
@@ -506,8 +529,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
         size_t remainder = transfer_size % num_rails;
         for (size_t i = 0; i < num_rails; ++i) {
             const size_t rail_id = selected_rails[i];
-            const size_t remote_ep_id =
-                remote_selected_endpoints[i % remote_selected_endpoints.size()];
+            const size_t remote_ep_id = pick_remote_ep(rail_id, i);
             NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id=" << remote_ep_id;
             size_t current_chunk_size = chunk_size + (i == num_rails - 1 ? remainder : 0);
             if (current_chunk_size == 0) {
@@ -551,8 +573,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                      xfer_id,
                                      fi_flags,
                                      dest_addrs.at(rail_id)[remote_ep_id],
-                                     device_id,
-                                     is_cuda_vram,
+                                     hmem_info,
                                      rail_id,
                                      req);
                 status = NIXL_SUCCESS;
@@ -606,8 +627,7 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
                                                uint16_t xfer_id,
                                                uint64_t fi_flags,
                                                fi_addr_t dest_addr,
-                                               int device_id,
-                                               bool is_cuda_vram,
+                                               const struct nfi_hmem_info &hmem_info,
                                                size_t rail_id,
                                                nixlLibfabricReq *req) {
     uint8_t seq_id = (op_type == nixlLibfabricReq::WRITE) ? LibfabricUtils::getNextSeqId() : 0;
@@ -626,8 +646,7 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
     pr.remote_key = req->remote_key;
     pr.req = req;
     pr.fi_flags = fi_flags;
-    pr.device_id = device_id;
-    pr.is_cuda_vram = is_cuda_vram;
+    pr.hmem_info = hmem_info;
     rails_[rail_id]->enqueuePost(pr);
 }
 
@@ -744,35 +763,34 @@ nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr,
         }
 
         // Get EFA devices for this PCI bus ID
-        std::vector<std::string> device_efa_devices =
-            topology->getEfaDevicesForPci(device_pci_bus_id);
-        if (device_efa_devices.empty()) {
+        std::vector<std::string> device_nics = topology->getNicsForPci(device_pci_bus_id);
+        if (device_nics.empty()) {
             NIXL_ERROR << "No EFA devices found for PCI " << device_pci_bus_id;
             return {}; // Return empty vector to indicate failure
         }
         std::vector<size_t> device_rails;
-        for (const std::string &efa_device : device_efa_devices) {
-            auto it = efa_device_to_rail_map.find(efa_device);
-            if (it != efa_device_to_rail_map.end()) {
+        for (const std::string &nic_device : device_nics) {
+            auto it = nic_device_to_rail_map.find(nic_device);
+            if (it != nic_device_to_rail_map.end()) {
                 // Bounds check: ensure rail index is valid
                 if (it->second < rails_.size()) {
                     device_rails.push_back(it->second);
                     NIXL_DEBUG << "VRAM memory " << mem_addr << " on device PCI "
                                << device_pci_bus_id << " mapped to rail " << it->second
-                               << " (EFA device=" << efa_device << ")";
+                               << " (EFA device=" << nic_device << ")";
                 } else {
-                    NIXL_WARN << "EFA device " << efa_device << " maps to rail " << it->second
+                    NIXL_WARN << "EFA device " << nic_device << " maps to rail " << it->second
                               << " but only " << rails_.size() << " rails available";
                 }
             } else {
-                NIXL_WARN << "EFA device " << efa_device
+                NIXL_WARN << "EFA device " << nic_device
                           << " not found in rail mapping for device PCI " << device_pci_bus_id;
             }
         }
 
         if (device_rails.empty()) {
             NIXL_ERROR << "No valid rail mapping found for device PCI " << device_pci_bus_id
-                       << " (checked " << device_efa_devices.size() << " EFA devices)";
+                       << " (checked " << device_nics.size() << " EFA devices)";
             return {};
         }
 
@@ -806,7 +824,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
                                          size_t length,
                                          nixl_mem_t mem_type,
                                          int device_id,
-                                         const std::string &device_pci_bus_id,
+                                         const struct nfi_hmem_info &hmem_info,
                                          std::vector<struct fid_mr *> &mr_list_out,
                                          std::vector<uint64_t> &key_list_out,
                                          std::vector<size_t> &selected_rails_out) {
@@ -819,15 +837,47 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
     // For VRAM: uses PCI bus ID provided by backend to map to topology-aware rails
     // For DRAM: uses all available rails
     std::vector<size_t> selected_rails =
-        selectRailsForMemory(buffer, mem_type, device_id, device_pci_bus_id);
+        selectRailsForMemory(buffer, mem_type, device_id, accelBusIdString(hmem_info));
     if (selected_rails.empty()) {
         NIXL_ERROR << "No rails selected for memory type " << mem_type;
         return NIXL_ERR_NOT_SUPPORTED;
     }
+    // Ascending rail id, to match the peer: derive_remote_selected_endpoints() builds its list by
+    // scanning the rail-indexed key list upwards, and postSingleTransfer() pairs the two lists by
+    // position. A local list in policy order -- PCIe proximity for VRAM, NUMA distance for DRAM --
+    // would post on one rail using another rail's rkey and dest address, which on a provider whose
+    // ports are separate fabrics is an unreachable address rather than an error: the write then
+    // retries EAGAIN forever. Only the order is dropped here, not the selection itself, so rail
+    // affinity is preserved.
+    std::sort(selected_rails.begin(), selected_rails.end());
 
-    enum fi_hmem_iface iface = FI_HMEM_SYSTEM;
-    if (mem_type == VRAM_SEG) {
-        iface = topology->getMrAttrIface(device_id);
+    /*
+     * What to declare to fi_mr_regattr(). Normally exactly what the shim reported; the one
+     * adjustment is for a VRAM_SEG buffer no runtime claimed.
+     */
+    struct nfi_hmem_info effective_info = hmem_info;
+    if (mem_type != VRAM_SEG) {
+        effective_info = nfi_hmem_info{};
+        effective_info.iface = FI_HMEM_SYSTEM;
+    } else if (effective_info.iface == FI_HMEM_SYSTEM) {
+        /*
+         * The caller registered this as device memory but no accelerator runtime claimed the
+         * pointer. Registering it as host memory would be wrong for a provider that needs the iface,
+         * so guess the host's primary runtime and take nixl's device index as the hmem ordinal --
+         * what this code did for every VRAM_SEG before per-pointer detection existed.
+         *
+         * A guess on both counts: nixl's public API gives VRAM_SEG no vendor, and mem.devId is a
+         * nixl device index, which only coincides with an hmem ordinal when the runtime enumerates
+         * devices the same way nixl does. It happens to be a valid encoding for every
+         * fi_mr_attr::device arm in use -- CUDA and Neuron take a plain ordinal, and
+         * fi_hmem_ze_device(0, n) == n -- but a vendor whose encoding is not the identity would need
+         * this to go through the shim.
+         */
+        effective_info.iface = runtime_;
+        effective_info.device = static_cast<uint64_t>(device_id);
+        NIXL_WARN << "No accelerator runtime claimed VRAM buffer " << buffer
+                  << ", falling back to iface " << nfi_hmem_iface_name(effective_info.iface)
+                  << " with device id " << device_id;
     }
 
     // Resize output vectors to match all rails
@@ -857,9 +907,8 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
 
         struct fid_mr *mr;
         uint64_t key;
-        // Pass device_id parameter to individual rail's registerMemory calls
         nixl_status_t status =
-            rails_[rail_idx]->registerMemory(buffer, length, mem_type, device_id, iface, &mr, &key);
+            rails_[rail_idx]->registerMemory(buffer, length, mem_type, effective_info, &mr, &key);
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "Failed to register memory on rail " << rail_idx;
             // Cleanup already registered MRs
@@ -924,6 +973,91 @@ nixlLibfabricRailManager::deregisterMemory(const std::vector<size_t> &selected_r
     NIXL_INFO << "Deregistered memory from " << selected_rails.size() << " rails";
 
     return overall_status;
+}
+
+std::vector<size_t>
+nixlLibfabricRailManager::computeRailPeering(
+    const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints) const {
+    std::vector<size_t> peering;
+
+    /*
+     * Read the peer's fabric identity out of the endpoint names it already sent. Only the local side
+     * of each comparison carries a netmask -- see LibfabricUtils::sameFabric -- so the peer ids are
+     * left with mask 0 on purpose.
+     */
+    std::vector<LibfabricUtils::nixlLibfabricFabricId> peer_ids;
+    peer_ids.reserve(endpoints.size());
+    bool any_peer_valid = false;
+    for (const auto &ep : endpoints) {
+        // Every rail of a given agent uses one provider, so rail 0's address format describes them
+        // all; the peer sends no format of its own.
+        const uint32_t fmt = rails_.empty() ? FI_FORMAT_UNSPEC : rails_[0]->addr_format;
+        peer_ids.push_back(LibfabricUtils::fabricIdFromEpName(fmt, ep.data(), ep.size()));
+        any_peer_valid = any_peer_valid || peer_ids.back().valid;
+    }
+
+    bool any_local_valid = false;
+    for (const auto &rail : rails_) {
+        any_local_valid = any_local_valid || rail->fabric_id.valid;
+    }
+
+    if (!any_local_valid || !any_peer_valid) {
+        NIXL_DEBUG << "No readable fabric identities, pairing rails by index as before";
+        return peering;
+    }
+
+    /*
+     * Greedy one-to-one assignment. One-to-one matters: two local rails pointed at the same peer
+     * rail would put both halves of a striped transfer on one peer NIC and waste the other, so a
+     * peer rail already taken is skipped even if it also matches.
+     */
+    peering.assign(rails_.size(), NIXL_LF_NO_PEER_RAIL);
+    std::vector<bool> peer_taken(endpoints.size(), false);
+
+    for (size_t rail_id = 0; rail_id < rails_.size(); ++rail_id) {
+        const auto &local_id = rails_[rail_id]->fabric_id;
+        for (size_t peer = 0; peer < peer_ids.size(); ++peer) {
+            if (peer_taken[peer] || !LibfabricUtils::sameFabric(local_id, peer_ids[peer])) {
+                continue;
+            }
+            peering[rail_id] = peer;
+            peer_taken[peer] = true;
+            break;
+        }
+    }
+
+    size_t matched = 0;
+    for (size_t rail_id = 0; rail_id < peering.size(); ++rail_id) {
+        if (peering[rail_id] == NIXL_LF_NO_PEER_RAIL) {
+            NIXL_WARN << "Rail " << rail_id << " (" << rails_[rail_id]->device_name
+                      << ") found no peer rail on its fabric; falling back to index order for it,"
+                         " which may be unreachable";
+            continue;
+        }
+        matched++;
+        NIXL_DEBUG << "Rail " << rail_id << " (" << rails_[rail_id]->device_name
+                   << ") paired with peer rail " << peering[rail_id];
+    }
+
+    // Worth INFO rather than DEBUG when it is not the identity permutation: that is precisely the
+    // case index pairing used to get wrong, and it is otherwise invisible.
+    bool is_identity = (peering.size() == endpoints.size());
+    for (size_t i = 0; is_identity && i < peering.size(); ++i) {
+        is_identity = (peering[i] == i);
+    }
+    if (!is_identity) {
+        std::string map_str;
+        for (size_t i = 0; i < peering.size(); ++i) {
+            map_str += std::to_string(i) + "->" +
+                (peering[i] == NIXL_LF_NO_PEER_RAIL ? std::string("none") :
+                                                      std::to_string(peering[i])) +
+                " ";
+        }
+        NIXL_INFO << "Rail pairing differs from index order (" << matched << "/" << rails_.size()
+                  << " matched by fabric): " << map_str;
+    }
+
+    return peering;
 }
 
 nixl_status_t
@@ -999,7 +1133,6 @@ nixlLibfabricRailManager::postControlMessage(
     fi_addr_t dest_addr,
     uint16_t agent_idx,
     std::function<void(nixl_status_t)> completion_callback) {
-    // Validation - use rail 0 for notifications
     if (rails_.empty()) {
         NIXL_ERROR << "No rails available";
         return NIXL_ERR_INVALID_PARAM;
@@ -1022,7 +1155,22 @@ nixlLibfabricRailManager::postControlMessage(
         NIXL_ERROR << "Unknown message type";
         return NIXL_ERR_INVALID_PARAM;
     }
-    size_t rail_id = 0; // Use rail 0 for notifications
+    /*
+     * The rail the caller allocated this request from, not a hardcoded 0. Control messages have to
+     * *arrive* on the peer's rail 0, where the notification and handshake callbacks live, but the
+     * local rail they leave from must be one that can reach it -- see
+     * nixlLibfabricConnection::control_rail_. Sending from rail 0 regardless meant that on a host
+     * pair whose rails are cabled across, the handshake went to a NIC on another segment and
+     * retried -FI_EAGAIN forever.
+     *
+     * Taking it from the request keeps this honest: the buffer and its MR belong to that rail, so
+     * posting it on a different one was never correct anyway.
+     */
+    const size_t rail_id = req->rail_id;
+    if (rail_id >= rails_.size()) {
+        NIXL_ERROR << "Control request carries out-of-range rail id " << rail_id;
+        return NIXL_ERR_INVALID_PARAM;
+    }
     uint32_t xfer_id = req->xfer_id;
     // For control messages, use SEQ_ID 0 since they don't need sequence tracking
     // TODO: Add sequencing for connection establishment workflow.
@@ -1037,7 +1185,6 @@ nixlLibfabricRailManager::postControlMessage(
     NIXL_DEBUG << "Sending control message type " << msg_type_value << " agent_idx=" << agent_idx
                << " XFER_ID=" << xfer_id << " imm_data=" << imm_data << " on rail " << rail_id;
 
-    // Use rail 0 for notifications
     nixl_status_t status = rails_[rail_id]->postSend(imm_data, dest_addr, req);
 
     if (status != NIXL_SUCCESS) {
@@ -1054,8 +1201,15 @@ nixl_status_t
 nixlLibfabricRailManager::progressActiveRails() {
     std::unordered_set<size_t> rails_to_process;
 
-    // Copy active rails under lock to avoid iterator invalidation
-    {
+    // A provider that connects lazily needs the passive side to poll a rail for the peer's
+    // connection to be accepted, and a rail this agent has not posted on is never active here.
+    // Progressing only rail 0 plus the active rails would deadlock the peer on any higher rail.
+    if (LibfabricUtils::providerNeedsAllRailProgress(topology->getProviderName())) {
+        for (size_t rail_id = 0; rail_id < rails_.size(); ++rail_id) {
+            rails_to_process.insert(rail_id);
+        }
+    } else {
+        // Copy active rails under lock to avoid iterator invalidation
         std::lock_guard<std::mutex> lock(active_rails_mutex_);
         // Always progress rail 0 for notifications (SEND/RECV)
         rails_to_process.insert(0);

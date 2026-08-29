@@ -26,11 +26,10 @@
 #include <mutex>
 #include <atomic>
 #include "libfabric_rail.h"
+#include "libfabric_accel.h"
 
-#ifdef HAVE_CUDA
-#include <cuda.h>
-#include <cuda_runtime.h>
-#endif
+/** @brief No peer rail shares this local rail's fabric; fall back to index order. */
+static constexpr size_t NIXL_LF_NO_PEER_RAIL = static_cast<size_t>(-1);
 
 // Forward declarations
 class nixlLibfabricTopology;
@@ -105,13 +104,13 @@ public:
     init(const nixl_b_params_t &custom_params);
 
     // Rail management
-    /** Create rails for high-bandwidth transfers (one per EFA device)
-     * @param efa_devices List of EFA device names to create rails on
-     * @param provider_name Provider name ("efa" or "efa-direct")
+    /** Create rails for high-bandwidth transfers (one per device)
+     * @param nic_devices List of libfabric domain names to create rails on
+     * @param provider_name Core provider name, e.g. "efa", "efa-direct", "cxi", "verbs", "tcp"
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
-    createRails(const std::vector<std::string> &efa_devices, const std::string &provider_name);
+    createRails(const std::vector<std::string> &nic_devices, const std::string &provider_name);
 
     // Access rails
     /** Get reference to rail by ID */
@@ -149,8 +148,10 @@ public:
      * @param length Buffer size in bytes
      * @param mem_type Memory type (DRAM_SEG or VRAM_SEG)
      * @param device_id Device ID (used for VRAM_SEG, ignored for DRAM_SEG)
-     * @param device_pci_bus_id PCI bus ID for VRAM device (queried in backend layer), empty for
-     * DRAM
+     * @param hmem_info What the backend's single detectHmemIface() call learned about @p buffer:
+     * the HMEM interface, the libfabric device ordinal and the PCI bus ID used for rail
+     * selection. Passed down rather than re-derived here so there is exactly one probe per
+     * registration and no way for two layers to disagree about a pointer.
      * @param mr_list_out Memory registration handles, indexed by rail ID
      * @param key_list_out Remote access keys, indexed by rail ID
      * @param selected_rails_out List of rail IDs where memory was registered
@@ -161,7 +162,7 @@ public:
                    size_t length,
                    nixl_mem_t mem_type,
                    int device_id,
-                   const std::string &device_pci_bus_id,
+                   const struct nfi_hmem_info &hmem_info,
                    std::vector<struct fid_mr *> &mr_list_out,
                    std::vector<uint64_t> &key_list_out,
                    std::vector<size_t> &selected_rails_out);
@@ -182,6 +183,16 @@ public:
      * @param ep_names_out Local endpoint names for reference
      * @return NIXL_SUCCESS on success, error code on failure
      */
+    /**
+     * @brief Pairs each local rail with the peer rail on its own fabric segment.
+     *
+     * @param endpoints The peer's rail endpoint names, in the peer's rail order.
+     * @return One entry per local rail: an index into @p endpoints, or @ref NIXL_LF_NO_PEER_RAIL.
+     *         Empty if no local rail has a readable fabric identity, which leaves pairing as it was.
+     */
+    std::vector<size_t>
+    computeRailPeering(const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints) const;
+
     nixl_status_t
     insertAllAddresses(const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,
                        std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs_out,
@@ -214,8 +225,9 @@ public:
      *        (posted with FI_MORE); false flushes the rail's batch. The caller passes false for
      *        a rail's last post and when a batch reaches NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE.
      *        Defaults to false so an unmarked descriptor flushes safely.
-     * @param device_id Device id when multi-GPU is enabled.
-     * @param is_cuda_device Specifies whether this is CUDA-VRAM transfer.
+     * @param hmem_info What the HMEM shim said about the local buffer at registration. Carried so a
+     *        deferred post can bind the progress thread to the owning accelerator device; ignored
+     *        for host memory and for runtimes with no thread-current state.
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
@@ -228,6 +240,7 @@ public:
                              const std::vector<struct fid_mr *> &local_mrs,
                              const std::vector<uint64_t> &remote_keys,
                              const std::vector<size_t> &remote_selected_endpoints,
+                             const std::vector<size_t> &peer_rail_for_local_rail,
                              const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
                              uint16_t agent_idx,
                              uint16_t xfer_id,
@@ -236,8 +249,7 @@ public:
                              int desc_idx,
                              size_t base_offset,
                              bool apply_fi_more = false,
-                             int device_id = -1,
-                             bool is_cuda_vram = false);
+                             const struct nfi_hmem_info &hmem_info = nfi_hmem_info{});
 
     void
     deferTransferRequest(nixlLibfabricReq::OpType op_type,
@@ -245,8 +257,7 @@ public:
                          uint16_t xfer_id,
                          uint64_t fi_flags,
                          fi_addr_t dest_addr,
-                         int device_id,
-                         bool is_cuda_vram,
+                         const struct nfi_hmem_info &hmem_info,
                          size_t rail_id,
                          nixlLibfabricReq *req);
 
@@ -375,8 +386,10 @@ public:
         return dram_rail_selection_policy_;
     }
 
-    /** Get the system's runtime type.
-     * @return fi_hmem_iface runtime type (CUDA, NEURON, or SYSTEM)
+    /** Get the accelerator runtime to assume when a pointer cannot be attributed.
+     * @return The iface @ref hmemPrimaryIface picked, or FI_HMEM_SYSTEM if no runtime is usable.
+     * @note Not a claim that the host has only one vendor. Per-pointer answers come from
+     *       @ref detectHmemIface.
      */
     fi_hmem_iface
     getRuntime() const;
@@ -384,7 +397,7 @@ public:
 private:
     size_t striping_threshold_;
 
-    // System runtime type (determined once at initialization)
+    // Accelerator runtime to assume for unattributed pointers (determined once at initialization)
     fi_hmem_iface runtime_;
 
     // Rail allocation
@@ -394,8 +407,8 @@ private:
 
     std::unique_ptr<nixlLibfabricTopology> topology;
 
-    // EFA device to rail mapping
-    std::unordered_map<std::string, size_t> efa_device_to_rail_map;
+    // NIC domain name to rail mapping
+    std::unordered_map<std::string, size_t> nic_device_to_rail_map;
 
     // active rails with reference counting (always positive)
     std::unordered_map<size_t, size_t> active_rails_;

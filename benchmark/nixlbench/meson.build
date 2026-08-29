@@ -188,8 +188,16 @@ if cuda_fabric_available
     add_project_arguments('-DHAVE_CUDA_FABRIC', language: 'cpp')
 endif
 
-if not cuda_available and not rocm_available
-    warning('Neither CUDA nor ROCm found. VRAM support will be disabled.')
+# Level Zero (Intel Xe / XPU) VRAM support. Headers only: libze_loader is dlopen'd at runtime, the
+# same way src/utils/neuron.cpp loads libnrt and nixl's libfabric plugin loads Level Zero, so a
+# binary built with this enabled still runs on a host without the loader.
+ze_available = cpp.has_header('level_zero/ze_api.h')
+if ze_available
+    add_project_arguments('-DHAVE_ZE=1', language: 'cpp')
+endif
+
+if not cuda_available and not rocm_available and not ze_available
+    warning('Neither CUDA, ROCm nor Level Zero found. VRAM support will be disabled.')
 endif
 
 ucx_device_cuda_args = []
@@ -308,6 +316,7 @@ summary(
     {
         'UCX GPU Device API': ucx_gpu_device_api_available,
         'nvcc available': nvcc_prog.found(),
+        'Level Zero (Intel Xe) VRAM': ze_available,
         'DOCA GPUNETIO found': doca_gpunetio_dep.found(),
     },
     section: 'Optional features',
@@ -327,6 +336,7 @@ configure_file(
         'HAVE_NVSHMEM': nvshmem_available ? '1' : '0',
         'HAVE_CUDA': cuda_available ? '1' : '0',
         'HAVE_ROCM': rocm_available ? '1' : '0',
+        'HAVE_ZE': ze_available ? '1' : '0',
         'HAVE_CUDA_FABRIC': cuda_fabric_available ? '1' : '0',
     },
     install: true,

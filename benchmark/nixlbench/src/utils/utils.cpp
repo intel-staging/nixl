@@ -33,6 +33,7 @@
 
 #include "runtime/etcd/etcd_rt.h"
 #include "utils/neuron.h"
+#include "utils/ze.h"
 #include "utils/utils.h"
 
 // Define command line parameters
@@ -1002,6 +1003,19 @@ copyVramToHost(void *host_addr, const void *device_addr, size_t len) {
             "nrt_tensor_read failed");
         return;
     }
+#if HAVE_ZE
+    /*
+     * Before the CUDA branch: HAVE_CUDA is defined whenever the CUDA *headers* are present, so on a
+     * host with an Intel GPU and no NVIDIA driver this used to reach cudaMemcpy and die against the
+     * stub library ("CUDA driver is a stub library"). That made --check_consistency unusable for
+     * VRAM on exactly the hardware the Level Zero path exists for.
+     */
+    if (zeAccelDeviceCount() > 0) {
+        CHECK_ZE_ERROR(zeAccelMemcpyDtoH(host_addr, device_addr, len),
+                       "Failed to copy Level Zero device memory to host");
+        return;
+    }
+#endif
 #if HAVE_CUDA
     CHECK_CUDA_ERROR(cudaMemcpy(host_addr, (void *)device_addr, len, cudaMemcpyDeviceToHost),
                      "cudaMemcpy failed");
@@ -1009,7 +1023,7 @@ copyVramToHost(void *host_addr, const void *device_addr, size_t len) {
     CHECK_CUDA_ERROR(hipMemcpy(host_addr, (void *)device_addr, len, hipMemcpyDeviceToHost),
                      "hipMemcpy failed");
 #else
-    std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
+    std::cerr << "VRAM not supported without CUDA, ROCm, Neuron or Level Zero" << std::endl;
     exit(EXIT_FAILURE);
 #endif
 }

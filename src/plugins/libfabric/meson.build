@@ -34,6 +34,12 @@ if cuda_dep.found()
     compile_flags += ['-DHAVE_CUDA']
 endif
 
+# Add Level Zero (Intel Xe / XPU) support if available. Headers only: libze_loader is dlopen'd
+# by the utils layer, so nothing is added to libfabric_plugin_deps.
+if have_ze
+    compile_flags += ['-DHAVE_ZE']
+endif
+
 # Build as static or shared library based on configuration
 if 'LIBFABRIC' in static_plugins
     libfabric_backend_lib = static_library(

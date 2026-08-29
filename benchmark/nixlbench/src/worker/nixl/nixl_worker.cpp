@@ -31,6 +31,7 @@
 #include "utils/neuron.h"
 #include "utils/scope_guard.h"
 #include "utils/utils.h"
+#include "utils/ze.h"
 #include <unistd.h>
 #include <utility>
 #include <sys/time.h>
@@ -45,15 +46,42 @@
 #define MAP_HUGE_2MB (21 << 26) // 2MB hugepage size encoding
 #endif
 
+/* True when Level Zero (Intel Xe / XPU) should supply VRAM.
+ *
+ * CUDA and ROCm keep precedence whenever they have a usable device, because a host with an NVIDIA or
+ * AMD accelerator very often also exposes an Intel integrated GPU to Level Zero, and benchmarking
+ * that instead of the discrete accelerator would silently measure the wrong hardware. The check is
+ * for a device rather than for compile-time support, so a binary built with CUDA enabled still
+ * reaches Xe VRAM when it runs somewhere CUDA has no device -- against a stub libcudart, or simply
+ * on an Intel-GPU host. */
+static bool
+useZeVram() {
+    if (zeAccelDeviceCount() <= 0) {
+        return false;
+    }
+#if HAVE_CUDA
+    int cuda_devices = 0;
+    if (cudaGetDeviceCount(&cuda_devices) == cudaSuccess && cuda_devices > 0) {
+        return false;
+    }
+#elif HAVE_ROCM
+    int rocm_devices = 0;
+    if (hipGetDeviceCount(&rocm_devices) == hipSuccess && rocm_devices > 0) {
+        return false;
+    }
+#endif
+    return true;
+}
+
 static nixl_mem_t
 resolveVramSegment() {
+    if (neuronCoreCount() > 0 || useZeVram()) return VRAM_SEG;
 #if HAVE_CUDA
     return VRAM_SEG;
 #elif HAVE_ROCM
     return VRAM_SEG;
 #else
-    if (neuronCoreCount() > 0) return VRAM_SEG;
-    std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
+    std::cerr << "VRAM not supported without CUDA, ROCm, Neuron or Level Zero" << std::endl;
     std::exit(EXIT_FAILURE);
 #endif
 }
@@ -572,6 +600,22 @@ cleanupVramNeuron(xferBenchIOV &iov) {
     CHECK_NEURON_ERROR(neuronFree((void *)iov.addr), "Failed to free nrt tensor");
 }
 
+static std::optional<xferBenchIOV>
+getVramDescZe(int devid, size_t buffer_size, uint8_t memset_value) {
+    void *addr;
+    CHECK_ZE_ERROR(zeAccelMalloc(&addr, buffer_size, devid),
+                   "Failed to allocate Level Zero device buffer");
+    CHECK_ZE_ERROR(zeAccelMemset(addr, memset_value, buffer_size),
+                   "Failed to set Level Zero device memory");
+
+    return std::optional<xferBenchIOV>(std::in_place, (uintptr_t)addr, buffer_size, devid);
+}
+
+static void
+cleanupVramZe(xferBenchIOV &iov) {
+    CHECK_ZE_ERROR(zeAccelFree((void *)iov.addr), "Failed to free Level Zero device buffer");
+}
+
 #if HAVE_CUDA
 static std::optional<xferBenchIOV>
 getVramDescCuda(int devid, size_t buffer_size, uint8_t memset_value) {
@@ -677,6 +721,10 @@ getVramDesc(int devid, size_t buffer_size, bool isInit) {
         return getVramDescNeuron(devid, buffer_size, memset_value);
     }
 
+    if (useZeVram()) {
+        return getVramDescZe(devid, buffer_size, memset_value);
+    }
+
 #if HAVE_CUDA
     CHECK_CUDA_ERROR(cudaSetDevice(devid), "Failed to set device");
     if (xferBenchConfig::enable_vmm) {
@@ -688,7 +736,7 @@ getVramDesc(int devid, size_t buffer_size, bool isInit) {
     CHECK_CUDA_ERROR(hipSetDevice(devid), "Failed to set device");
     return getVramDescRocm(devid, buffer_size, memset_value);
 #else
-    std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
+    std::cerr << "VRAM not supported without CUDA, ROCm, Neuron or Level Zero" << std::endl;
     return std::nullopt;
 #endif
 }
@@ -882,12 +930,17 @@ cleanupBasicDescVram(xferBenchIOV &iov) {
         return;
     }
 
+    if (useZeVram()) {
+        cleanupVramZe(iov);
+        return;
+    }
+
 #if HAVE_CUDA
     cleanupVramCuda(iov);
 #elif HAVE_ROCM
     cleanupVramRocm(iov);
 #else
-    std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
+    std::cerr << "VRAM not supported without CUDA, ROCm, Neuron or Level Zero" << std::endl;
 #endif
 }
 

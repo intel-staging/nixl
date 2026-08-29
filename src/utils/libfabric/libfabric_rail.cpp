@@ -20,10 +20,10 @@
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
 #include "libfabric_common.h"
+#include "libfabric_accel.h"
 
-#ifdef HAVE_CUDA
-#include <cuda_runtime.h>
-#endif
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #include <cstring>
 #include <stdexcept>
@@ -422,20 +422,20 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
     hints->caps |= FI_LOCAL_COMM | FI_REMOTE_COMM;
     hints->mode = FI_CONTEXT;
     hints->ep_attr->type = FI_EP_RDM;
-    // Configure memory registration mode based on provider capabilities
-    if (provider == "tcp" || provider == "sockets") {
-        // TCP provider doesn't support FI_MR_PROV_KEY or FI_MR_VIRT_ADDR, use basic mode
-        hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED;
-        hints->domain_attr->mr_key_size = 0; // Let provider decide
-    } else if (provider == "cxi") {
-        hints->caps |= FI_RMA_EVENT;
-        hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED |
-            FI_MR_PROV_KEY | FI_MR_ENDPOINT;
-    } else {
-        // EFA and other providers support advanced memory registration
-        hints->domain_attr->mr_mode =
-            FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-        hints->domain_attr->mr_key_size = 2;
+    // Capabilities and memory registration mode come from the provider table; an unlisted provider
+    // gets the plain-RDMA defaults rather than a special case here.
+    const LibfabricUtils::nixlLibfabricProviderInfo *prov_info =
+        LibfabricUtils::findProviderInfo(provider);
+    if (prov_info == nullptr) {
+        prov_info = &LibfabricUtils::defaultProviderInfo();
+        NIXL_DEBUG << "Provider " << provider << " has no table entry, using defaults from "
+                   << prov_info->name;
+    }
+    hints->caps |= prov_info->extra_caps;
+    hints->domain_attr->mr_mode = prov_info->mr_mode;
+    hints->domain_attr->mr_key_size = prov_info->mr_key_size;
+    if (prov_info->needs_prov_name_hint) {
+        hints->fabric_attr->prov_name = strdup(prov_info->name);
     }
     hints->domain_attr->name = strdup(device_name.c_str());
     hints->domain_attr->threading = FI_THREAD_COMPLETION;
@@ -576,6 +576,28 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         if (ret) {
             NIXL_ERROR << "fi_getname failed for rail " << rail_id << ": " << fi_strerror(-ret);
             throw std::runtime_error("fi_getname failed for rail " + std::to_string(rail_id));
+        }
+
+        /*
+         * Remember how this rail is addressed so it can be paired with the right peer rail later.
+         * The peer sends the same bytes for its own rails during connection setup, so comparing them
+         * is what lets a transfer post to a NIC on the same segment instead of trusting that both
+         * hosts enumerated their rails in the same order. See LibfabricUtils::sameFabric.
+         */
+        this->ep_name_len = ep_name_len;
+        this->addr_format = (info != nullptr) ? info->addr_format : FI_FORMAT_UNSPEC;
+        fabric_id = LibfabricUtils::fabricIdFromEpName(this->addr_format, ep_name, ep_name_len);
+        LibfabricUtils::resolveLocalFabricMask(fabric_id);
+        if (fabric_id.valid) {
+            char ip[INET_ADDRSTRLEN] = {0};
+            struct in_addr a;
+            a.s_addr = fabric_id.addr;
+            inet_ntop(AF_INET, &a, ip, sizeof(ip));
+            NIXL_DEBUG << "Rail " << rail_id << " (" << device_name << ") fabric address " << ip;
+        } else {
+            NIXL_DEBUG << "Rail " << rail_id << " (" << device_name
+                       << ") has an address format this build cannot read (" << this->addr_format
+                       << "); rail pairing will use index order";
         }
 
         // Initialize control request pool with buffers
@@ -1173,10 +1195,6 @@ nixl_status_t
 nixlLibfabricRail::drainPostQueue() {
     nixlLibfabricPostRequest pr;
     int posted = 0;
-#if HAVE_CUDA
-    bool use_cuda_addr_wa = false;
-    int current_cuda_device = -1;
-#endif
 
     // drain the queue up to configured limit,
     // to ensure requests from other rails do not wait too much time
@@ -1185,51 +1203,28 @@ nixlLibfabricRail::drainPostQueue() {
         ++post_req_count;
         int ret = -FI_EAGAIN;
 
-#if HAVE_CUDA
-        if (pr.is_cuda_vram) {
-            // NOTE: for now we do not call engine to try to set context in work-around mode - this
-            // is postponsed to another PR, which requires substantial refactoring - instead we
-            // directly call cudaSetDevice() when needed
-            use_cuda_addr_wa = false;
-            nixl_status_t status = LibfabricUtils::cudaSetCtx(use_cuda_addr_wa);
-            if (status != NIXL_SUCCESS) {
-                // completion is notified also for failed requests
-                // (otherwise counters would never match)
-                if (pr.req && pr.req->completion_callback) {
-                    pr.req->completion_callback(status);
-                }
-                if (pr.req) {
-                    releaseRequest(pr.req);
-                }
-
-                // defrred request cannot be executed, continue to the next
-                NIXL_ERROR << "Failed to set CUDA context, while posting deferred descriptor";
-                continue;
+        /*
+         * Bind the accelerator device this request's buffer lives on, for the duration of the post.
+         * Scoped rather than set, so a device bound for one request cannot leak into the next; a
+         * no-op for host memory and for any runtime with no thread-current state, which is why
+         * there is no flag to test. The push is cheap enough to do per request.
+         */
+        const nixlAccelScope accel_scope(pr.hmem_info);
+        if (!accel_scope.ok()) {
+            // completion is notified also for failed requests
+            // (otherwise counters would never match)
+            if (pr.req && pr.req->completion_callback) {
+                pr.req->completion_callback(NIXL_ERR_BACKEND);
+            }
+            if (pr.req) {
+                releaseRequest(pr.req);
             }
 
-            // other-wise set cuda device before call if needed
-            if (!use_cuda_addr_wa && pr.device_id != current_cuda_device) {
-                cudaError_t cuda_ret = cudaSetDevice(pr.device_id);
-                if (cuda_ret != cudaSuccess) {
-                    // completion is notified also for failed requests
-                    // (otherwise counters would never match)
-                    if (pr.req && pr.req->completion_callback) {
-                        pr.req->completion_callback(NIXL_ERR_BACKEND);
-                    }
-                    if (pr.req) {
-                        releaseRequest(pr.req);
-                    }
-
-                    // defrred request cannot be executed, continue to the next
-                    NIXL_ERROR << "Failed to set CUDA device " << pr.device_id
-                               << " while posting deferred descriptor: "
-                               << cudaGetErrorString(cuda_ret);
-                    continue;
-                }
-                current_cuda_device = pr.device_id;
-            }
+            // deferred request cannot be executed, continue to the next
+            NIXL_ERROR << "Failed to bind accelerator device " << pr.hmem_info.device
+                       << " while posting deferred descriptor";
+            continue;
         }
-#endif
 
         while (ret == -FI_EAGAIN) {
             if (pr.type == nixlLibfabricPostRequest::WRITE) {
@@ -1491,8 +1486,7 @@ nixl_status_t
 nixlLibfabricRail::registerMemory(void *buffer,
                                   size_t length,
                                   nixl_mem_t mem_type,
-                                  int device_id,
-                                  enum fi_hmem_iface iface,
+                                  const struct nfi_hmem_info &hmem_info,
                                   struct fid_mr **mr_out,
                                   uint64_t *key_out) const {
     if (!buffer || !mr_out || !key_out) {
@@ -1544,23 +1538,10 @@ nixlLibfabricRail::registerMemory(void *buffer,
     // Set HMEM interface based on memory type and provider capability
     if (mem_type == VRAM_SEG) {
         if (provider_supports_hmem_) {
-            mr_attr.iface = iface;
-            if (iface == FI_HMEM_CUDA) {
-                mr_attr.device.cuda = device_id;
-                NIXL_DEBUG << "CUDA memory registration - iface: FI_HMEM_CUDA, device.cuda: "
-                           << device_id;
-            } else if (iface == FI_HMEM_NEURON) {
-                /*
-                 * Store a sentinel; libfabric requires this to be initialized.
-                 * Libfabric requires the device.neuron field to be set for Neuron HMEM,
-                 * but the EFA provider does not use the value. Store an invalid device id
-                 * sentinel to both follow the Libfabric spec and cause an error if a
-                 * provider uses the value in the future.
-                 */
-                mr_attr.device.neuron = -1;
-                NIXL_DEBUG << "NEURON memory registration - iface: FI_HMEM_NEURON, device_id: "
-                           << device_id;
-            }
+            // Which fi_mr_attr::device union arm applies is decided by iface, so it is
+            // libfabric's own knowledge and lives in the shim. This layer stays vendor-blind and
+            // just forwards the opaque info block it was given.
+            nfi_hmem_fill_mr_attr(&hmem_info, &mr_attr);
         } else {
             NIXL_WARN << "VRAM memory requested but provider does not support FI_HMEM - falling "
                          "back to system memory registration";
