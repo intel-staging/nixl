@@ -168,7 +168,11 @@ def build_and_install_prerequisites(args):
         './configure',
         f'--prefix={LIBFABRIC_INSTALL_DIR}',
         '--enable-verbs', '--enable-shm', '--enable-sockets', '--enable-tcp',
-        '--with-synapseai=/usr/include/habanalabs' # As requested
+        '--with-synapseai=/usr/include/habanalabs', # As requested
+        # liburing-dev is installed for NIXL, and libfabric would pick it up too. The
+        # libfabric swapped into the wheel below is not repaired, so its liburing
+        # dependency would be missing wherever the cached wheel is installed.
+        '--with-uring=no',
     ]
     run_command(configure_command_lf, cwd=LIBFABRIC_DIR)
     run_command(['make', '-j', str(os.cpu_count() or 1)], cwd=LIBFABRIC_DIR)
