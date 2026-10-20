@@ -53,10 +53,19 @@ public:
 class nixlOfiRequest : public nixlBackendReqH {
 public:
     fid_cq *cq;
-    std::atomic<uint64_t> wr_id;  // CRITICAL FIX: Atomic completion tracking
+    std::atomic<uint64_t> wr_id;  // operations posted and not yet completed
+    std::atomic<bool> failed;     // an operation completed with an error
+    std::atomic<bool> released;   // handle released while operations were outstanding
+    std::atomic<bool> freed;      // exactly one of release and the last completion deletes
 
-    nixlOfiRequest() : cq(nullptr), wr_id(0) { }
+    nixlOfiRequest() : cq(nullptr), wr_id(0), failed(false), released(false), freed(false) { }
     ~nixlOfiRequest() { }
+};
+
+// Context of one posted operation. The CQ is shared by all requests, so a completion
+// must name the request it belongs to rather than be credited to whoever reads it.
+struct nixlOfiOpContext {
+    nixlOfiRequest *req;
 };
 
 class nixlOfiEngine : public nixlBackendEngine {
@@ -134,6 +143,9 @@ private:
     void driveProgress() const;
     void driveProgressIfNeeded() const;
     int ofi_progress_manual(fid_cq *cq) const;
+    static void completeOp(void *op_context, bool error);
+    nixl_status_t resolveTarget(const std::string &remote_agent, fid_ep *&target_ep,
+                                fi_addr_t &dest_addr) const;
     bool isConnectionlessProvider() const;
     nixl_status_t setupEndpoint(bool connection_oriented);
     static nixl_status_t getEndpointAddress(fid_ep* endpoint, std::string& address);
