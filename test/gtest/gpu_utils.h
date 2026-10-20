@@ -41,6 +41,10 @@ checkHipError(hipError_t result, const char *message) {
 #if defined(HAVE_ZE) && !defined(HAVE_CUDA) && !defined(HAVE_ROCM)
 #include <level_zero/ze_api.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <vector>
+
 inline void
 checkZeError(ze_result_t result, const char *message) {
     if (result != ZE_RESULT_SUCCESS) {
@@ -55,6 +59,8 @@ checkZeError(ze_result_t result, const char *message) {
 struct zeTestDevice {
     ze_context_handle_t context = nullptr;
     ze_device_handle_t device = nullptr;
+    // Ordinal of the first command queue group that supports copies.
+    uint32_t copyOrdinal = 0;
     // Why the device is unusable, or nullptr if it is usable.
     const char *error = nullptr;
 
@@ -85,6 +91,30 @@ struct zeTestDevice {
             error = "device cannot export allocations as DMA-BUF";
             return;
         }
+
+        uint32_t group_count = 0;
+        if (zeDeviceGetCommandQueueGroupProperties(device, &group_count, nullptr) !=
+            ZE_RESULT_SUCCESS) {
+            error = "zeDeviceGetCommandQueueGroupProperties failed";
+            return;
+        }
+        std::vector<ze_command_queue_group_properties_t> groups(group_count);
+        for (auto &group : groups) {
+            group.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_GROUP_PROPERTIES;
+        }
+        if (zeDeviceGetCommandQueueGroupProperties(device, &group_count, groups.data()) !=
+            ZE_RESULT_SUCCESS) {
+            error = "zeDeviceGetCommandQueueGroupProperties failed";
+            return;
+        }
+        const auto copy_group = std::find_if(groups.begin(), groups.end(), [](const auto &group) {
+            return (group.flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY) != 0;
+        });
+        if (copy_group == groups.end()) {
+            error = "device has no command queue group that supports copies";
+            return;
+        }
+        copyOrdinal = static_cast<uint32_t>(copy_group - groups.begin());
 
         ze_context_desc_t desc{ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0};
         if (zeContextCreate(driver, &desc, &context) != ZE_RESULT_SUCCESS) {
@@ -117,9 +147,10 @@ struct zeTestDevice {
         return error == nullptr;
     }
 
-    // Allocate device memory that can be exported as a DMA-BUF. The NIC registers VRAM
-    // through its DMA-BUF fd, and on BMG with a single device visible, the fd of a plain
-    // allocation maps zeros, which RDMA then transfers without reporting an error.
+    // Allocate device memory that can be exported as a DMA-BUF. The NIC accesses VRAM
+    // through its DMA-BUF fd. On BMG with a single device visible, the fd of a plain
+    // allocation does not map the allocation's memory, so RDMA through it misses the
+    // buffer, yet completes without an error.
     [[nodiscard]] ze_result_t
     allocExportable(void **ptr, size_t size) const {
         ze_external_memory_export_desc_t export_desc{ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_DESC,
@@ -128,6 +159,28 @@ struct zeTestDevice {
         ze_device_mem_alloc_desc_t desc{
             ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC, &export_desc, 0, 0};
         return zeMemAllocDevice(context, &desc, size, 0, device, ptr);
+    }
+
+    // Copy between host and device memory in either direction, returning once done.
+    [[nodiscard]] ze_result_t
+    copy(void *dst, const void *src, size_t size) const {
+        ze_command_queue_desc_t desc{};
+        desc.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
+        desc.ordinal = copyOrdinal;
+        desc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
+
+        ze_command_list_handle_t list = nullptr;
+        ze_result_t result = zeCommandListCreateImmediate(context, device, &desc, &list);
+        if (result != ZE_RESULT_SUCCESS) {
+            return result;
+        }
+
+        result = zeCommandListAppendMemoryCopy(list, dst, src, size, nullptr, 0, nullptr);
+        if (result == ZE_RESULT_SUCCESS) {
+            result = zeCommandListHostSynchronize(list, UINT64_MAX);
+        }
+        zeCommandListDestroy(list);
+        return result;
     }
 };
 
@@ -192,6 +245,23 @@ gpuFree(void *ptr, const char *message) {
     checkZeError(zeMemFree(zeGetUsableTestDevice(message).context, ptr), message);
 #else
     (void)ptr;
+    (void)message;
+#endif
+}
+
+// Copy between host and device memory; the direction is inferred from the pointers.
+inline void
+gpuMemcpy(void *dst, const void *src, size_t size, const char *message) {
+#if defined(HAVE_CUDA)
+    checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyDefault), message);
+#elif defined(HAVE_ROCM)
+    checkHipError(hipMemcpy(dst, src, size, hipMemcpyDefault), message);
+#elif defined(HAVE_ZE)
+    checkZeError(zeGetUsableTestDevice(message).copy(dst, src, size), message);
+#else
+    (void)dst;
+    (void)src;
+    (void)size;
     (void)message;
 #endif
 }

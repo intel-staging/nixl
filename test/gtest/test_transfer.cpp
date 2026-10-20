@@ -27,7 +27,10 @@
 #include <absl/strings/str_format.h>
 #include <absl/time/clock.h>
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -46,14 +49,11 @@ namespace gtest {
 
 class MemBuffer : std::shared_ptr<void> {
 public:
-    MemBuffer(size_t size, nixl_mem_t mem_type = DRAM_SEG) :
-        std::shared_ptr<void>(allocate(size, mem_type),
-                              [mem_type](void *ptr) {
-                                  release(ptr, mem_type);
-                              }),
-        size(size)
-    {
-    }
+    MemBuffer(size_t size, nixl_mem_t mem_type = DRAM_SEG)
+        : std::shared_ptr<void>(allocate(size, mem_type),
+                                [mem_type](void *ptr) { release(ptr, mem_type); }),
+          size(size),
+          memType(mem_type) {}
 
     operator uintptr_t() const
     {
@@ -65,7 +65,67 @@ public:
         return size;
     }
 
+    // Fill the buffer with the pattern for seed, staging through host memory for VRAM.
+    void
+    fill(uint8_t seed) {
+        std::vector<uint8_t> host(size);
+        for (size_t i = 0; i < size; ++i) {
+            host[i] = patternByte(seed, i);
+        }
+        copy(get(), host.data());
+    }
+
+    // Check that the buffer holds the pattern fill(seed) writes. The pattern has no zero
+    // bytes, so zeros in the result are counted separately.
+    [[nodiscard]] testing::AssertionResult
+    hasPattern(uint8_t seed) const {
+        std::vector<uint8_t> host(size);
+        copy(host.data(), get());
+
+        size_t mismatches = 0;
+        size_t zeros = 0;
+        size_t first = size;
+        for (size_t i = 0; i < size; ++i) {
+            if (host[i] != patternByte(seed, i)) {
+                first = std::min(first, i);
+                ++mismatches;
+                zeros += (host[i] == 0);
+            }
+        }
+
+        if (mismatches == 0) {
+            return testing::AssertionSuccess();
+        }
+        return testing::AssertionFailure()
+            << mismatches << " of " << size << " bytes differ from the pattern, first at offset "
+            << first << " (got " << unsigned(host[first]) << ", expected "
+            << unsigned(patternByte(seed, first)) << "); " << zeros << " of them are zero";
+    }
+
 private:
+    static uint8_t
+    patternByte(uint8_t seed, size_t offset) {
+        return static_cast<uint8_t>((offset * 131 + seed) % 255 + 1);
+    }
+
+    // Copy size bytes between the buffer and host memory, in the direction given.
+    void
+    copy(void *dst, const void *src) const {
+        switch (memType) {
+        case DRAM_SEG:
+            memcpy(dst, src, size);
+            break;
+#if defined(HAVE_GPU)
+        case VRAM_SEG:
+            gpuMemcpy(dst, src, size, "MemBuffer copy");
+            break;
+#endif
+        default:
+            FAIL() << "MemBuffer copy is not supported for "
+                   << nixlEnumStrings::memTypeStr(memType);
+        }
+    }
+
     static void *allocate(size_t size, nixl_mem_t mem_type)
     {
         switch (mem_type) {
@@ -100,6 +160,7 @@ private:
     }
 
     const size_t size;
+    const nixl_mem_t memType;
 };
 
 class TestTransfer : public nixl_test_t {
@@ -610,6 +671,16 @@ TEST_P(TestTransfer, remoteMDFromSocket)
 
     exchangeMDIP(0, 1);
     for (const auto op : {NIXL_WRITE, NIXL_READ}) {
+        // Agent 0 initiates: WRITE moves its buffers into agent 1's, READ the reverse.
+        auto &from_buffers = (op == NIXL_WRITE) ? src_buffers : dst_buffers;
+        auto &to_buffers = (op == NIXL_WRITE) ? dst_buffers : src_buffers;
+        const uint8_t seed = (op == NIXL_WRITE) ? 1 : 101;
+        for (size_t i = 0; i < count; ++i) {
+            from_buffers[i].fill(seed + i);
+            // Any other pattern, so a transfer that never lands is caught.
+            to_buffers[i].fill(seed + i + 50);
+        }
+
         doTransfer(getAgent(0),
                    getAgentName(0),
                    getAgent(1),
@@ -623,6 +694,12 @@ TEST_P(TestTransfer, remoteMDFromSocket)
                    src_buffers,
                    mem_type,
                    dst_buffers);
+
+        for (size_t i = 0; i < count; ++i) {
+            EXPECT_TRUE(to_buffers[i].hasPattern(seed + i))
+                << nixlEnumStrings::xferOpStr(op) << " into "
+                << nixlEnumStrings::memTypeStr(mem_type) << " buffer " << i;
+        }
     }
 
     invalidateMD(0, 1);
