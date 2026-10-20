@@ -1000,7 +1000,9 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     // store context count in request for completion tracking
     ofi_req->wr_id = op_contexts.size();
     handle = ofi_req;
-    return NIXL_SUCCESS;
+    // NIXL_SUCCESS from postXfer means the transfer already finished, and the agent then
+    // never calls checkXfer. Report posted-but-uncompleted operations as in progress.
+    return op_contexts.empty() ? NIXL_SUCCESS : NIXL_IN_PROG;
 
 }
 
