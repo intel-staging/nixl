@@ -291,15 +291,17 @@ cleanup_teardown:
 }
 
 void nixlOfiEngine::getStringParam(const nixlBackendInitParams* init_params, const std::string& key, std::string& value) {
-    auto it = init_params->customParams->find(key);
-    if (it != init_params->customParams->end()) {
+    const auto &params = getCustomParams();
+    auto it = params.find(key);
+    if (it != params.end()) {
         value = it->second;
     }
 }
 
 void nixlOfiEngine::getLongParam(const nixlBackendInitParams* init_params, const std::string& key, long& value, long min_val, long max_val) {
-    auto it = init_params->customParams->find(key);
-    if (it != init_params->customParams->end()) {
+    const auto &params = getCustomParams();
+    auto it = params.find(key);
+    if (it != params.end()) {
         try {
             long parsed_val = std::stol(it->second);
             if (parsed_val >= min_val && parsed_val <= max_val) {
@@ -314,8 +316,9 @@ void nixlOfiEngine::getLongParam(const nixlBackendInitParams* init_params, const
 }
 
 void nixlOfiEngine::getSizeTParam(const nixlBackendInitParams* init_params, const std::string& key, size_t& value) {
-    auto it = init_params->customParams->find(key);
-    if (it != init_params->customParams->end()) {
+    const auto &params = getCustomParams();
+    auto it = params.find(key);
+    if (it != params.end()) {
         try {
             size_t parsed_val = std::stoull(it->second);
             value = parsed_val;
