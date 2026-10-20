@@ -293,7 +293,9 @@ protected:
         }
 
         auto reg_list = makeDescList<nixlBlobDesc>(buffers, mem_type);
-        agent.registerMem(reg_list);
+        ASSERT_EQ(NIXL_SUCCESS, agent.registerMem(reg_list))
+            << "registering " << buffers.size() << " " << nixlEnumStrings::memTypeStr(mem_type)
+            << " buffers";
     }
 
     static bool wait_until_true(std::function<bool()> func, int retries = 500) {
@@ -664,10 +666,12 @@ TEST_P(TestTransfer, remoteMDFromSocket)
     std::vector<MemBuffer> src_buffers, dst_buffers;
     constexpr size_t size = 16 * 1024;
     constexpr size_t count = 4;
+    // A visible GPU means VRAM, so the backend must be able to register that GPU's memory:
+    // UCX has to be built with support for it, e.g. --with-ze for Level Zero.
     nixl_mem_t mem_type = m_gpu_device ? VRAM_SEG : DRAM_SEG;
 
-    createRegisteredMem(getAgent(0), size, count, mem_type, src_buffers);
-    createRegisteredMem(getAgent(1), size, count, mem_type, dst_buffers);
+    ASSERT_NO_FATAL_FAILURE(createRegisteredMem(getAgent(0), size, count, mem_type, src_buffers));
+    ASSERT_NO_FATAL_FAILURE(createRegisteredMem(getAgent(1), size, count, mem_type, dst_buffers));
 
     exchangeMDIP(0, 1);
     for (const auto op : {NIXL_WRITE, NIXL_READ}) {
