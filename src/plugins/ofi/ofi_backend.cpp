@@ -28,25 +28,27 @@
 #include <cstdlib>
 
 // OFI_POST macro based on libfabric FT_POST pattern for reliable operation posting
-#define OFI_POST(post_fn, cq, seq, op_str, ...)                             \
+#define OFI_POST(status, post_fn, cq, op_str, ...)                          \
     do {                                                                    \
-        int ret, progress_ret;                                              \
+        status = NIXL_SUCCESS;                                              \
         while (1) {                                                         \
-            ret = post_fn(__VA_ARGS__);                                     \
+            int ret = post_fn(__VA_ARGS__);                                 \
             if (!ret) {                                                     \
                 break;                                                      \
             }                                                               \
             if (ret != -FI_EAGAIN) {                                        \
                 NIXL_ERROR << "OFI " op_str " failed: " << fi_strerror(-ret) << " (" << ret << ")"; \
-                return NIXL_ERR_BACKEND;                                    \
+                status = NIXL_ERR_BACKEND;                                  \
+                break;                                                      \
             }                                                               \
-            progress_ret = ofi_progress_manual(cq);                         \
-            if (progress_ret < 0 && progress_ret != -FI_EAGAIN) {           \
+            /* error completions are credited to their request by the reaper */ \
+            int progress_ret = ofi_progress_manual(cq);                     \
+            if (progress_ret < 0 && progress_ret != -FI_EAGAIN && progress_ret != -FI_EAVAIL) { \
                 NIXL_ERROR << "OFI progress failed during " op_str ": " << fi_strerror(-progress_ret); \
-                return NIXL_ERR_BACKEND;                                    \
+                status = NIXL_ERR_BACKEND;                                  \
+                break;                                                      \
             }                                                               \
         }                                                                   \
-        seq++;                                                              \
     } while (0)
 
 // static synapseAI handles for dynamic loading
@@ -819,35 +821,19 @@ nixl_status_t nixlOfiEngine::unloadMD(nixlBackendMD* input) {
     return deregisterMem(input);
 }
 
-nixl_status_t nixlOfiEngine::prepXfer(const nixl_xfer_op_t &operation,
-                                  const nixl_meta_dlist_t &local,
-                                  const nixl_meta_dlist_t &remote,
-                                  const std::string &remote_agent,
-                                  nixlBackendReqH* &handle,
-                                  const nixl_opt_b_args_t* opt_args) const {
-    return postXfer(operation, local, remote, remote_agent, handle, opt_args);
-}
-
-nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
-                                  const nixl_meta_dlist_t &local,
-                                  const nixl_meta_dlist_t &remote,
-                                  const std::string &remote_agent,
-                                  nixlBackendReqH* &handle,
-                                  const nixl_opt_b_args_t* opt_args) const {
+nixl_status_t nixlOfiEngine::resolveTarget(const std::string &remote_agent, fid_ep *&target_ep,
+                                           fi_addr_t &dest_addr) const {
     if (!ep_) {
         NIXL_ERROR << "Primary endpoint not initialized";
         return NIXL_ERR_BACKEND;
     }
-    
-    fid_ep *target_ep = ep_;
-    fi_addr_t dest_addr = FI_ADDR_UNSPEC;
+    target_ep = ep_;
+    dest_addr = FI_ADDR_UNSPEC;
 
     if (isConnectionless_) {
         auto shm_it = shmAddrs_.find(remote_agent);
         if (shm_it == shmAddrs_.end()) {
-            // connection should have been established in loadRemoteConnInfo
-            // if we reach here, it means the connection was not properly established
-            NIXL_ERROR << "No address mapping found for " << remote_agent 
+            NIXL_ERROR << "No address mapping found for " << remote_agent
                       << " - connection should have been established in loadRemoteConnInfo";
             return NIXL_ERR_NOT_FOUND;
         }
@@ -855,7 +841,7 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     } else {
         auto it = connectedEps_.find(remote_agent);
         if (it == connectedEps_.end()) {
-            NIXL_ERROR << "OFI backend: Not connected to " << remote_agent 
+            NIXL_ERROR << "OFI backend: Not connected to " << remote_agent
                       << " - connection should have been established in loadRemoteConnInfo";
             return NIXL_ERR_NOT_FOUND;
         }
@@ -865,145 +851,155 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
             return NIXL_ERR_BACKEND;
         }
     }
+    return NIXL_SUCCESS;
+}
+
+// Validates the request and allocates its handle; nothing is posted until postXfer.
+nixl_status_t nixlOfiEngine::prepXfer(const nixl_xfer_op_t &operation,
+                                  const nixl_meta_dlist_t &local,
+                                  const nixl_meta_dlist_t &remote,
+                                  const std::string &remote_agent,
+                                  nixlBackendReqH* &handle,
+                                  const nixl_opt_b_args_t* opt_args) const {
+    if (operation != NIXL_READ && operation != NIXL_WRITE) {
+        NIXL_ERROR << "Unsupported operation type";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    fid_ep *target_ep;
+    fi_addr_t dest_addr;
+    nixl_status_t status = resolveTarget(remote_agent, target_ep, dest_addr);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
 
     if (local.descCount() != remote.descCount()) {
         NIXL_ERROR << "Mismatched descriptor counts: local=" << local.descCount()
                    << ", remote=" << remote.descCount();
         return NIXL_ERR_INVALID_PARAM;
     }
-
-    if (!cq_) {
-        NIXL_ERROR << "Completion queue not initialized";
-        return NIXL_ERR_BACKEND;
-    }
-    
-    nixlOfiRequest *ofi_req = new nixlOfiRequest();
-    if (!ofi_req) {
-        return NIXL_ERR_BACKEND;
-    }
-    ofi_req->cq = cq_;
-    
     if (local.descCount() <= 0) {
         NIXL_ERROR << "No descriptors to transfer";
         return NIXL_ERR_INVALID_PARAM;
     }
-    
-    // track posted operation contexts for proper cleanup
-    std::vector<uint64_t*> op_contexts;
+    if (!cq_) {
+        NIXL_ERROR << "Completion queue not initialized";
+        return NIXL_ERR_BACKEND;
+    }
 
     for (size_t i = 0; i < static_cast<size_t>(local.descCount()); ++i) {
         const nixlMetaDesc &local_desc = local[i];
         const nixlMetaDesc &remote_desc = remote[i];
-
         nixlOfiMetadata *local_meta = static_cast<nixlOfiMetadata*>(local_desc.metadataP);
         nixlOfiMetadata *remote_meta = static_cast<nixlOfiMetadata*>(remote_desc.metadataP);
-        
+
         if (!local_meta || !remote_meta || !local_meta->mr) {
             NIXL_ERROR << "Invalid metadata or memory registration";
-            // clean up any previously allocated contexts
-            for (auto* ctx : op_contexts) {
-                delete ctx;
-            }
-            delete ofi_req;
             return NIXL_ERR_INVALID_PARAM;
         }
-        
-        // validate transfer parameters
         if (local_desc.addr == 0 || local_desc.len == 0 ||
             remote_desc.addr == 0 || remote_desc.len == 0) {
             NIXL_ERROR << "Invalid transfer parameters: local_addr=" << local_desc.addr
                       << " local_len=" << local_desc.len
-                      << " remote_addr=" << remote_desc.addr 
+                      << " remote_addr=" << remote_desc.addr
                       << " remote_len=" << remote_desc.len;
-            // clean up any previously allocated contexts
-            for (auto* ctx : op_contexts) {
-                delete ctx;
-            }
-            delete ofi_req;
             return NIXL_ERR_INVALID_PARAM;
         }
-        
         if (local_desc.len != remote_desc.len) {
-            NIXL_ERROR << "Length mismatch: local=" << local_desc.len 
+            NIXL_ERROR << "Length mismatch: local=" << local_desc.len
                       << " remote=" << remote_desc.len;
-            // clean up any previously allocated contexts
-            for (auto* ctx : op_contexts) {
-                delete ctx;
-            }
-            delete ofi_req;
             return NIXL_ERR_INVALID_PARAM;
         }
+    }
+
+    nixlOfiRequest *ofi_req = new nixlOfiRequest();
+    ofi_req->cq = cq_;
+    handle = ofi_req;
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
+                                  const nixl_meta_dlist_t &local,
+                                  const nixl_meta_dlist_t &remote,
+                                  const std::string &remote_agent,
+                                  nixlBackendReqH* &handle,
+                                  const nixl_opt_b_args_t* opt_args) const {
+    nixlOfiRequest *ofi_req = static_cast<nixlOfiRequest*>(handle);
+    if (!ofi_req) {
+        NIXL_ERROR << "postXfer called without a prepared request";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    if (ofi_req->wr_id.load() != 0) {
+        NIXL_ERROR << "Request reposted with " << ofi_req->wr_id.load() << " operations outstanding";
+        return NIXL_ERR_REPOST_ACTIVE;
+    }
+    ofi_req->failed.store(false);
+
+    fid_ep *target_ep;
+    fi_addr_t dest_addr;
+    nixl_status_t status = resolveTarget(remote_agent, target_ep, dest_addr);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
+    size_t inject_size = fi_ ? fi_->tx_attr->inject_size : 0;
+
+    for (size_t i = 0; i < static_cast<size_t>(local.descCount()); ++i) {
+        const nixlMetaDesc &local_desc = local[i];
+        const nixlMetaDesc &remote_desc = remote[i];
+        nixlOfiMetadata *local_meta = static_cast<nixlOfiMetadata*>(local_desc.metadataP);
+        nixlOfiMetadata *remote_meta = static_cast<nixlOfiMetadata*>(remote_desc.metadataP);
 
         // get remote memory key - either from mr or stored in desc field for remote metadata
         uint64_t remote_key;
         if (remote_meta->mr) {
             remote_key = fi_mr_key(remote_meta->mr);
         } else {
-            // for remote metadata, key is stored in desc field - safe extraction
             uintptr_t desc_as_ptr = reinterpret_cast<uintptr_t>(remote_meta->desc);
             remote_key = static_cast<uint64_t>(desc_as_ptr);
         }
-        
-        struct fi_rma_iov rma_iov = {
-            .addr = (uint64_t)remote_desc.addr,
-            .len = remote_desc.len,
-            .key = remote_key
-        };
 
-        // check if we can use injection for small transfers (performance optimization)
-        size_t inject_size = fi_ ? fi_->tx_attr->inject_size : 0;
+        // injected writes generate no completion, so they are not counted
         bool use_inject = (local_desc.len <= inject_size) && (operation == NIXL_WRITE);
-
-        // use unique context for each operation (not needed for inject operations)
-        uint64_t* op_context = use_inject ? nullptr : new uint64_t(i);
-        static uint64_t seq_num = 0;
-
-        switch (operation) {
-            case NIXL_READ:
-                OFI_POST(fi_read, cq_, seq_num, "fi_read",
-                        target_ep, reinterpret_cast<void*>(local_desc.addr),
-                        local_desc.len, local_meta->desc, dest_addr,
-                        rma_iov.addr, rma_iov.key, op_context);
-                break;
-            case NIXL_WRITE:
-                if (use_inject) {
-                    OFI_POST(fi_inject_write, cq_, seq_num, "fi_inject_write",
-                            target_ep, reinterpret_cast<void*>(local_desc.addr),
-                            local_desc.len, dest_addr, rma_iov.addr, rma_iov.key);
-                } else {
-                    OFI_POST(fi_write, cq_, seq_num, "fi_write",
-                            target_ep, reinterpret_cast<void*>(local_desc.addr),
-                            local_desc.len, local_meta->desc, dest_addr,
-                            rma_iov.addr, rma_iov.key, op_context);
-                }
-                break;
-            default:
-                NIXL_ERROR << "Unsupported operation type";
-                if (op_context) delete op_context;
-                // cleanup all previously allocated contexts
-                for (auto* ctx : op_contexts) {
-                    delete ctx;
-                }
-                delete ofi_req;
-                return NIXL_ERR_NOT_SUPPORTED;
+        nixlOfiOpContext *op_context = nullptr;
+        if (!use_inject) {
+            op_context = new nixlOfiOpContext{ofi_req};
+            // count before posting so a fast completion can never underflow the counter
+            ofi_req->wr_id.fetch_add(1);
         }
 
-        // OFI_POST succeeded, track the context if not using injection
-        if (op_context) {
-            op_contexts.push_back(op_context);
+        nixl_status_t post_status;
+        if (operation == NIXL_READ) {
+            OFI_POST(post_status, fi_read, cq_, "fi_read",
+                    target_ep, reinterpret_cast<void*>(local_desc.addr),
+                    local_desc.len, local_meta->desc, dest_addr,
+                    (uint64_t)remote_desc.addr, remote_key, op_context);
         } else if (use_inject) {
-            // injection operations complete immediately, no context tracking needed
-            NIXL_DEBUG << "OFI inject transfer " << i << " completed immediately";
+            OFI_POST(post_status, fi_inject_write, cq_, "fi_inject_write",
+                    target_ep, reinterpret_cast<void*>(local_desc.addr),
+                    local_desc.len, dest_addr, (uint64_t)remote_desc.addr, remote_key);
+        } else {
+            OFI_POST(post_status, fi_write, cq_, "fi_write",
+                    target_ep, reinterpret_cast<void*>(local_desc.addr),
+                    local_desc.len, local_meta->desc, dest_addr,
+                    (uint64_t)remote_desc.addr, remote_key, op_context);
+        }
+
+        if (post_status != NIXL_SUCCESS) {
+            // already-posted operations still complete through the reaper and the
+            // handle stays valid until the agent releases it
+            if (op_context) {
+                delete op_context;
+                ofi_req->wr_id.fetch_sub(1);
+            }
+            ofi_req->failed.store(true);
+            return post_status;
         }
     }
 
-    // store context count in request for completion tracking
-    ofi_req->wr_id = op_contexts.size();
-    handle = ofi_req;
     // NIXL_SUCCESS from postXfer means the transfer already finished, and the agent then
     // never calls checkXfer. Report posted-but-uncompleted operations as in progress.
-    return op_contexts.empty() ? NIXL_SUCCESS : NIXL_IN_PROG;
-
+    return ofi_req->wr_id.load() == 0 ? NIXL_SUCCESS : NIXL_IN_PROG;
 }
 
 void nixlOfiEngine::connectionProgressFunc() {
@@ -1087,43 +1083,62 @@ void nixlOfiEngine::driveProgressIfNeeded() const {
     }
 }
 
+// Credits one finished operation to the request that posted it. The request is deleted
+// here when it was already released and this was its last outstanding operation.
+void nixlOfiEngine::completeOp(void *op_context, bool error) {
+    if (!op_context) {
+        return;
+    }
+    auto *ctx = static_cast<nixlOfiOpContext*>(op_context);
+    nixlOfiRequest *req = ctx->req;
+    delete ctx;
+    if (error) {
+        req->failed.store(true);
+    }
+    if (req->wr_id.fetch_sub(1) == 1 && req->released.load() && !req->freed.exchange(true)) {
+        delete req;
+    }
+}
+
+// Reaps completions from the shared CQ for every request. All CQ readers go through
+// here so no completion is dropped or credited to the wrong request.
 int nixlOfiEngine::ofi_progress_manual(fid_cq *cq) const {
     if (!cq) {
         return -FI_EINVAL;
     }
 
-    // read multiple completions for better RXM performance
-    const size_t batch_size = 8;
+    const size_t batch_size = 16;
     struct fi_cq_data_entry comps[batch_size];
     int total_processed = 0;
 
-    // try to read multiple completions in batches
     for (int batch = 0; batch < 3; batch++) {
         int ret = fi_cq_read(cq, comps, batch_size);
 
         if (ret > 0) {
+            for (int i = 0; i < ret; ++i) {
+                completeOp(comps[i].op_context, false);
+            }
             total_processed += ret;
-            continue; // try to read more
         } else if (ret == -FI_EAGAIN) {
-            break; // no more completions
+            break;
         } else if (ret == -FI_EAVAIL) {
-            struct fi_cq_err_entry err_entry;
+            struct fi_cq_err_entry err_entry = {};
             ret = fi_cq_readerr(cq, &err_entry, 0);
             if (ret < 0) {
                 if (!shutdownFlag_.load()) {
                     NIXL_ERROR << "fi_cq_readerr failed: " << fi_strerror(-ret);
                 }
-            } else {
-                // Don't log cancellation errors during shutdown as errors
-                if (err_entry.err == FI_ECANCELED && shutdownFlag_.load()) {
-                    NIXL_DEBUG << "Operation canceled during shutdown: " << fi_strerror(err_entry.err);
-                } else if (err_entry.err == FI_EIO && shutdownFlag_.load()) {
-                    NIXL_DEBUG << "I/O error during shutdown: " << fi_strerror(err_entry.err);
-                } else {
-                    NIXL_ERROR << "CQ error: " << fi_strerror(err_entry.err);
-                }
+                return ret;
             }
-            return -FI_EAVAIL;
+            // Don't log cancellation errors during shutdown as errors
+            if ((err_entry.err == FI_ECANCELED || err_entry.err == FI_EIO) && shutdownFlag_.load()) {
+                NIXL_DEBUG << "Operation ended during shutdown: " << fi_strerror(err_entry.err);
+            } else {
+                NIXL_ERROR << "CQ error completion: " << fi_strerror(err_entry.err)
+                           << " provider=" << err_entry.prov_errno;
+            }
+            completeOp(err_entry.op_context, true);
+            total_processed++;
         } else {
             if (!shutdownFlag_.load()) {
                 NIXL_ERROR << "fi_cq_read failed: " << fi_strerror(-ret);
@@ -1140,87 +1155,22 @@ nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
         return NIXL_ERR_BACKEND;  // shutdown in progress
     }
 
-    // rate-limited progress driving for main thread
-    driveProgressIfNeeded();
-
     nixlOfiRequest *ofi_req = static_cast<nixlOfiRequest*>(handle);
     if (!ofi_req || !ofi_req->cq) {
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    uint64_t expected_completions = ofi_req->wr_id.load();
-    if (expected_completions == 0) {
-        return NIXL_SUCCESS; // no operations were posted
+    if (ofi_req->wr_id.load() > 0) {
+        int ret = ofi_progress_manual(ofi_req->cq);
+        if (ret < 0 && ret != -FI_EAGAIN) {
+            return NIXL_ERR_BACKEND;
+        }
     }
 
-    // read available completions in batches
-    const size_t batch_size = 16;
-    struct fi_cq_data_entry entries[batch_size];
-    size_t max_read = std::min(expected_completions, batch_size);
-    int ret = fi_cq_read(ofi_req->cq, entries, max_read);
-    
-    if (ret > 0) {
-        NIXL_DEBUG << "checkXfer: got " << ret << " completions";
-        // got some completions - free the contexts
-        for (int i = 0; i < ret; ++i) {
-            if (entries[i].op_context) {
-                delete static_cast<uint64_t*>(entries[i].op_context);
-            }
-        }
-        
-        // thread-safe atomic update of remaining completions
-        uint64_t expected = ofi_req->wr_id.load();
-        uint64_t new_count;
-        
-        do {
-            if (expected >= static_cast<uint64_t>(ret)) {
-                new_count = expected - ret;
-            } else {
-                NIXL_ERROR << "Completion count underflow: expected=" << expected << " got=" << ret;
-                new_count = 0;
-            }
-        } while (!ofi_req->wr_id.compare_exchange_weak(expected, new_count));
-        
-        if (ofi_req->wr_id.load() == 0) {
-            return NIXL_SUCCESS; // all operations completed
-        }
-        return NIXL_IN_PROG; // some operations still pending
-    } else if (ret == -FI_EAGAIN) {
-        return NIXL_IN_PROG;
-    } else if (ret == -FI_EAVAIL) {
-        // handle error completions like fabtest ft_progress pattern
-        struct fi_cq_err_entry err_entry;
-        int err_ret = fi_cq_readerr(ofi_req->cq, &err_entry, 0);
-        if (err_ret > 0) {
-            // Don't log cancellation errors during shutdown as errors
-            if (err_entry.err == FI_ECANCELED && shutdownFlag_.load()) {
-                NIXL_DEBUG << "checkXfer: Operation canceled during shutdown";
-            } else if (err_entry.err == FI_EIO && shutdownFlag_.load()) {
-                NIXL_DEBUG << "checkXfer: I/O error during shutdown";
-            } else {
-                NIXL_ERROR << "CQ error completion: " << fi_strerror(err_entry.err) << " provider=" << err_entry.prov_errno;
-            }
-
-            // cleanup context on error and count as completion
-            if (err_entry.op_context) {
-                delete static_cast<uint64_t*>(err_entry.op_context);
-            }
-
-            // atomically decrement remaining operations
-            uint64_t expected = ofi_req->wr_id.load();
-            uint64_t new_count = expected > 0 ? expected - 1 : 0;
-            while (!ofi_req->wr_id.compare_exchange_weak(expected, new_count)) {
-                new_count = expected > 0 ? expected - 1 : 0;
-            }
-        } else {
-            NIXL_ERROR << "fi_cq_readerr failed: " << fi_strerror(-err_ret);
-        }
-        return NIXL_ERR_BACKEND;
-    } else if (ret < 0) {
-        NIXL_ERROR << "fi_cq_read failed: " << fi_strerror(-ret);
+    if (ofi_req->failed.load()) {
         return NIXL_ERR_BACKEND;
     }
-    return NIXL_IN_PROG;
+    return ofi_req->wr_id.load() == 0 ? NIXL_SUCCESS : NIXL_IN_PROG;
 }
 
 nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
@@ -1229,100 +1179,26 @@ nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // try to drain pending completions to prevent context leaks
-    uint64_t pending_ops = ofi_req->wr_id.load();
-    if (pending_ops > 0) {
-        int drain_attempts = 0;
-        // dynamic max attempts based on pending operations, with reasonable bounds
-        const int base_attempts = 50;
-        const int max_attempts = std::min(static_cast<int>(pending_ops * 5), 500);
-        const int total_attempts = std::max(base_attempts, max_attempts);
-
-        NIXL_DEBUG << "Draining " << pending_ops << " pending operations (max attempts: " << total_attempts << ")";
-
-        while (ofi_req->wr_id.load() > 0 && drain_attempts < total_attempts) {
-            // drain completions in batches
-            const size_t batch_size = 16;
-            struct fi_cq_data_entry entries[batch_size];
-            uint64_t expected_completions = ofi_req->wr_id.load();
-            size_t max_read = std::min(expected_completions, batch_size);
-
-            int ret = fi_cq_read(ofi_req->cq, entries, max_read);
-            if (ret > 0) {
-                // process completions and free contexts
-                // for (int i = 0; i < ret; ++i) {
-                //     if (entries[i].op_context) {
-                //         delete static_cast<uint64_t*>(entries[i].op_context);
-                //     }
-                // }
-
-                // atomic update of completion count using compare-exchange to prevent races
-                uint64_t expected = ofi_req->wr_id.load();
-                uint64_t new_count;
-                do {
-                    new_count = (expected >= static_cast<uint64_t>(ret)) ? expected - ret : 0;
-                } while (!ofi_req->wr_id.compare_exchange_weak(expected, new_count));
-
-                NIXL_DEBUG << "Drained " << ret << " completions, " << new_count << " remaining";
-            } else if (ret == -FI_EAGAIN) {
-                // no completions available, wait briefly and retry
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
-            } else if (ret == -FI_EAVAIL) {
-                // handle error completions
-                struct fi_cq_err_entry err_entry;
-                int err_ret = fi_cq_readerr(ofi_req->cq, &err_entry, 0);
-                if (err_ret > 0) {
-                    if (shutdownFlag_.load()) {
-                        NIXL_DEBUG << "Error completion during shutdown: " << fi_strerror(err_entry.err);
-                    } else {
-                        NIXL_WARN << "Error completion in releaseReqH: " << fi_strerror(err_entry.err);
-                    }
-
-                    // cleanup context on error and count as completion
-                    if (err_entry.op_context) {
-                        delete static_cast<uint64_t*>(err_entry.op_context);
-                    }
-
-                    // atomically decrement remaining operations
-                    uint64_t expected = ofi_req->wr_id.load();
-                    uint64_t new_count;
-                    do {
-                        new_count = expected > 0 ? expected - 1 : 0;
-                    } while (!ofi_req->wr_id.compare_exchange_weak(expected, new_count));
-                }
-            } else {
-                // other CQ errors - log but continue trying for a few more attempts
-                if (!shutdownFlag_.load()) {
-                    NIXL_WARN << "CQ read error in releaseReqH: " << fi_strerror(-ret);
-                }
-                // give a few more chances for transient errors
-                if (drain_attempts < total_attempts - 10) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(500));
-                } else {
-                    break; // stop if we're near the limit
-                }
-            }
-
-            drain_attempts++;
-        }
-
-        // log final status
-        uint64_t remaining = ofi_req->wr_id.load();
-        if (remaining > 0) {
-            if (shutdownFlag_.load()) {
-                NIXL_DEBUG << "Shutdown: releasing request with " << remaining
-                          << " pending operations after " << drain_attempts << " attempts";
-            } else {
-                NIXL_WARN << "Releasing request with " << remaining
-                         << " pending operations after " << drain_attempts
-                         << " attempts (potential context leak)";
-            }
-        } else {
-            NIXL_DEBUG << "Successfully drained all operations after " << drain_attempts << " attempts";
+    // RMA operations cannot be cancelled; give outstanding ones a bounded time to finish
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ofi_req->wr_id.load() > 0 && !shutdownFlag_.load() &&
+           std::chrono::steady_clock::now() < deadline) {
+        if (ofi_progress_manual(ofi_req->cq) == -FI_EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
 
-    delete ofi_req;
+    uint64_t remaining = ofi_req->wr_id.load();
+    if (remaining > 0 && !shutdownFlag_.load()) {
+        NIXL_WARN << "Releasing request with " << remaining
+                  << " pending operations; it is freed when they complete";
+    }
+
+    // whoever sees the request idle after it was released frees it, exactly once
+    ofi_req->released.store(true);
+    if (ofi_req->wr_id.load() == 0 && !ofi_req->freed.exchange(true)) {
+        delete ofi_req;
+    }
     return NIXL_SUCCESS;
 }
 
