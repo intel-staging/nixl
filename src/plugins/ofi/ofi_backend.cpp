@@ -1108,7 +1108,8 @@ int nixlOfiEngine::ofi_progress_manual(fid_cq *cq) const {
     }
 
     const size_t batch_size = 16;
-    struct fi_cq_data_entry comps[batch_size];
+    // the CQ is opened with FI_CQ_FORMAT_CONTEXT, so entries are fi_cq_entry
+    struct fi_cq_entry comps[batch_size];
     int total_processed = 0;
 
     for (int batch = 0; batch < 3; batch++) {
