@@ -1949,7 +1949,7 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
     
     // Align device offset to suit page size
     uint64_t device_offset = mem.addr - hbm_base;
-    uint64_t modi_mem_addr;
+    uint64_t modi_mem_addr = mem.addr;
     if (mem.addr % ACCEL_PAGE_SIZE) {
         modi_mem_addr = (mem.addr / ACCEL_PAGE_SIZE) * ACCEL_PAGE_SIZE;
         device_offset -= mem.addr - modi_mem_addr;
