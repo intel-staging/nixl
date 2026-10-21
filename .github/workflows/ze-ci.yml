@@ -31,6 +31,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # The image build clones level-zero, UCX and meson's [wrap-git] subprojects
+      # from github.com. Authenticate them with this job's read-only token, so an
+      # anonymous clone answered with HTTP 401 cannot fail the build.
+      - name: Write github.com credential for the image build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          umask 077
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
+          printf '[http "https://github.com/"]\n\textraheader = AUTHORIZATION: basic %s\n' \
+            "${auth}" > "${RUNNER_TEMP}/ghconfig"
+
       - name: Build Docker image from Dockerfile.ze-test
         uses: docker/build-push-action@v6
         with:
@@ -39,11 +52,19 @@ jobs:
           load: true
           push: false
           tags: ${{ env.IMAGE_TAG }}
+          secret-files: |
+            ghconfig=${{ runner.temp }}/ghconfig
           build-args: |
             http_proxy
             https_proxy
             HTTP_PROXY
             HTTPS_PROXY
+
+      # Self-hosted runners do not reliably clean RUNNER_TEMP between jobs.
+      - name: Remove github.com credential
+        if: always()
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/ghconfig"
 
       - name: Inspect built image
         shell: bash

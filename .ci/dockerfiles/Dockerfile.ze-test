@@ -13,32 +13,31 @@
 #   docker build -f .ci/dockerfiles/Dockerfile.ze-test -t nixl-ze-test .
 #
 
-ARG BASE_IMAGE=intel/oneapi-toolkit:2026.1.0-devel-ubuntu24.04
+ARG BASE_IMAGE=intel/oneapi-toolkit:2026.1.1-devel-ubuntu24.04
 
 FROM ${BASE_IMAGE}
 
-# UCX is pinned to a specific master commit because the Level Zero (ZE)
-# features required for Intel XPU support have not yet landed in a UCX
-# release. When a UCX release ships with the required ZE features, switch to
-# a release tag and drop UCX_COMMIT. Bump deliberately; do not float on master.
+# UCX is pinned to the v1.23.0-rc1 release tag, by commit so that a moved tag
+# cannot change the build. It carries the Level Zero (ZE) features required for
+# Intel XPU support. Move to v1.23.0 once it is released. Bump deliberately; do
+# not float on a branch.
 ARG UCX_REPO_URL=https://github.com/openucx/ucx.git
-ARG UCX_COMMIT=36333b9b1f263c82b2893fc8f05ad1596f325237
+ARG UCX_COMMIT=2ff0b47ce7626584cb9b56c647d08f712c6c3edf
 ARG UCX_SRC_DIR=/tmp/ucx_source
 ARG UCX_INSTALL_DIR=/usr
 ARG WORKSPACE=/workspace/nixl
-ARG XPU_LIB_DEB_URL=https://github.com/intel/xpumanager/releases/download/v2.0.0/libxpum2_2.0.0-238.24.04_amd64.deb
-ARG XPU_LIB_DEB_SHA256=3bf16ef35016e8818223ea05bf77101e99611c831239f513d09d51a98b97591b
-ARG XPU_SMI_DEB_URL=https://github.com/intel/xpumanager/releases/download/v2.0.0/xpu-smi_2.0.0-238.24.04_amd64.deb
-ARG XPU_SMI_DEB_SHA256=f2b64bcd514980e4b3d37b14783a600a414be815658608ba900e6f6d0e4683df
+# xpu-smi 2.2.0 is a single package; it replaces the separate libxpum2 deb.
+ARG XPU_SMI_DEB_URL=https://github.com/intel/xpumanager/releases/download/v2.2.0/xpu-smi_2.2.0-1.24.04_amd64.deb
+ARG XPU_SMI_DEB_SHA256=fa8700e97b51c0e19298f53237a02e435b5e1e1377ddcd064813faae29a1d11a
 
 # Tag of the level-zero source to build the null driver from. Must match the
-# loader version the base image ships (intel/oneapi-toolkit:2026.1.0 ships
-# loader 1.28.2). The build detects the image loader version and FAILS if this
+# loader version the base image ships (intel/oneapi-toolkit:2026.1.1 ships
+# loader 1.32.0). The build detects the image loader version and FAILS if this
 # pin disagrees, so a base-image bump cannot silently build a stale driver.
 # If set empty (ARG L0_TAG=), the build auto-detects the tag from the image's
 # libze_loader.so.1 soname instead of using this default.
 # Override: docker build --build-arg L0_TAG=v1.30.0
-ARG L0_TAG=v1.28.2
+ARG L0_TAG=v1.32.0
 
 # Labels for documentation
 LABEL maintainer="NVIDIA NIXL Team"
@@ -50,6 +49,19 @@ LABEL version="1.0"
 # cause apt-get update to fail when apt.repos.intel.com is unreachable.
 RUN rm -f /etc/apt/sources.list.d/*oneapi*.list \
           /etc/apt/sources.list.d/*oneAPI*.list
+
+# xpu-smi 2.2.0 links libmetee.so.6.2.5.0, and libmetee puts its full version in
+# the soname. The intel-graphics PPA the base image ships has only libmetee6
+# 6.2.1; the testing PPA has 6.2.5. Without it, xpu-smi installs (its libmetee6
+# dependency is unversioned) but fails to load.
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gnupg \
+        software-properties-common && \
+    add-apt-repository -y ppa:kobuk-team/intel-graphics-testing && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install build/runtime dependencies.
 RUN apt-get update -y && \
@@ -73,7 +85,8 @@ RUN apt-get update -y && \
         libibverbs1 \
         rdma-core \
         numactl \
-        libgtest-dev && \
+        libgtest-dev \
+        libgmock-dev && \
     update-alternatives --install /usr/bin/python python /usr/bin/python3.12 100 && \
     python3 -m pip config set global.break-system-packages true && \
     apt-get clean && \
@@ -81,13 +94,14 @@ RUN apt-get update -y && \
 
 # Install xpu-smi from the upstream .deb release.
 # Kept separate so a release URL change does not invalidate the apt cache layer.
-RUN wget -O /tmp/libxpum2.deb ${XPU_LIB_DEB_URL} && \
-    wget -O /tmp/xpu-smi.deb ${XPU_SMI_DEB_URL} && \
-    echo "${XPU_LIB_DEB_SHA256}  /tmp/libxpum2.deb" | sha256sum -c - && \
+# The ldd gate fails the build if a library xpu-smi needs, such as libmetee, is
+# missing.
+RUN wget -O /tmp/xpu-smi.deb ${XPU_SMI_DEB_URL} && \
     echo "${XPU_SMI_DEB_SHA256}  /tmp/xpu-smi.deb" | sha256sum -c - && \
     apt-get update -y && \
-    apt-get install -y --no-install-recommends /tmp/libxpum2.deb /tmp/xpu-smi.deb && \
-    rm -f /tmp/libxpum2.deb /tmp/xpu-smi.deb && \
+    apt-get install -y --no-install-recommends /tmp/xpu-smi.deb && \
+    ! ldd "$(command -v xpu-smi)" | grep "not found" && \
+    rm -f /tmp/xpu-smi.deb && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -103,7 +117,14 @@ RUN wget -O /tmp/libxpum2.deb ${XPU_LIB_DEB_URL} && \
 #
 # This mirrors the UCX ze-builder image; swap for the published UCX base
 # image (which bakes the null driver + deps) once it is available.
-RUN set -eux; \
+#
+# CI supplies a github.com credential as the optional "ghconfig" build secret
+# for the clones in this and the RUNs below, including meson's [wrap-git]
+# subprojects. Without it, git ignores the missing include and clones
+# anonymously, as before.
+RUN --mount=type=secret,id=ghconfig,mode=0444 set -eux; \
+    export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path \
+        GIT_CONFIG_VALUE_0=/run/secrets/ghconfig; \
     # 1. Locate the versioned loader the image ships. Prefer the ldconfig
     #    cache, then fall back to a filesystem search (oneAPI may install
     #    outside the default linker path).
@@ -150,7 +171,10 @@ RUN set -eux; \
 
 # Build and install UCX from pinned commit.
 # Source is removed in the same RUN to avoid bloating the image layer.
-RUN git clone ${UCX_REPO_URL} ${UCX_SRC_DIR} && \
+RUN --mount=type=secret,id=ghconfig,mode=0444 \
+    export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path \
+        GIT_CONFIG_VALUE_0=/run/secrets/ghconfig && \
+    git clone ${UCX_REPO_URL} ${UCX_SRC_DIR} && \
     cd ${UCX_SRC_DIR} && \
     git checkout ${UCX_COMMIT} && \
     ./autogen.sh && \
@@ -176,10 +200,15 @@ WORKDIR ${WORKSPACE}
 COPY . .
 
 # Build and install NIXL.
-# GDS backend is disabled because it is NVIDIA-specific.
-RUN set -eux; \
+# GDS backend is disabled because it is NVIDIA-specific. Level Zero is required
+# rather than auto-detected, so a missing libze_loader fails here instead of
+# silently turning the ZE VRAM tests into DRAM ones.
+RUN --mount=type=secret,id=ghconfig,mode=0444 set -eux; \
+    export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path \
+        GIT_CONFIG_VALUE_0=/run/secrets/ghconfig; \
     pip install --no-cache-dir meson ninja pybind11; \
-    meson setup build -Dinstall_headers=true -Ddisable_gds_backend=true; \
+    meson setup build -Dinstall_headers=true -Ddisable_gds_backend=true \
+        -Denable_ze_backend=true; \
     cd build; \
     ninja; \
     ninja install; \

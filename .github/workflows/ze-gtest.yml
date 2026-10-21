@@ -41,13 +41,13 @@ jobs:
       IMAGE_TAG: ${{ inputs.image_tag || format('nixl-ze-test:sha-{0}', github.sha) }}
       CONTAINER_NAME: nixl-ze-gtest-${{ github.run_id }}-${{ github.run_attempt }}
       BUILD_DIR: /tmp/nixl-build
-      # Filter to UCX-on-ZE specific test groups. Other gtest suites
-      # depend on hardware/transports not present in the ZE CI
-      # environment (CUDA, EFA, etc.). Override via workflow_dispatch
-      # input or by passing gtest_filter from a calling workflow.
-      # UCX backend test groups. These require a real ZE transport (Intel GPU);
-      # they are NOT run against the null driver — see the smoke step note below.
-      GTEST_FILTER: ${{ inputs.gtest_filter || 'UcxBackendParams.*:*/TestErrorHandling.*' }}
+      # Filter to the UCX test groups. Other gtest suites depend on
+      # hardware/transports not present in the ZE CI environment (CUDA, EFA,
+      # etc.). Override via workflow_dispatch input or by passing gtest_filter
+      # from a calling workflow. TestTransfer.remoteMDFromSocket moves and
+      # byte-checks ZE VRAM when an Intel GPU is visible; on the null driver
+      # the suites fall back to DRAM (see the smoke step note below).
+      GTEST_FILTER: ${{ inputs.gtest_filter || 'ucx*/TestTransfer.*:*/TestErrorHandling.*' }}
 
     steps:
       - name: Verify ZE image is available locally
@@ -67,10 +67,22 @@ jobs:
           else
             echo "No /dev/dri on host; using Level Zero null driver."
           fi
+          # Pass the RDMA devices through when the host has them. UCX then moves
+          # VRAM zero-copy over the NIC via DMA-BUF, which is the path the ZE
+          # allocation in test/gtest/gpu_utils.h exists for. RoCE needs the
+          # host's network namespace for its GIDs, and registration needs
+          # unlimited locked memory.
+          rdma_args=()
+          if [ -e /dev/infiniband ]; then
+            rdma_args+=(--device=/dev/infiniband --network=host --ulimit memlock=-1)
+          else
+            echo "No /dev/infiniband on host; UCX cannot use the NIC path."
+          fi
           docker run -itd \
             --name "${CONTAINER_NAME}" \
             --shm-size="32g" \
             "${gpu_args[@]}" \
+            "${rdma_args[@]}" \
             -w /workspace/nixl \
             "${IMAGE_TAG}" \
             bash
@@ -163,6 +175,7 @@ jobs:
             meson setup "${BUILD_DIR}" /workspace/nixl \
               -Dinstall_headers=true \
               -Ddisable_gds_backend=true \
+              -Denable_ze_backend=true \
               --buildtype=debug \
               -Denable_plugins=UCX \
               -Dbuild_tests=true \
@@ -176,15 +189,38 @@ jobs:
             meson compile -C "${BUILD_DIR}" gtest
           '
 
+      # Run once with a single device visible, then with all of them. With one
+      # device visible, RDMA through the DMA-BUF of a plain (non-exportable) ZE
+      # allocation misses the buffer yet completes, so that run is the one that
+      # catches a regression in the exportable allocation.
       - name: Run gtest target
         shell: bash
         run: |
           docker exec -e BUILD_DIR="${BUILD_DIR}" -e GTEST_FILTER="${GTEST_FILTER}" "${CONTAINER_NAME}" bash -lc '
-            meson test -C "${BUILD_DIR}" gtest \
-              --verbose \
-              --print-errorlogs \
-              --timeout-multiplier 10 \
-              --test-args="--gtest_filter=${GTEST_FILTER}"
+            # -e and pipefail: a failing "meson test | tee" must fail the step,
+            # not just end its loop iteration.
+            set -eo pipefail
+            for mask in 0 all; do
+              if [ "${mask}" = all ]; then
+                unset ZE_AFFINITY_MASK
+              else
+                export ZE_AFFINITY_MASK="${mask}"
+              fi
+              echo "=== gtest with ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-<unset>}"
+              meson test -C "${BUILD_DIR}" gtest \
+                --verbose \
+                --print-errorlogs \
+                --timeout-multiplier 10 \
+                --test-args="--gtest_filter=${GTEST_FILTER}" 2>&1 | tee "/tmp/gtest-${mask}.log"
+
+              # The suites fall back to DRAM when Level Zero reports no usable
+              # device. With a GPU mounted, that would hide a broken VRAM path.
+              if [ -e /dev/dri ] && grep -q "setting count to 0" "/tmp/gtest-${mask}.log"; then
+                grep -m1 "setting count to 0" "/tmp/gtest-${mask}.log"
+                echo "ERROR: /dev/dri is present, but the tests found no usable Level Zero device."
+                exit 1
+              fi
+            done
           '
 
       - name: Remove ZE container
