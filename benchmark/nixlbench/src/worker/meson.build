@@ -28,6 +28,8 @@ if cuda_available
   worker_deps += [cuda_dep]
 elif rocm_available
   worker_deps += [rocm_dep]
+elif ze_available
+  worker_deps += [ze_dep]
 endif
 
 worker_lib = static_library('worker',

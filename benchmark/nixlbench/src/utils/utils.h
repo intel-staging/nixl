@@ -69,6 +69,8 @@
             exit(EXIT_FAILURE);                                                \
         }                                                                      \
     } while (0)
+#elif HAVE_ZE
+#include "utils/ze.h"
 #endif
 
 // TODO: This is true for CX-7, need support for other CX cards and NVLink

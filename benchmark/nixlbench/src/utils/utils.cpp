@@ -672,6 +672,9 @@ xferBenchConfig::loadParams(void) {
 #if HAVE_ROCM
             std::cerr << "VMM is not supported with ROCm" << std::endl;
             return -1;
+#elif HAVE_ZE
+            std::cerr << "VMM is not supported with Level Zero" << std::endl;
+            return -1;
 #elif HAVE_CUDA && !HAVE_CUDA_FABRIC
             std::cerr << "VMM is not supported in CUDA version " << CUDA_VERSION << std::endl;
             return -1;
@@ -1267,6 +1270,9 @@ copyVramToHost(void *host_addr, const void *device_addr, size_t len) {
 #elif HAVE_ROCM
     CHECK_CUDA_ERROR(hipMemcpy(host_addr, (void *)device_addr, len, hipMemcpyDeviceToHost),
                      "hipMemcpy failed");
+#elif HAVE_ZE
+    CHECK_ZE_ERROR(zeMemcpyDeviceToHost(host_addr, device_addr, len),
+                   "zeCommandListAppendMemoryCopy failed");
 #else
     std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
     exit(EXIT_FAILURE);

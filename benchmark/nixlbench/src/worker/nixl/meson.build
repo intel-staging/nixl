@@ -25,6 +25,8 @@ if cuda_available
   nixl_worker_deps += [cuda_dep]
 elif rocm_available
   nixl_worker_deps += [rocm_dep]
+elif ze_available
+  nixl_worker_deps += [ze_dep]
 endif
 
 nixl_worker_lib = static_library('nixl_worker',

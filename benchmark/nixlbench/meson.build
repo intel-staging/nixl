@@ -84,9 +84,26 @@ if use_rocm
     endif
 endif
 
-# CUDA (skipped when use_rocm=true)
+# Level Zero (mutually exclusive with CUDA and ROCm; default off)
+ze_available = false
+use_ze = get_option('use_ze')
+if use_ze
+    if use_rocm
+        error('use_ze and use_rocm are mutually exclusive.')
+    endif
+    if nvshmem_lib_path != ''
+        error('use_ze is incompatible with NVSHMEM, which needs CUDA. Unset nvshmem_lib_path.')
+    endif
+    ze_dep = dependency('libze_loader', required : false)
+    if not ze_dep.found()
+        ze_dep = dependency('level-zero', required : true)
+    endif
+    ze_available = true
+endif
+
+# CUDA (skipped when use_rocm=true or use_ze=true)
 cuda_available = false
-if use_rocm
+if use_rocm or use_ze
     # Placeholder dep so unconditional references to cuda_dep don't error;
     # cuda_available=false gates real use.
     cuda_dep = declare_dependency()
@@ -200,6 +217,10 @@ if rocm_available
     add_project_arguments('-DHAVE_ROCM', language: 'cpp')
 endif
 
+if ze_available
+    add_project_arguments('-DHAVE_ZE', language: 'cpp')
+endif
+
 if cuda_fabric_available
     add_project_arguments('-DHAVE_CUDA_FABRIC', language: 'cpp')
 endif
@@ -208,8 +229,8 @@ if cuda_locality_domain_available
     add_project_arguments('-DHAVE_CUDA_LOCALITY_DOMAIN', language: 'cpp')
 endif
 
-if not cuda_available and not rocm_available
-    warning('Neither CUDA nor ROCm found. VRAM support will be disabled.')
+if not cuda_available and not rocm_available and not ze_available
+    warning('Neither CUDA, ROCm nor Level Zero found. VRAM support will be disabled.')
 endif
 
 ucx_device_cuda_args = []
@@ -347,6 +368,7 @@ configure_file(
         'HAVE_NVSHMEM': nvshmem_available ? '1' : '0',
         'HAVE_CUDA': cuda_available ? '1' : '0',
         'HAVE_ROCM': rocm_available ? '1' : '0',
+        'HAVE_ZE': ze_available ? '1' : '0',
         'HAVE_CUDA_FABRIC': cuda_fabric_available ? '1' : '0',
         'HAVE_CUDA_LOCALITY_DOMAIN': cuda_locality_domain_available ? '1' :'0',
         'HAVE_RAW_CLI': raw_cli_available ? '1' : '0',
@@ -367,6 +389,8 @@ if cuda_available
     deps += [cuda_dep]
 elif rocm_available
     deps += [rocm_dep]
+elif ze_available
+    deps += [ze_dep]
 endif
 if ucx_gpu_device_api_available
     deps += [nixlbench_kernels_dep]

@@ -38,6 +38,9 @@ if cuda_available
   utils_deps += [cuda_dep]
 elif rocm_available
   utils_deps += [rocm_dep]
+elif ze_available
+  utils_deps += [ze_dep]
+  utils_sources += ['ze.cpp', 'ze.h']
 endif
 
 utils_lib = static_library('utils',

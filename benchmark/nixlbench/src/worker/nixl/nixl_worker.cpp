@@ -52,6 +52,8 @@ resolveVramSegment() {
     return VRAM_SEG;
 #elif HAVE_ROCM
     return VRAM_SEG;
+#elif HAVE_ZE
+    return VRAM_SEG;
 #else
     if (neuronCoreCount() > 0) return VRAM_SEG;
     std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
@@ -735,6 +737,21 @@ cleanupVramRocm(xferBenchIOV &iov) {
 }
 #endif /* HAVE_ROCM */
 
+#if HAVE_ZE
+static std::optional<xferBenchIOV>
+getVramDescZe(int devid, size_t buffer_size, uint8_t memset_value) {
+    void *addr;
+    CHECK_ZE_ERROR(zeMalloc(&addr, buffer_size, devid), "Failed to allocate Level Zero buffer");
+    CHECK_ZE_ERROR(zeMemset(addr, memset_value, buffer_size), "Failed to set device memory");
+    return std::optional<xferBenchIOV>(std::in_place, (uintptr_t)addr, buffer_size, devid);
+}
+
+static void
+cleanupVramZe(xferBenchIOV &iov) {
+    CHECK_ZE_ERROR(zeFree((void *)iov.addr), "Failed to deallocate Level Zero buffer");
+}
+#endif /* HAVE_ZE */
+
 static std::optional<xferBenchIOV>
 getVramDesc(int devid, size_t buffer_size, bool isInit) {
     uint8_t memset_value =
@@ -754,6 +771,8 @@ getVramDesc(int devid, size_t buffer_size, bool isInit) {
 #elif HAVE_ROCM
     CHECK_CUDA_ERROR(hipSetDevice(devid), "Failed to set device");
     return getVramDescRocm(devid, buffer_size, memset_value);
+#elif HAVE_ZE
+    return getVramDescZe(devid, buffer_size, memset_value);
 #else
     std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
     return std::nullopt;
@@ -953,6 +972,8 @@ cleanupBasicDescVram(xferBenchIOV &iov) {
     cleanupVramCuda(iov);
 #elif HAVE_ROCM
     cleanupVramRocm(iov);
+#elif HAVE_ZE
+    cleanupVramZe(iov);
 #else
     std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
 #endif
