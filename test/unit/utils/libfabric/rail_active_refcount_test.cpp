@@ -204,7 +204,7 @@ testRegisterDeregisterRefcount(nixlLibfabricRailManager &mgr) {
     TEST_ASSERT(mgr.getActiveRailCount() == 0, "no active rails before register");
 
     // Default-constructed: DRAM_SEG registration ignores it, and these buffers are host memory
-    const struct nfi_hmem_info hmem_info{};
+    const nixlAccelInfo hmem_info{};
 
     nixl_status_t st = mgr.registerMemory(
         buf, sizeof(buf), DRAM_SEG, 0, hmem_info, mr_list, key_list, selected_rails);
@@ -250,7 +250,7 @@ testDeregisterFailureKeepsRailActive(nixlLibfabricRailManager &mgr) {
     std::vector<size_t> selected_rails;
 
     nixl_status_t st = mgr.registerMemory(
-        buf, sizeof(buf), DRAM_SEG, 0, nfi_hmem_info{}, mr_list, key_list, selected_rails);
+        buf, sizeof(buf), DRAM_SEG, 0, nixlAccelInfo{}, mr_list, key_list, selected_rails);
     TEST_ASSERT(st == NIXL_SUCCESS, "registerMemory succeeded");
     TEST_ASSERT(mgr.getActiveRailCount() == NUM_FAKE_RAILS, "all rails active after register");
 

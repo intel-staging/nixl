@@ -18,78 +18,116 @@
 #ifndef NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_ACCEL_H
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_ACCEL_H
 
-#include "nfi_hmem.h"
+#include "nixl_types.h"
+
+#include <rdma/fabric.h>
+#include <rdma/fi_domain.h>
 
 #include <hwloc.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 /**
- * @brief nixl's side of the accelerator boundary: the part @ref nfi_hmem.h deliberately excludes.
+ * @brief nixl's side of the accelerator boundary.
  *
- * The shim answers libfabric-shaped questions -- what owns this pointer, which fi_mr_attr arm, is
- * this runtime usable. Three kinds of question are left out of it on purpose, and they live here:
+ * Pointer attribution, device enumeration and fi_mr_attr population come from libfabric's hmem
+ * query extension (fi_open("hmem"), rdma/fi_ext.h), so this layer and the provider cannot reach
+ * different conclusions about one pointer. What libfabric does not provide stays here:
  *
- *   1. **hwloc.** Accelerator discovery in nixl is hwloc-driven, because rail selection walks PCIe
- *      ancestry. libfabric does not depend on hwloc and never should, so the shim reports PCI
- *      addresses as integers and the matching against an hwloc topology happens here.
- *   2. **Policy.** Whether a vendor's devices join PCIe-proximity NIC grouping, and whether an
- *      unattributable VRAM_SEG pointer is a caller error, are nixl rail-selection decisions. They
- *      would be meaningless inside libfabric.
- *   3. **C++ ergonomics.** The shim is C so it can be donated upstream; the scope guard that makes
- *      it pleasant to use is not part of that contract.
- *
- * Adding an accelerator vendor: the shim gets a table entry, and this file gets a `groupable`
- * decision plus, if hwloc cannot identify the hardware from PCI attributes alone, a branch in
- * @ref accelIfaceOfHwlocObj.
+ *   1. **Neuron attribution.** libfabric has no Neuron pointer probe, so a Neuron pointer is
+ *      identified through libnrt, which reports the attached EFA device rather than the
+ *      accelerator -- see @ref nixlAccelBusKind.
+ *   2. **CUDA context binding.** libfabric does no context management on the data path, so the
+ *      thread-current context its CUDA calls need is established by @ref nixlAccelScope.
+ *   3. **hwloc matching and rail-selection policy**, which are nixl decisions.
  */
 
 /****************************************
- * Diagnostics
+ * Pointer attribution
  *****************************************/
 
 /**
- * @brief Routes the shim's diagnostics into NIXL_LOG. Idempotent, safe to call from anywhere.
+ * @brief Whose PCI address @ref nixlAccelInfo::bus holds.
  *
- * Call before the first shim query if you want to see vendor initialisation messages, since that
- * happens lazily on first use and is the most informative thing it logs.
+ * A CUDA or Level Zero pointer reports the GPU's own address; a Neuron pointer reports the address
+ * of the NIC attached to that accelerator, because that is what libnrt offers -- a Trainium card
+ * carries its EFA device onboard.
  */
+enum class nixlAccelBusKind { NONE, ACCELERATOR, NIC };
+
+/** @brief What is known about one registered buffer. */
+struct nixlAccelInfo {
+    /** FI_HMEM_SYSTEM when no runtime claimed the pointer. */
+    enum fi_hmem_iface iface = FI_HMEM_SYSTEM;
+    /** Encoded for the fi_mr_attr::device arm @ref iface selects; not a nixl device index. */
+    uint64_t device = 0;
+    nixlAccelBusKind bus_kind = nixlAccelBusKind::NONE;
+    /** Valid only when @ref bus_kind is not NONE. */
+    struct fi_pci_attr bus = {};
+};
+
+/**
+ * @brief Identifies which accelerator runtime owns @p addr.
+ *
+ * Host memory is a successful FI_HMEM_SYSTEM answer, not an error. Talks to the vendor runtime, so
+ * call it once per registration and keep the result.
+ */
+nixl_status_t
+accelQueryPtr(const void *addr, nixlAccelInfo &info);
+
+/** @brief Sets fi_mr_attr::iface and the device union arm @p info selects; nothing else. */
 void
-nixlAccelInstallLogBridge();
+accelFillMrAttr(const nixlAccelInfo &info, struct fi_mr_attr &attr);
 
 /****************************************
- * Vendor enumeration
+ * Runtime enablement
  *****************************************/
 
 /**
- * @brief Every interface the shim knows about, in probe order, as a range-for-able container.
+ * @brief The interfaces nixl handles, in libfabric's probe order (descending fi_hmem_iface).
  *
- * A convenience over @ref nfi_hmem_ifaces so callers can iterate vendors without naming any. Says
- * nothing about whether a runtime is usable; ask @ref nfi_hmem_iface_available for that.
+ * Says nothing about whether a runtime is usable; ask @ref accelIfaceAvailable for that.
  */
 const std::vector<enum fi_hmem_iface> &
 nixlAccelKnownIfaces();
+
+/** @brief Whether @p iface is usable for registration in this process. */
+bool
+accelIfaceAvailable(enum fi_hmem_iface iface);
+
+/** @brief Whether any interface in @ref nixlAccelKnownIfaces is usable. */
+bool
+accelAvailable();
+
+/**
+ * @brief First usable interface in probe order, or FI_HMEM_SYSTEM.
+ *
+ * For logging, and as the fallback for a VRAM pointer no runtime claimed. Not a substitute for
+ * per-pointer attribution: on a host with two runtimes it names only one.
+ */
+enum fi_hmem_iface
+accelPrimaryIface();
+
+/** @brief Short name of @p iface ("CUDA", "ZE", "SYSTEM", ...), from libfabric's fi_tostr. */
+const char *
+accelIfaceName(enum fi_hmem_iface iface);
 
 /****************************************
  * PCI addresses
  *****************************************/
 
 /**
- * @brief Renders a shim PCI address the way hwloc does, so both sides key alike.
+ * @brief Renders a PCI address the way hwloc does, so both sides key alike.
  *
- * hwloc writes "%x:%02x:%02x.%x" -- an unpadded domain, everything else padded. Vendor SDKs
- * generally zero-pad the domain ("0000:59:00.0"), which is why nixlLibfabricTopology renormalises
- * anything arriving as a string. Values from the shim are integers and go straight through here.
- *
- * @return Empty string when @p kind is NFI_HMEM_BUS_NONE, so callers can test for "no address"
- *         without inspecting the kind separately.
+ * hwloc writes "%x:%02x:%02x.%x" -- an unpadded domain, everything else padded.
  */
 std::string
-accelBusIdString(const struct nfi_hmem_bus_id &bus, enum nfi_hmem_bus_kind kind);
+accelBusIdString(const struct fi_pci_attr &bus);
 
-/** @brief @ref accelBusIdString for the address inside an info block. */
+/** @brief @ref accelBusIdString for @p info, or an empty string when it has no address. */
 std::string
-accelBusIdString(const struct nfi_hmem_info &info);
+accelBusIdString(const nixlAccelInfo &info);
 
 /****************************************
  * hwloc matching
@@ -98,21 +136,9 @@ accelBusIdString(const struct nfi_hmem_info &info);
 /**
  * @brief The interface whose vendor owns @p obj, or FI_HMEM_SYSTEM if none does.
  *
- * The single place hwloc objects are attributed to a vendor. Null and non-PCI objects are rejected
- * rather than dereferenced.
- *
- * Two different strategies, per vendor, and the difference is deliberate:
- *
- *   - **NVIDIA and Neuron are matched from hwloc alone** (vendor ID, plus PCI class or a device-ID
- *     allowlist). That keeps them discoverable in a build without the vendor SDK, and -- more
- *     importantly for CUDA -- keeps discovery independent of CUDA_VISIBLE_DEVICES. Accelerator
- *     discovery describes the machine; masking it to the process's view would report one GPU on a
- *     masked 8-GPU host and repartition every NIC.
- *   - **Intel is matched against the Level Zero driver's own device list** via
- *     @ref nfi_hmem_device_bdfs. There is no hwloc-only alternative: a discrete Intel GPU and Intel
- *     integrated graphics share vendor ID 0x8086 and PCI class 0x0300, so nothing in the PCI
- *     attributes separates them, and compute-only parts carry no display class at all. Answers
- *     false when Level Zero is unavailable.
+ * NVIDIA and Neuron are matched from hwloc alone, which keeps discovery independent of
+ * CUDA_VISIBLE_DEVICES. Intel is matched against the Level Zero devices libfabric enumerated,
+ * because a discrete Intel GPU and Intel integrated graphics share vendor ID and PCI class.
  */
 enum fi_hmem_iface
 accelIfaceOfHwlocObj(hwloc_obj_t obj);
@@ -124,21 +150,17 @@ accelIfaceOfHwlocObj(hwloc_obj_t obj);
 /**
  * @brief Whether @p iface's devices take part in PCIe-proximity NIC grouping.
  *
- * Distinct from being an accelerator at all. Neuron devices are accelerators for counting purposes
- * but must stay out of grouping: a Trainium card carries its EFA device onboard, so a Neuron pointer
- * reports a NIC address (NFI_HMEM_BUS_NIC) and resolves through the NIC map instead of through an
- * accelerator-to-NIC map.
+ * Neuron devices are accelerators for counting purposes but stay out of grouping: a Neuron pointer
+ * reports a NIC address and resolves through the NIC map.
  */
 bool
 accelIfaceIsGroupable(enum fi_hmem_iface iface);
 
 /**
- * @brief Whether some usable runtime demands that VRAM pointers be attributable to it.
+ * @brief Whether a VRAM_SEG pointer no runtime claimed is a caller error.
  *
- * True when a VRAM_SEG registration whose pointer no vendor claimed is a caller error rather than
- * something to warn about and continue past. CUDA sets it: on a CUDA host, device memory that
- * cuPointerGetAttributes() does not recognise is a bug in the caller. Neuron and Level Zero do not;
- * both fall back to registering on all rails.
+ * True when CUDA is usable: device memory CUDA does not recognise is a bug in the caller. Neuron
+ * and Level Zero fall back to registering on all rails.
  */
 bool
 accelRequiresStrictAttribution();
@@ -148,54 +170,37 @@ accelRequiresStrictAttribution();
  *****************************************/
 
 /**
- * @brief RAII wrapper over @ref nfi_hmem_scope_push / @ref nfi_hmem_scope_pop.
+ * @brief Makes the buffer's CUDA device current on this thread for the scope's lifetime.
  *
- * Bracket the operations that need a current accelerator context. Which those are is not obvious, so
- * to be explicit: **registration needs one, detection does not.** libfabric exports a dmabuf handle
- * from inside fi_mr_regattr() for providers configured that way, and that export requires a context
- * on the buffer's device; attributing a pointer requires nothing, because unified virtual addressing
- * lets the driver identify any allocation in the process. UCX draws the line in exactly the same
- * place, and for the same stated reason.
+ * Registration needs a context because libfabric exports a dmabuf handle from inside
+ * fi_mr_regattr() for providers configured that way; posting is bracketed too, because a provider
+ * may take a host-copy path for small transfers. Attribution needs none.
  *
- * Posting is bracketed too, because a provider may take a host-copy path for small transfers.
- *
- * A no-op for every runtime with no thread-current state (Level Zero, Neuron) and for host memory,
- * so callers can construct one unconditionally rather than testing first.
+ * Pushes the device's primary context and pops it on destruction, so an application thread's own
+ * binding survives. A no-op for host memory and for runtimes with no thread-current state, so
+ * callers can construct one unconditionally.
  */
 class nixlAccelScope {
 public:
-    /** @brief Binds the device that owns the buffer @p info describes. */
-    explicit nixlAccelScope(const struct nfi_hmem_info &info)
-        : nixlAccelScope(info.iface, info.device) {}
+    explicit nixlAccelScope(const nixlAccelInfo &info) : nixlAccelScope(info.iface, info.device) {}
 
-    /** @brief Binds @p device of @p iface, for a caller holding the pair rather than an info block. */
-    nixlAccelScope(enum fi_hmem_iface iface, uint64_t device) : scope_{}, ok_(false) {
-        ok_ = (nfi_hmem_scope_push(iface, device, &scope_) == 0);
-    }
-
-    ~nixlAccelScope() {
-        nfi_hmem_scope_pop(&scope_);
-    }
+    nixlAccelScope(enum fi_hmem_iface iface, uint64_t device);
+    ~nixlAccelScope();
 
     nixlAccelScope(const nixlAccelScope &) = delete;
     nixlAccelScope &
     operator=(const nixlAccelScope &) = delete;
 
-    /**
-     * @brief Whether the binding succeeded.
-     *
-     * Worth checking before an operation that would fail confusingly without a context, but not
-     * worth failing a transfer over on its own -- a runtime that has nothing to bind also reports
-     * success here, so false means the runtime actively refused.
-     */
+    /** @brief False only when the runtime actively refused; nothing to bind is success. */
     bool
     ok() const {
         return ok_;
     }
 
 private:
-    struct nfi_hmem_scope scope_;
-    bool ok_;
+    bool pushed_ = false;
+    int device_ = 0;
+    bool ok_ = true;
 };
 
 #endif // NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_ACCEL_H

@@ -43,6 +43,27 @@ constexpr const char *NIXL_LIBFABRIC_POST_THREADS_PARAM = "num_threads";
 constexpr const char *NIXL_LIBFABRIC_POST_SPLIT_BATCH_SIZE_PARAM = "split_batch_size";
 constexpr size_t NIXL_LIBFABRIC_POST_THREAD_HW_MULTIPLIER = 4;
 
+size_t
+parseStripingThreshold(const nixl_b_params_t &params) {
+    size_t threshold = NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD;
+    const auto it = params.find("striping_threshold");
+
+    if (it == params.end()) {
+        NIXL_INFO << "Striping threshold: " << threshold << " bytes (default)";
+        return threshold;
+    }
+
+    try {
+        threshold = std::stoull(it->second);
+        NIXL_INFO << "Striping threshold: " << threshold << " bytes (custom)";
+    }
+    catch (const std::exception &e) {
+        NIXL_WARN << "Invalid striping_threshold value '" << it->second
+                  << "', using default: " << threshold << " bytes";
+    }
+    return threshold;
+}
+
 void
 storeFirstError(std::atomic<int> &status, nixl_status_t new_status) {
     int expected = static_cast<int>(NIXL_SUCCESS);
@@ -134,11 +155,10 @@ private:
     bool stop_ = false;
 };
 
-// Accelerator vendor knowledge lives in two places now, neither of them here:
-//   - src/utils/libfabric/nfi_hmem.cpp, the libfabric HMEM shim -- pointer attribution, the
-//     fi_mr_attr::device arm, and thread-context push/pop. C-compatible interface, meant to be
-//     donated upstream.
-//   - src/utils/libfabric/libfabric_accel.{h,cpp}, the nixl-side policy and hwloc matching.
+// Accelerator vendor knowledge does not live here. Pointer attribution, device enumeration and the
+// fi_mr_attr::device arm come from libfabric's hmem query extension; src/utils/libfabric/
+// libfabric_accel.{h,cpp} wraps it and adds what libfabric lacks -- Neuron attribution, CUDA
+// context push/pop, hwloc matching and rail-selection policy.
 //
 // What used to be here was a binder hierarchy plus a mediator so the progress thread could reach
 // it. All of it is gone, and the reason is an ordering correction rather than a refactor: the old
@@ -238,7 +258,7 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
     : nixlBackendEngine(init_params),
       progress_thread_enabled_(init_params->enableProgTh),
       progress_thread_delay_(std::chrono::microseconds(init_params->pthrDelay)),
-      rail_manager_(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD),
+      rail_manager_(parseStripingThreshold(getCustomParams())),
       post_thread_count_(NIXL_LIBFABRIC_DEFAULT_POST_THREADS),
       post_split_batch_size_(NIXL_LIBFABRIC_DEFAULT_POST_SPLIT_BATCH_SIZE),
       runtime_(FI_HMEM_SYSTEM) {
@@ -253,26 +273,7 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
     // Query system runtime type from rail manager (determined once at topology discovery)
     runtime_ = rail_manager_.getRuntime();
 
-    // Route the shim's diagnostics into NIXL_LOG before anything provokes vendor initialisation.
-    nixlAccelInstallLogBridge();
-    NIXL_INFO << "System runtime: " << nfi_hmem_iface_name(runtime_);
-
-    // Parse striping threshold parameter
-    std::string threshold_str;
-    striping_threshold_ = NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD;
-
-    if (getInitParam("striping_threshold", threshold_str) == NIXL_SUCCESS) {
-        try {
-            striping_threshold_ = std::stoull(threshold_str);
-            NIXL_INFO << "Striping threshold: " << striping_threshold_ << " bytes (custom)";
-        }
-        catch (const std::exception &e) {
-            NIXL_WARN << "Invalid striping_threshold value '" << threshold_str
-                      << "', using default: " << striping_threshold_ << " bytes";
-        }
-    } else {
-        NIXL_INFO << "Striping threshold: " << striping_threshold_ << " bytes (default)";
-    }
+    NIXL_INFO << "System runtime: " << accelIfaceName(runtime_);
 
     initPostThreadPool();
     // Initialize Rail Manager which will discover the topology and create all rails.
@@ -711,10 +712,10 @@ nixlLibfabricEngine::getSupportedMems() const {
     nixl_mem_list_t mems;
     mems.push_back(DRAM_SEG);
 
-    // Any usable runtime is enough: VRAM_SEG is vendor-blind, and the shim decides which runtime
+    // Any usable runtime is enough: VRAM_SEG is vendor-blind, and libfabric decides which runtime
     // owns a given buffer at registration time. Asks the vendor SDKs rather than runtime_, which
     // names only the first of them.
-    if (nfi_hmem_available()) {
+    if (accelAvailable()) {
         NIXL_DEBUG << "Accelerator runtime available, adding VRAM support";
         mems.push_back(VRAM_SEG);
     } else {
@@ -737,9 +738,8 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
 
     priv->buffer_ = (void *)mem.addr;
     priv->length_ = mem.len;
-    priv->device_id_ = mem.devId; // Store device ID
 
-    struct nfi_hmem_info &hmem_info = priv->hmem_info_;
+    nixlAccelInfo &hmem_info = priv->hmem_info_;
 
     if (nixl_mem == VRAM_SEG) {
         /*
@@ -749,16 +749,15 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
          * than re-derived there, so no two layers can disagree about one address. Binding happens
          * further down, around the registration calls that actually require it.
          */
-        if (nfi_hmem_query_ptr((void *)mem.addr, &hmem_info) != 0) {
+        if (accelQueryPtr((void *)mem.addr, hmem_info) != NIXL_SUCCESS) {
             NIXL_ERROR << "Failed to query device from memory " << (void *)mem.addr;
             return NIXL_ERR_BACKEND;
         }
 
         if (hmem_info.iface == FI_HMEM_SYSTEM) {
             if (accelRequiresStrictAttribution()) {
-                // The failure this path has always reported when cudaQueryAddr() said "not device
-                // memory": where a runtime can attribute all of its own memory, a VRAM_SEG none of
-                // them claims is a caller error.
+                // Where a runtime can attribute all of its own memory, a VRAM_SEG none of them
+                // claims is a caller error.
                 NIXL_ERROR << "Failed to query device from memory " << (void *)mem.addr;
                 return NIXL_ERR_BACKEND;
             }
@@ -769,7 +768,7 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
         }
 
         NIXL_DEBUG << "Queried PCI bus ID: " << accelBusIdString(hmem_info) << " (iface "
-                   << nfi_hmem_iface_name(hmem_info.iface) << ", hmem device " << hmem_info.device
+                   << accelIfaceName(hmem_info.iface) << ", hmem device " << hmem_info.device
                    << ") for device " << mem.devId;
     }
 
@@ -1085,8 +1084,8 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
         /*
          * Per descriptor, because consecutive descriptors can live on different devices, and scoped
          * so the caller's own binding survives -- this may be an application thread. A no-op for a
-         * runtime with no thread-current state, which is why it is not guarded by a needsBinding()
-         * test. Declared in the descriptor's scope so it pops before the next iteration binds.
+         * runtime with no thread-current state, which is why it is not guarded by an iface test.
+         * Declared in the descriptor's scope so it pops before the next iteration binds.
          */
         std::optional<nixlAccelScope> accel_scope;
         if (bind_accel_ctx) {

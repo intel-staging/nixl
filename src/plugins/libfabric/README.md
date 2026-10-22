@@ -7,7 +7,7 @@ This plugin provides a high-performance RDMA backend for NIXL using the OpenFabr
 The Libfabric plugin provides a high-performance RDMA communication backend with the following key capabilities:
 
 - **Multi-Rail RDMA**: Automatic discovery and utilization of multiple network devices for increased bandwidth
-- **Accelerator Memory Support**: Zero-copy transfers between accelerator memory (VRAM) and remote systems. Peer-direct RDMA (e.g. GPU Direct RDMA) support is currently required. Accelerator vendors are handled generically through the HMEM vendor table (see [Adding an accelerator vendor](#adding-an-accelerator-vendor)); CUDA, Level Zero and Neuron are supported today.
+- **Accelerator Memory Support**: Zero-copy transfers between accelerator memory (VRAM) and remote systems. Peer-direct RDMA (e.g. GPU Direct RDMA) support is currently required. Device pointers are attributed through libfabric's hmem query extension, so the plugin and the provider always agree about which runtime owns a buffer (see [Where accelerator knowledge comes from](#where-accelerator-knowledge-comes-from)); CUDA, Level Zero and Neuron are supported today.
 - **Scalable Connection Management**: Efficient multi-agent connectivity with robust state tracking and automatic reconnection
 - **Asynchronous Processing**: Non-blocking RDMA operations with pre-allocated request pools and completion processing
 - **Thread-Safe Concurrency**: Background progress threads with lock-free data structures and configurable threading patterns
@@ -20,6 +20,7 @@ The Libfabric plugin provides a high-performance RDMA communication backend with
 - **Libfabric**
   - Many systems will have libfabric already installed. If not, custom libfabric installation is available via https://ofiwg.github.io/libfabric/ - Minimum required version: `v1.21.0`
   - For EFA enabled AWS instances, it is recommended to install through AWS EFA installer: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html - Recommend to use the latest version
+  - The libfabric must provide the hmem query extension (`fi_open_hmem()` in `rdma/fi_ext.h`, libfabric 2.8 or later). Meson checks for it; a libfabric without it produces the warning `libfabric lacks the hmem query extension` and the backend is not built.
 
 - **hwloc**
   - hwloc is used to understand the underlying architecture to optimize application performance. Suggested version: 2.10.0 or newer
@@ -30,25 +31,23 @@ The Libfabric plugin provides a high-performance RDMA communication backend with
 ### Optional Accelerator Dependencies
 
 Each accelerator runtime is optional and detected independently; `VRAM_SEG` is advertised if *any*
-of them is usable. All three are needed only at build time as headers — the runtime libraries are
-`dlopen`'d, so one binary works on hosts with and without each vendor's driver.
+of them is usable. A runtime is usable when libfabric initialised it, so libfabric itself must be
+built with that vendor's support (`--with-cuda`, `--with-ze`, `--with-neuron`).
 
-| Accelerator | Build dependency | Runtime library | HMEM interface |
+| Accelerator | nixl build dependency | Runtime library | HMEM interface |
 |---|---|---|---|
-| NVIDIA GPU | CUDA toolkit (`cuda_dep`) | `libcuda.so.1` | `FI_HMEM_CUDA` |
-| Intel GPU (Xe / Arc / Data Center GPU / CRI) | `level_zero/ze_api.h` (`libze-dev`, or oneAPI) | `libze_loader.so.1` | `FI_HMEM_ZE` |
-| AWS Trainium / Inferentia | none | `libnrt.so.1` | `FI_HMEM_NEURON` |
+| NVIDIA GPU | CUDA toolkit (`cuda_dep`), for context binding | `libcuda.so.1` | `FI_HMEM_CUDA` |
+| Intel GPU (Xe / Arc / Data Center GPU / CRI) | none | `libze_loader.so.1`, loaded by libfabric | `FI_HMEM_ZE` |
+| AWS Trainium / Inferentia | none | `libnrt.so.1`, loaded by nixl | `FI_HMEM_NEURON` |
 
-Meson reports what it found — look for `Found Level Zero headers, libfabric backend will build with
-FI_HMEM_ZE support` in the configure output. At startup the plugin logs the accelerators hwloc found
-per vendor (`Topology: ... CUDA=0 NEURON=0 ZE=1`) and the runtime it will assume for pointers it
-cannot attribute (`System runtime: ZE`).
+At startup the plugin logs the accelerators hwloc found per vendor (`Topology: ... CUDA=0 NEURON=0
+ZE=1`) and the runtime it will assume for pointers it cannot attribute (`System runtime: ZE`).
 
 Notes specific to Intel GPUs:
 
 - Only **discrete** GPUs are used for PCIe-proximity rail selection. Integrated graphics are
-  filtered out using the Level Zero driver's own `ZE_DEVICE_PROPERTY_FLAG_INTEGRATED` flag rather
-  than a PCI class check, which cannot separate the two (a discrete Battlemage and an iGPU both
+  filtered out using the device type libfabric reports (`fi_hmem_dev_attr::type`, derived from the
+  Level Zero driver's own `ZE_DEVICE_PROPERTY_FLAG_INTEGRATED` flag) rather than a PCI class check, which cannot separate the two (a discrete Battlemage and an iGPU both
   report class `0x0300`) and which wrongly excludes CRI cards, that carry no display class at all.
   Memory on an integrated GPU is still registered correctly; it just does not form a proximity
   group.
@@ -215,8 +214,7 @@ The following table summarizes briefly the plugin's runtime configuration:
 - **`nixlLibfabricTopology`** - Hardware topology discovery for optimal accelerator-to-NIC and NUMA-to-NIC mapping
 - **`nixlLibfabricBackendH`** - Request handle for tracking multi-request transfer completion with atomic counters
 - **`nixlLibfabricConnection`** - Multi-rail connection metadata for remote agents with state management
-- **`nfi_hmem.{h,c}`** - The libfabric HMEM shim: everything libfabric knows about attributing a device pointer but does not export. Plain C, no nixl dependencies, written to be donated upstream
-- **`libfabric_accel.{h,cpp}`** - nixl's side of the accelerator boundary: hwloc matching, rail-selection policy, and the `nixlAccelScope` RAII guard
+- **`libfabric_accel.{h,cpp}`** - nixl's side of the accelerator boundary: a wrapper over libfabric's hmem query extension, Neuron attribution, hwloc matching, rail-selection policy, and the `nixlAccelScope` RAII guard
 - **`nixlLibfabricProviderInfo`** - Table entry describing one core libfabric provider (in `src/utils/libfabric/libfabric_common.cpp`); the single place provider-specific knowledge lives
 - **`nixlAccelScope`** - RAII guard that pushes and pops an accelerator context around the operations that need one; a no-op for runtimes with no thread-current state
 
@@ -227,29 +225,33 @@ that adding hardware is an edit to one entry rather than a hunt through the code
 
 | | Table | Answers |
 |---|---|---|
-| Accelerators | `nfi_vendors[]` in `nfi_hmem.cpp` | who owns this pointer, which `fi_mr_attr` arm, is this runtime usable, which devices does it have |
+| Accelerators | libfabric's hmem extension, wrapped by `libfabric_accel.cpp` | who owns this pointer, which `fi_mr_attr` arm, is this runtime usable, which devices does it have |
 | Providers | `knownProviders()` in `libfabric_common.cpp` | which provider to prefer, what hints a rail needs, does it need topology discovery, does it need all-rail progress |
 
 Everything else asks through the table-derived queries and stays hardware-blind.
 
-### Why the accelerator table is a separate C library
+### Where accelerator knowledge comes from
 
 `fi_mr_regattr()` requires the caller to declare `fi_mr_attr::iface` and the correct arm of the
-`fi_mr_attr::device` union. libfabric knows how to derive both from a pointer -- `ofi_get_hmem_iface()`
-in `src/hmem.c` does exactly that, and `prov/hook/hook_hmem` even auto-fills `fi_mr_attr` from it --
-but neither is reachable by an application: `include/ofi_hmem.h` is not installed and `libfabric.so`
-exports only the `fi_*` API. So every consumer that registers device memory reimplements libfabric's
-vendor probing, and this is that reimplementation, factored so it can eventually be deleted.
+`fi_mr_attr::device` union. libfabric's hmem query extension (`fi_open_hmem()`) answers both from a
+pointer, using the same detection its providers use internally, and reports the PCI location and
+type of every device each runtime enumerated:
 
-`nfi_hmem.{h,cpp}` is therefore constrained at its *interface*: a C-compatible surface (POD structs,
-plain functions, `extern "C"`) with no dependency beyond libfabric's public headers, `dlopen` and the
-vendor SDK headers -- no hwloc, no nixl types, no nixl logging (diagnostics go through a
-caller-installed callback). The header compiles as C99 as well as C++20, and there is a test for that.
-The implementation is ordinary C++ like the rest of nixl. If libfabric later exports an equivalent,
-the shim collapses to a version gate rather than being thrown away.
+| Call | Used for |
+|---|---|
+| `fi_hmem_query_addr()` | which runtime and device own a registered buffer |
+| `fi_hmem_dev_lookup()` | that device's PCI address, for rail selection |
+| `fi_hmem_dev_attr()` | the discrete Level Zero GPUs, for hwloc matching |
+| `fi_hmem_set_mr_attr()` | `fi_mr_attr::iface` and the device union arm |
+| `fi_hmem_iface_enabled()` | whether a runtime is usable |
 
-Three things stay on the nixl side in `libfabric_accel.{h,cpp}`, because libfabric would not want
-them: hwloc predicates, rail-selection policy (`groupable`, strict attribution), and C++ ergonomics.
+Three things libfabric does not provide stay in `libfabric_accel.{h,cpp}`:
+
+- **Neuron attribution.** libfabric has no Neuron pointer probe, so nixl asks libnrt, which reports
+  the attached EFA device rather than the accelerator (`nixlAccelBusKind::NIC`).
+- **CUDA context binding**, below.
+- **hwloc matching and rail-selection policy** (`groupable`, strict attribution), which are nixl
+  decisions.
 
 ### Where an accelerator context is needed
 
@@ -268,28 +270,21 @@ the device's *primary* context rather than one observed on a pointer, which is w
 
 ## Adding an accelerator vendor
 
-Backend, rail manager and topology code asks vendor questions only through the shim's API and the
-policy helpers in `libfabric_accel.h`, so none of them change for a new vendor. Supporting one costs
-at most four edits, the first two in `nfi_hmem.cpp` and the rest in `libfabric_accel.cpp`:
+Pointer attribution, device enumeration and the `fi_mr_attr::device` arm are libfabric's: a vendor
+libfabric supports through its hmem extension needs no attribution code in nixl. Backend, rail
+manager and topology code ask vendor questions only through `libfabric_accel.h`, so none of them
+change either. The nixl side is at most four edits, all in `libfabric_accel.cpp`:
 
-1. **One `nfi_vendors[]` entry.** The vendor name, its `fi_hmem_iface`, an `init` hook (leave `NULL`
-   when the SDK is absent at build time, which makes the runtime permanently unavailable rather than
-   a build break), a `query` hook that attributes a pointer, an optional `device_bdfs` enumerator,
-   and optional `scope_push`/`scope_pop` if the runtime keeps thread-current state. Table order is
-   the probe order and first hit wins; keep it descending by `fi_hmem_iface` so it matches
-   libfabric's own `ofi_get_hmem_iface()` — several providers call that for themselves.
-2. **One `fi_mr_attr::device` union arm** in `nfi_hmem_fill_mr_attr()`. Forced by libfabric's ABI:
-   the union member is chosen by `iface` at compile time and cannot be written generically.
-3. **One branch in `accelIfaceOfHwlocObj()`**, if the hardware is identifiable from hwloc at all.
-   Prefer a PCI vendor ID plus class check, which keeps discovery working without the SDK and
-   independent of device masking like `CUDA_VISIBLE_DEVICES`. Fall back to `nfi_hmem_device_bdfs()`
-   membership only when PCI attributes cannot separate the hardware, as with Intel GPUs.
-4. **A `groupable` decision** in `accelIfaceIsGroupable()`, and a line in
+1. **Add the interface to `nixlAccelKnownIfaces()`**, keeping the list descending by
+   `fi_hmem_iface` so the primary runtime matches libfabric's probe order.
+2. **One branch in `accelIfaceOfHwlocObj()`**, if the hardware is identifiable from hwloc at all.
+   Prefer a PCI vendor ID plus class check, which keeps discovery independent of device masking
+   like `CUDA_VISIBLE_DEVICES`. Fall back to membership in libfabric's `fi_hmem_dev_attr()` list
+   only when PCI attributes cannot separate the hardware, as with Intel GPUs.
+3. **A `groupable` decision** in `accelIfaceIsGroupable()`, and a line in
    `accelRequiresStrictAttribution()` if an unattributable pointer should be a caller error.
-
-An SDK that is optional at runtime must be reached by `dlopen()` (as CUDA, Level Zero and Neuron all
-are) rather than linked, so a build with the headers still runs on a host without the driver. Only
-the headers may be a build-time dependency.
+4. **Context binding in `nixlAccelScope`**, only if the runtime keeps thread-current state that
+   libfabric's calls depend on, as CUDA does.
 
 ## Adding a provider
 

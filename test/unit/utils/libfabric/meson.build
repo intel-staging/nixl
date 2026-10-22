@@ -62,8 +62,9 @@ if get_option('buildtype') != 'release'
 
     test('rail_active_refcount_test', rail_active_refcount_test_bin)
 
-    # No libfabric/numa call wrapping: the HMEM detector talks only to the accelerator SDKs and
-    # hwloc, and every assertion is either host-independent or gated on hmemIfaceAvailable().
+    # No libfabric/numa call wrapping: the accelerator layer talks to libfabric's hmem extension,
+    # libnrt and hwloc, and every assertion is either host-independent or gated on
+    # accelIfaceAvailable().
     libfabric_hmem_test_bin = executable('libfabric_hmem_test',
                'libfabric_hmem_test.cpp',
                dependencies: libfabric_utils_dep + [ hwloc_dep ],

@@ -54,9 +54,8 @@ private:
 
     // System information
     /**
-     * Accelerators discovered per HMEM interface, keyed by the vendor table's ifaces. A map rather
-     * than one counter per vendor so that adding a vendor to nixl_accel_vendors[] needs no change
-     * here; absent key means zero.
+     * Accelerators discovered per HMEM interface. A map rather than one counter per vendor so that
+     * adding a vendor to libfabric_accel.cpp needs no change here; absent key means zero.
      */
     std::unordered_map<int, int> accel_counts;
     int num_numa_nodes;
@@ -145,8 +144,6 @@ private:
     nixl_status_t
     buildTopologyAwareGrouping();
     nixl_status_t
-    buildFallbackMapping();
-    nixl_status_t
     groupNicsWithAccel(const std::vector<NicInfo> &discovered_nics,
                        const std::vector<AccelInfo> &discovered_accel,
                        std::vector<NicGroup> &nic_groups);
@@ -170,8 +167,8 @@ private:
     /**
      * @brief HMEM interface of the vendor that claims @p obj, or FI_HMEM_SYSTEM if none does.
      *
-     * The single place hwloc objects are attributed to a vendor. Asks each entry of the accelerator
-     * vendor table in turn via hmemIsAccel(); there is no vendor knowledge in this class.
+     * The single place hwloc objects are attributed to a vendor. Delegates to
+     * accelIfaceOfHwlocObj(); there is no vendor knowledge in this class.
      */
     enum fi_hmem_iface
     accelIfaceOf(hwloc_obj_t obj) const;
@@ -243,12 +240,6 @@ public:
     std::vector<std::string>
     getNicsForPci(const std::string &pci_bus_id) const;
 
-    /** @brief Deprecated spelling of @ref getNicsForPci. */
-    std::vector<std::string>
-    getEfaDevicesForPci(const std::string &pci_bus_id) const {
-        return getNicsForPci(pci_bus_id);
-    }
-
     // System information
 
     /** @brief Accelerators discovered for @p iface, zero if that vendor found none. */
@@ -287,15 +278,6 @@ public:
     getProviderName() const {
         return provider_name.empty() ? "libfabric" : provider_name;
     }
-
-    // Validation
-    bool
-    isTopologyDiscovered() const {
-        return topology_discovered;
-    }
-
-    bool
-    isValidDevice(const std::string &nic_device) const;
 
     /** @brief Invalid NUMA node id constant. */
     static const uint16_t INVALID_NUMA_NODE_ID = UINT16_MAX;
@@ -395,8 +377,6 @@ public:
     // Debug/info
     void
     printTopologyInfo() const;
-    std::string
-    getTopologyString() const;
 
     /** @brief "CUDA=8 NEURON=0 ZE=0 ", one term per vendor table entry. For logs. */
     std::string

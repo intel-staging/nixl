@@ -148,7 +148,7 @@ public:
      * @param length Buffer size in bytes
      * @param mem_type Memory type (DRAM_SEG or VRAM_SEG)
      * @param device_id Device ID (used for VRAM_SEG, ignored for DRAM_SEG)
-     * @param hmem_info What the backend's single detectHmemIface() call learned about @p buffer:
+     * @param hmem_info What the backend's single accelQueryPtr() call learned about @p buffer:
      * the HMEM interface, the libfabric device ordinal and the PCI bus ID used for rail
      * selection. Passed down rather than re-derived here so there is exactly one probe per
      * registration and no way for two layers to disagree about a pointer.
@@ -162,7 +162,7 @@ public:
                    size_t length,
                    nixl_mem_t mem_type,
                    int device_id,
-                   const struct nfi_hmem_info &hmem_info,
+                   const nixlAccelInfo &hmem_info,
                    std::vector<struct fid_mr *> &mr_list_out,
                    std::vector<uint64_t> &key_list_out,
                    std::vector<size_t> &selected_rails_out);
@@ -225,7 +225,7 @@ public:
      *        (posted with FI_MORE); false flushes the rail's batch. The caller passes false for
      *        a rail's last post and when a batch reaches NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE.
      *        Defaults to false so an unmarked descriptor flushes safely.
-     * @param hmem_info What the HMEM shim said about the local buffer at registration. Carried so a
+     * @param hmem_info What libfabric said about the local buffer at registration. Carried so a
      *        deferred post can bind the progress thread to the owning accelerator device; ignored
      *        for host memory and for runtimes with no thread-current state.
      * @return NIXL_SUCCESS on success, error code on failure
@@ -249,7 +249,7 @@ public:
                              int desc_idx,
                              size_t base_offset,
                              bool apply_fi_more = false,
-                             const struct nfi_hmem_info &hmem_info = nfi_hmem_info{});
+                             const nixlAccelInfo &hmem_info = nixlAccelInfo{});
 
     void
     deferTransferRequest(nixlLibfabricReq::OpType op_type,
@@ -257,7 +257,7 @@ public:
                          uint16_t xfer_id,
                          uint64_t fi_flags,
                          fi_addr_t dest_addr,
-                         const struct nfi_hmem_info &hmem_info,
+                         const nixlAccelInfo &hmem_info,
                          size_t rail_id,
                          nixlLibfabricReq *req);
 
@@ -303,12 +303,6 @@ public:
     nixl_status_t
     progressActiveRails();
 
-    /** Validate that all rails are properly initialized
-     * @return NIXL_SUCCESS if all rails initialized, error code otherwise
-     */
-    nixl_status_t
-    validateAllRailsInitialized();
-
     // Active Rail Management APIs
     /** Increment active reference count on a rail */
     void
@@ -325,11 +319,6 @@ public:
     /** Get count of currently active rails */
     size_t
     getActiveRailCount() const;
-
-    // Memory Descriptor APIs
-    /** Get memory descriptor for specified rail and MR */
-    struct fid_mr *
-    getMemoryDescriptor(size_t rail_id, struct fid_mr *mr);
 
     // SerDes-based Memory Key Serialization
     /** Serialize memory keys and buffer address for remote access
@@ -387,9 +376,9 @@ public:
     }
 
     /** Get the accelerator runtime to assume when a pointer cannot be attributed.
-     * @return The iface @ref hmemPrimaryIface picked, or FI_HMEM_SYSTEM if no runtime is usable.
+     * @return The iface @ref accelPrimaryIface picked, or FI_HMEM_SYSTEM if no runtime is usable.
      * @note Not a claim that the host has only one vendor. Per-pointer answers come from
-     *       @ref detectHmemIface.
+     *       @ref accelQueryPtr.
      */
     fi_hmem_iface
     getRuntime() const;

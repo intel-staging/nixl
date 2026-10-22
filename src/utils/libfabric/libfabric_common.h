@@ -36,9 +36,6 @@
 
 
 // Libfabric configuration constants
-// Sockets provider requires short timeout to maintain software progress during fi_cq_sread().
-// Long timeouts block in poll(), preventing message processing. EFA uses hardware completions.
-#define NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_MS 10
 #define NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD (128 * 1024) // 128KB
 #define LF_EP_NAME_MAX_LEN 56
 #define NIXL_LIBFABRC_DEFAULT_POST_QUEUE_SIZE (32 * 1024) // 32K MPSC entries
@@ -287,9 +284,6 @@ getNextXferId();
 // Get next 4-bit SEQ_ID
 uint8_t
 getNextSeqId();
-// Reset SEQ_ID counter for new postXfer
-void
-resetSeqId();
 } // namespace LibfabricUtils
 
 // Utility functions
@@ -344,10 +338,9 @@ using nixlProviderDeviceMap = std::unordered_map<std::string, std::vector<std::s
 /**
  * @brief Everything the plugin knows about one core libfabric provider.
  *
- * The provider analogue of libfabric_hmem.cpp's accelerator vendor table, and it exists for the
- * same reason: provider-specific behaviour used to be seven independent `provider == "..."`
- * comparisons spread across device discovery, rail setup, topology discovery and CQ progress, so
- * adding a provider meant finding all seven. Now it is one table entry.
+ * Provider-specific behaviour used to be seven independent `provider == "..."` comparisons spread
+ * across device discovery, rail setup, topology discovery and CQ progress, so adding a provider
+ * meant finding all seven. Now it is one table entry.
  *
  * Table order is the preference order used by @ref getAvailableNetworkDevices.
  */
@@ -569,13 +562,6 @@ getCustomStringParam(const nixl_b_params_t &custom_params,
 extern nixl_status_t
 getCustomIntParam(const nixl_b_params_t &custom_params, const std::string &key, size_t &value);
 } // namespace LibfabricUtils
-
-/*
- * The accelerator-context mediator that used to live here is gone. It existed so the utils-layer
- * progress thread could reach a binder owned by the plugin without seeing its type; now the shim
- * (nfi_hmem.h) is in the utils layer itself and nfi_hmem_scope_push() needs no back-pointer to
- * anything. See the note in libfabric_backend.cpp for why the binder disappeared too.
- */
 
 
 #endif // NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_COMMON_H

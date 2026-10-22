@@ -47,23 +47,21 @@ class nixlLibfabricPrivateMetadata : public nixlBackendMD {
 private:
     void *buffer_; // Local memory buffer address
     size_t length_; // Buffer length in bytes
-    int device_id_; // nixl device index for VRAM, -1 for DRAM
     /**
-     * What the HMEM shim said about this buffer when it was registered.
+     * What libfabric said about this buffer when it was registered.
      *
      * Kept rather than re-derived so the post path can bind the right accelerator device without
      * probing the pointer again -- and so it binds using libfabric's own device ordinal rather than
-     * @ref device_id_, which is a nixl index and only coincides with the runtime's numbering when
-     * the two happen to enumerate devices the same way.
+     * the nixl devId, which only coincides with the runtime's numbering when the two happen to
+     * enumerate devices the same way.
      */
-    struct nfi_hmem_info hmem_info_;
+    nixlAccelInfo hmem_info_;
     std::vector<struct fid_mr *> rail_mr_list_; // Memory registrations, one per rail
     std::vector<uint64_t> rail_key_list_; // Remote access keys, one per rail
-    std::vector<char *> src_ep_names_; // Source endpoint names, one per rail
     std::vector<size_t> selected_rails_; // Rails selected based on memory topology
 
 public:
-    nixlLibfabricPrivateMetadata() : nixlBackendMD(true), device_id_(-1), hmem_info_{} {
+    nixlLibfabricPrivateMetadata() : nixlBackendMD(true), hmem_info_{} {
         hmem_info_.iface = FI_HMEM_SYSTEM;
     }
     friend class nixlLibfabricEngine;
@@ -75,7 +73,6 @@ private:
     uint64_t remote_buf_addr_; // Remote buffer base address
     std::shared_ptr<nixlLibfabricConnection> conn_; // Connection to remote agent
     std::vector<uint64_t> rail_remote_key_list_; // Remote access keys, one per rail
-    std::vector<char *> src_ep_names_; // Source endpoint names, one per rail
     std::vector<size_t>
         remote_selected_endpoints_; // Remote rails selected, derived from rail_remote_key_list_.
 
@@ -151,26 +148,15 @@ private:
     // Rail Manager - Stack allocated for better performance (mutable for const methods)
     mutable nixlLibfabricRailManager rail_manager_;
 
-    // Configurable striping threshold
-    size_t striping_threshold_;
-
     // Descriptor-posting thread pool configuration
     size_t post_thread_count_;
     size_t post_split_batch_size_;
     std::unique_ptr<nixlLibfabricPostThreadPool> post_thread_pool_;
 
-    mutable size_t total_transfer_size_;
-
     // Map of agent name to connection info
     // <remoteAgent, <connection>>
     mutable std::unordered_map<std::string, std::shared_ptr<nixlLibfabricConnection>> connections_;
     mutable std::vector<std::string> agent_names_; // List of agent names for easy access
-
-    // Threading infrastructure - remaining members
-    // Connection Management (CM) thread
-    std::mutex cm_mutex_;
-    std::thread cm_thread_;
-    std::condition_variable cm_cv_;
 
     // Progress thread for rail CQs
     std::thread progress_thread_;
@@ -182,7 +168,7 @@ private:
 
     // Accelerator runtime to assume, from rail_manager_. Only labels a log line and supplies the
     // last-resort fallback for an unattributable pointer; which runtime owns a given buffer is the
-    // HMEM shim's answer, per pointer.
+    // answered by libfabric, per pointer.
     fi_hmem_iface runtime_;
 
     void

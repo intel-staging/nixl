@@ -196,11 +196,6 @@ nixlLibfabricTopology::getNicsForPci(const std::string &pci_bus_id) const {
     return all_devices;
 }
 
-bool
-nixlLibfabricTopology::isValidDevice(const std::string &nic_device) const {
-    return std::find(all_devices.begin(), all_devices.end(), nic_device) != all_devices.end();
-}
-
 uint16_t
 nixlLibfabricTopology::getDeviceNumaNode(const std::string &nic_device) const {
     int device_numa_node = -1;
@@ -293,19 +288,8 @@ std::string
 nixlLibfabricTopology::accelCountsString() const {
     std::stringstream ss;
     for (const enum fi_hmem_iface iface : nixlAccelKnownIfaces()) {
-        ss << nfi_hmem_iface_name(iface) << "=" << getNumAccel(iface) << " ";
+        ss << accelIfaceName(iface) << "=" << getNumAccel(iface) << " ";
     }
-    return ss.str();
-}
-
-std::string
-nixlLibfabricTopology::getTopologyString() const {
-    std::stringstream ss;
-    ss << "Libfabric Topology: ";
-    ss << "Accelerators=[" << accelCountsString() << "], ";
-    ss << "NUMA=" << num_numa_nodes << ", ";
-    ss << "NICs=" << num_devices << ", ";
-    ss << "Discovered=" << (topology_discovered ? "Yes" : "No");
     return ss.str();
 }
 
@@ -429,13 +413,13 @@ nixlLibfabricTopology::discoverAccelWithHwloc() {
         uint16_t device_id = pci_obj->attr->pcidev.device_id;
         uint16_t class_id = pci_obj->attr->pcidev.class_id;
 
-        NIXL_TRACE << "Found " << nfi_hmem_iface_name(iface) << " accelerator: " << pcie_addr
+        NIXL_TRACE << "Found " << accelIfaceName(iface) << " accelerator: " << pcie_addr
                    << " (vendor=" << std::hex << vendor_id << ", device=" << device_id
                    << ", class=" << class_id << std::dec << ")";
     }
 
     for (const enum fi_hmem_iface iface : nixlAccelKnownIfaces()) {
-        NIXL_TRACE << "Discovered " << getNumAccel(iface) << " " << nfi_hmem_iface_name(iface)
+        NIXL_TRACE << "Discovered " << getNumAccel(iface) << " " << accelIfaceName(iface)
                    << " devices via hwloc";
     }
     return NIXL_SUCCESS;
@@ -585,8 +569,9 @@ nixlLibfabricTopology::buildAccelToNicMapping() {
     // Implement NIXL's topology-aware accelerator-NIC grouping algorithm
     nixl_status_t status = buildTopologyAwareGrouping();
     if (status != NIXL_SUCCESS) {
-        NIXL_WARN << "Topology-aware grouping failed, using fallback to use all available devices";
-        return buildFallbackMapping();
+        // getNicsForPci() returns every device for a bus ID that is not in the map.
+        NIXL_WARN << "Topology-aware grouping failed, all accelerators will use all available NICs";
+        return NIXL_SUCCESS;
     }
 
     NIXL_TRACE << "Built PCI→NIC mapping for " << pci_to_nic_devices.size()
@@ -723,15 +708,6 @@ nixlLibfabricTopology::buildNicInfoMap() {
     calcAvgNumaNodeBandwidth();
     calcAvgNicBandwidth();
     calcAvgNicUpstreamBandwidth();
-}
-
-nixl_status_t
-nixlLibfabricTopology::buildFallbackMapping() {
-    // Fallback: if specific mapping failed, use simple approach
-    // We can't build PCI-based mapping without topology, so just return success
-    // getNicsForPci() will return all_devices when no mapping is found
-    NIXL_WARN << "Using fallback: all accelerators will use all available NICs";
-    return NIXL_SUCCESS;
 }
 
 // hwloc helper methods

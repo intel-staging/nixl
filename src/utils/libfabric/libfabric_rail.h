@@ -31,7 +31,7 @@
 #include "nixl.h"
 #include "backend/backend_aux.h"
 #include "libfabric/libfabric_common.h"
-#include "nfi_hmem.h"
+#include "libfabric_accel.h"
 
 // Forward declarations
 class nixlLibfabricConnection;
@@ -96,14 +96,6 @@ public:
     /** Find request by libfabric context pointer */
     nixlLibfabricReq *
     findByContext(void *context) const;
-
-    /** Get count of currently active requests */
-    size_t
-    getActiveRequestCount() const;
-
-    /** Get pool utilization as percentage (0-100) */
-    size_t
-    getPoolUtilization() const;
 
     /** Expand pool by doubling its size - virtual method for subclass implementation */
     virtual nixl_status_t
@@ -387,10 +379,10 @@ struct nixlLibfabricPostRequest {
     uint64_t remote_key;
     nixlLibfabricReq *req;
     uint64_t fi_flags;
-    /** What the HMEM shim said about this request's local buffer, copied from its registration.
+    /** What libfabric said about this request's local buffer, copied from its registration.
      *  The progress thread binds from this before posting -- a no-op for host memory and for every
      *  runtime that keeps no thread-current state, so no separate flag is needed. */
-    struct nfi_hmem_info hmem_info;
+    nixlAccelInfo hmem_info;
 };
 
 /** Individual libfabric rail managing fabric, domain, endpoint, CQ, and AV */
@@ -431,21 +423,17 @@ public:
     void
     cleanup();
 
-    /** Validate that rail is properly initialized */
-    bool
-    isProperlyInitialized() const;
-
     // Memory registration methods
     /** Register memory buffer with libfabric
-     * @param hmem_info What the HMEM shim learned about @p buffer. Opaque here -- this layer never
-     * interprets it, it only hands it to nfi_hmem_fill_mr_attr(). In particular hmem_info.device is
+     * @param hmem_info What libfabric learned about @p buffer. Opaque here -- this layer never
+     * interprets it, it only hands it to accelFillMrAttr(). In particular hmem_info.device is
      * a libfabric device ordinal, not a nixl device index.
      */
     nixl_status_t
     registerMemory(void *buffer,
                    size_t length,
                    nixl_mem_t mem_type,
-                   const struct nfi_hmem_info &hmem_info,
+                   const nixlAccelInfo &hmem_info,
                    struct fid_mr **mr_out,
                    uint64_t *key_out) const;
 
@@ -461,15 +449,6 @@ public:
     /** Remove address from address vector */
     nixl_status_t
     removeAddress(fi_addr_t fi_addr) const;
-
-    // Memory descriptor helper methods
-    /** Get libfabric memory descriptor for MR */
-    void *
-    getMemoryDescriptor(struct fid_mr *mr) const;
-
-    /** Get remote access key for MR */
-    uint64_t
-    getMemoryKey(struct fid_mr *mr) const;
 
     // Libfabric operation wrappers
     /** Post receive operation */

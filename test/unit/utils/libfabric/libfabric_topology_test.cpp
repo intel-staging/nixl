@@ -331,7 +331,7 @@ testBasicTopology() {
                          prop.pciBusID,
                          prop.pciDeviceID);
 
-                auto gpu_devices = topology.getEfaDevicesForPci(pci_bus_id);
+                auto gpu_devices = topology.getNicsForPci(pci_bus_id);
 
                 std::string device_list;
                 for (const auto &device : gpu_devices) {
@@ -354,7 +354,7 @@ testBasicTopology() {
         // wholesale and the assertion would be vacuous. See libfabric_hmem_test.cpp for the
         // predicate's own tests.
         NIXL_INFO << "4. Intel accelerators detected: " << topology.getNumIntelAccel();
-        if (!nfi_hmem_iface_available(FI_HMEM_ZE)) {
+        if (!accelIfaceAvailable(FI_HMEM_ZE)) {
             if (topology.getNumIntelAccel() != 0) {
                 NIXL_ERROR << "   Level Zero is unavailable but topology reports "
                            << topology.getNumIntelAccel() << " Intel accelerator(s)";

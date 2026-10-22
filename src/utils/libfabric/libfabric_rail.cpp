@@ -109,18 +109,6 @@ RequestPool::findByContext(void *context) const {
     return req;
 }
 
-size_t
-RequestPool::getActiveRequestCount() const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
-    return requests_.size() - free_indices_.size();
-}
-
-size_t
-RequestPool::getPoolUtilization() const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
-    return ((requests_.size() - free_indices_.size()) * 100) / requests_.size();
-}
-
 nixlLibfabricReq *
 RequestPool::allocateReq(uint32_t req_id) {
     std::lock_guard<std::mutex> lock(pool_mutex_);
@@ -651,11 +639,6 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
 
 nixlLibfabricRail::~nixlLibfabricRail() {
     cleanup();
-}
-
-bool
-nixlLibfabricRail::isProperlyInitialized() const {
-    return (cq != nullptr && endpoint != nullptr && domain != nullptr);
 }
 
 void
@@ -1486,7 +1469,7 @@ nixl_status_t
 nixlLibfabricRail::registerMemory(void *buffer,
                                   size_t length,
                                   nixl_mem_t mem_type,
-                                  const struct nfi_hmem_info &hmem_info,
+                                  const nixlAccelInfo &hmem_info,
                                   struct fid_mr **mr_out,
                                   uint64_t *key_out) const {
     if (!buffer || !mr_out || !key_out) {
@@ -1539,9 +1522,9 @@ nixlLibfabricRail::registerMemory(void *buffer,
     if (mem_type == VRAM_SEG) {
         if (provider_supports_hmem_) {
             // Which fi_mr_attr::device union arm applies is decided by iface, so it is
-            // libfabric's own knowledge and lives in the shim. This layer stays vendor-blind and
-            // just forwards the opaque info block it was given.
-            nfi_hmem_fill_mr_attr(&hmem_info, &mr_attr);
+            // libfabric's own knowledge. This layer stays vendor-blind and just forwards the
+            // opaque info block it was given.
+            accelFillMrAttr(hmem_info, mr_attr);
         } else {
             NIXL_WARN << "VRAM memory requested but provider does not support FI_HMEM - falling "
                          "back to system memory registration";
@@ -1657,26 +1640,6 @@ nixlLibfabricRail::removeAddress(fi_addr_t fi_addr) const {
     }
 
     return NIXL_SUCCESS;
-}
-
-// Memory Descriptor Helper Methods
-
-void *
-nixlLibfabricRail::getMemoryDescriptor(struct fid_mr *mr) const {
-    if (!mr) {
-        NIXL_ERROR << "Invalid MR parameter on rail " << rail_id;
-        return nullptr;
-    }
-    return fi_mr_desc(mr);
-}
-
-uint64_t
-nixlLibfabricRail::getMemoryKey(struct fid_mr *mr) const {
-    if (!mr) {
-        NIXL_ERROR << "Invalid MR parameter on rail " << rail_id;
-        return 0;
-    }
-    return fi_mr_key(mr);
 }
 
 // Optimized Resource Management Methods

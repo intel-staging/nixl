@@ -25,6 +25,7 @@ subprojects/*
 /infinia-libs/
 
 install/
+install-v2/
 
 # ucx-spcx-plugin source fetched into the build context by build-container.sh
 ucx-spcx-plugin-src/

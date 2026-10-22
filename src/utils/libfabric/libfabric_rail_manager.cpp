@@ -27,16 +27,6 @@
 
 #include <numa.h>
 
-// Forward declaration for LibfabricUtils namespace
-namespace LibfabricUtils {
-uint16_t
-getNextXferId();
-uint8_t
-getNextSeqId();
-void
-resetSeqId();
-} // namespace LibfabricUtils
-
 // Static round-robin counter for rail selection
 static std::atomic<size_t> round_robin_counter{0};
 static const std::string NUM_RAILS_TAG{"num_rails"};
@@ -203,16 +193,16 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
 
     /*
      * Which runtime to name in logs and to fall back to when a VRAM pointer cannot be attributed.
-     * Not a claim that this host has exactly one accelerator vendor: detectHmemIface() decides per
-     * pointer, and getSupportedMems() asks hmemAnyIfaceAvailable().
+     * Not a claim that this host has exactly one accelerator vendor: accelQueryPtr() decides per
+     * pointer, and getSupportedMems() asks accelAvailable().
      *
      * Asks the vendor SDKs rather than the topology's accelerator counts, because those counts are
      * only populated for the providers that do proximity-based rail selection -- see
      * discoverTopology(), which zeroes them for tcp and sockets. The SDK answer is
      * provider-independent, which is what enablement needs to be.
      */
-    runtime_ = nfi_hmem_primary_iface();
-    NIXL_INFO << "System runtime: " << nfi_hmem_iface_name(runtime_)
+    runtime_ = accelPrimaryIface();
+    NIXL_INFO << "System runtime: " << accelIfaceName(runtime_)
               << (runtime_ == FI_HMEM_SYSTEM ? " (no accelerator runtime available)" : "")
               << ", accelerators found by hwloc: " << topology->accelCountsString();
 
@@ -393,7 +383,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     int desc_idx,
     size_t base_offset,
     bool apply_fi_more,
-    const struct nfi_hmem_info &hmem_info) {
+    const nixlAccelInfo &hmem_info) {
     // Initialize output parameter
     submitted_count_out = 0;
 
@@ -627,7 +617,7 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
                                                uint16_t xfer_id,
                                                uint64_t fi_flags,
                                                fi_addr_t dest_addr,
-                                               const struct nfi_hmem_info &hmem_info,
+                                               const nixlAccelInfo &hmem_info,
                                                size_t rail_id,
                                                nixlLibfabricReq *req) {
     uint8_t seq_id = (op_type == nixlLibfabricReq::WRITE) ? LibfabricUtils::getNextSeqId() : 0;
@@ -824,7 +814,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
                                          size_t length,
                                          nixl_mem_t mem_type,
                                          int device_id,
-                                         const struct nfi_hmem_info &hmem_info,
+                                         const nixlAccelInfo &hmem_info,
                                          std::vector<struct fid_mr *> &mr_list_out,
                                          std::vector<uint64_t> &key_list_out,
                                          std::vector<size_t> &selected_rails_out) {
@@ -843,7 +833,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
         return NIXL_ERR_NOT_SUPPORTED;
     }
     // Ascending rail id, to match the peer: derive_remote_selected_endpoints() builds its list by
-    // scanning the rail-indexed key list upwards, and postSingleTransfer() pairs the two lists by
+    // scanning the rail-indexed key list upwards, and prepareAndSubmitTransfer() pairs the two lists by
     // position. A local list in policy order -- PCIe proximity for VRAM, NUMA distance for DRAM --
     // would post on one rail using another rail's rkey and dest address, which on a provider whose
     // ports are separate fabrics is an unreachable address rather than an error: the write then
@@ -852,12 +842,12 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
     std::sort(selected_rails.begin(), selected_rails.end());
 
     /*
-     * What to declare to fi_mr_regattr(). Normally exactly what the shim reported; the one
+     * What to declare to fi_mr_regattr(). Normally exactly what libfabric reported; the one
      * adjustment is for a VRAM_SEG buffer no runtime claimed.
      */
-    struct nfi_hmem_info effective_info = hmem_info;
+    nixlAccelInfo effective_info = hmem_info;
     if (mem_type != VRAM_SEG) {
-        effective_info = nfi_hmem_info{};
+        effective_info = nixlAccelInfo{};
         effective_info.iface = FI_HMEM_SYSTEM;
     } else if (effective_info.iface == FI_HMEM_SYSTEM) {
         /*
@@ -871,12 +861,12 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
          * devices the same way nixl does. It happens to be a valid encoding for every
          * fi_mr_attr::device arm in use -- CUDA and Neuron take a plain ordinal, and
          * fi_hmem_ze_device(0, n) == n -- but a vendor whose encoding is not the identity would need
-         * this to go through the shim.
+         * this to go through fi_hmem_dev_attr().
          */
         effective_info.iface = runtime_;
         effective_info.device = static_cast<uint64_t>(device_id);
         NIXL_WARN << "No accelerator runtime claimed VRAM buffer " << buffer
-                  << ", falling back to iface " << nfi_hmem_iface_name(effective_info.iface)
+                  << ", falling back to iface " << accelIfaceName(effective_info.iface)
                   << " with device id " << device_id;
     }
 
@@ -1247,27 +1237,6 @@ nixlLibfabricRailManager::progressActiveRails() {
         return first_error;
     }
     return any_completions ? NIXL_SUCCESS : NIXL_IN_PROG;
-}
-
-nixl_status_t
-nixlLibfabricRailManager::validateAllRailsInitialized() {
-    for (size_t rail_id = 0; rail_id < rails_.size(); ++rail_id) {
-        if (!rails_[rail_id]->isProperlyInitialized()) {
-            NIXL_ERROR << "Rail " << rail_id << " is not properly initialized";
-            return NIXL_ERR_BACKEND;
-        }
-    }
-    NIXL_DEBUG << "All " << rails_.size() << " rails are properly initialized";
-    return NIXL_SUCCESS;
-}
-
-struct fid_mr *
-nixlLibfabricRailManager::getMemoryDescriptor(size_t rail_id, struct fid_mr *mr) {
-    if (rail_id >= rails_.size()) {
-        NIXL_ERROR << "Invalid rail index " << rail_id;
-        return nullptr;
-    }
-    return static_cast<struct fid_mr *>(rails_[rail_id]->getMemoryDescriptor(mr));
 }
 
 nixl_status_t
