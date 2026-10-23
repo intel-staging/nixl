@@ -24,7 +24,9 @@
 #include <limits>
 #include <string>
 #include <functional>
+#include <chrono>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <atomic>
 #include <thread>
@@ -417,11 +419,17 @@ public:
     LibfabricUtils::nixlLibfabricFabricId fabric_id;
     struct fid_ep *endpoint; ///< Libfabric endpoint handle
 
-    /** Initialize libfabric rail with all resources */
+    /** Initialize libfabric rail with all resources
+     * @param auto_progress Ask the provider to progress connection setup on its own thread
+     *        (FI_PROGRESS_AUTO, which also needs FI_THREAD_SAFE). Set for a lazily connecting
+     *        provider when the backend runs no progress thread: such a provider accepts a peer's
+     *        connection only while it is progressed, and without either thread nothing does so
+     *        during connection and metadata setup. Throws if the provider does not grant it. */
     nixlLibfabricRail(const std::string &device,
                       const std::string &provider,
                       uint16_t id,
-                      enum fi_hmem_iface runtime);
+                      enum fi_hmem_iface runtime,
+                      bool auto_progress = false);
 
     /** Destroy rail and cleanup all libfabric resources */
     ~nixlLibfabricRail();
@@ -663,9 +671,19 @@ private:
     using post_ring_t = MpscRing<nixlLibfabricPostRequest>;
     post_ring_t post_ring_;
 
+    // A post drainPostQueue() could not make within POST_EAGAIN_RETRIES attempts, kept for the
+    // next drain so the progress thread can service other rails meanwhile. Touched only by the
+    // progress thread, the ring's single consumer.
+    std::optional<nixlLibfabricPostRequest> pending_post_;
+    // When pending_post_ was first parked; past NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S it is failed.
+    std::chrono::steady_clock::time_point pending_since_;
+
     // the post/poll interleave ratio constants
     static constexpr size_t POST_MAX_BATCH_SIZE = 256;
     static constexpr size_t POST_POLL_INTERLEAVE_RATIO = 32;
+    // -FI_EAGAIN retries of one post, each after reaping this rail's CQ, before it is parked.
+    // Enough to ride out a briefly full send queue without leaving the rail.
+    static constexpr size_t POST_EAGAIN_RETRIES = 16;
 
     // Whether a progress thread is handling CQ draining
     bool progress_thread_enabled_ = false;

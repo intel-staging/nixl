@@ -735,10 +735,12 @@ NIXL_INSTANTIATE_TEST(ucx_no_pt, TestTransfer, "UCX", false, 2, 0, "");
 // RDMA fabric is present, so this runs anywhere the plugin was built. On a verbs host it needs a
 // raised locked-memory limit -- see the troubleshooting section of the plugin README.
 //
-// Only the progress-thread-enabled configuration is instantiated. With useProgThread=false there
-// is a single application thread, and a layered provider (verbs;ofi_rxm) establishes its per-peer
-// MSG connection lazily inside the send path: the one thread blocks in rxm_get_conn() waiting for
-// a connection that only it could have progressed. See the plugin README for the details.
+// Only the progress-thread-enabled configuration is instantiated. These tests drive both agents
+// from one thread, and with useProgThread=false nothing progresses an agent while that thread is
+// busy in the other: a provider whose connections are made on demand -- tcp as much as
+// verbs;ofi_rxm -- needs the passive side progressed to accept, so the first send blocks waiting
+// on itself. Real deployments, one agent per process, do not have that problem; verbs rails get
+// FI_PROGRESS_AUTO for exactly that case. See the plugin README for the details.
 NIXL_INSTANTIATE_TEST(libfabric, TestTransfer, "LIBFABRIC", true, 2, 0, "");
 #endif
 NIXL_INSTANTIATE_TEST(ucx_threadpool, TestTransfer, "UCX", true, 6, 4, "");

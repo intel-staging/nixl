@@ -38,6 +38,8 @@
 #include "common/nixl_log.h"
 
 #include <algorithm>
+#include <exception>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -244,28 +246,10 @@ testProviderSelection() {
     NIXL_INFO << "4. Testing getAvailableNetworkDevices()'s selection rule";
 
     /*
-     * getAvailableNetworkDevices() itself needs a real fabric, but the rule it applies is the table
-     * walk plus each entry's select_domains hook, and those are testable. Reproduced here rather
-     * than exported, because what is worth pinning down is the outcome, not the loop.
+     * getAvailableNetworkDevices() itself needs a real fabric, but the rule it applies to what
+     * fi_getinfo reported is selectProvider(), which takes a synthetic map.
      */
-    auto select = [](const ProviderMap &map) -> std::pair<std::string, std::vector<std::string>> {
-        for (const auto *provider : LibfabricUtils::knownProviders()) {
-            std::vector<std::string> domains;
-            if (provider->select_domains != nullptr) {
-                domains = provider->select_domains(map);
-            } else {
-                domains = LibfabricUtils::selectDomainsGeneric(map, provider->name);
-            }
-            if (domains.empty()) {
-                continue;
-            }
-            if (provider->single_domain && domains.size() > 1) {
-                domains.resize(1);
-            }
-            return {provider->name, domains};
-        }
-        return {"none", {}};
-    };
+    auto select = [](const ProviderMap &map) { return LibfabricUtils::selectProvider(map); };
 
     // A RoCE host that also has tcp: verbs must win, which is the behaviour change the table order
     // encodes. Picking tcp here would silently drop to the host stack on real RDMA hardware.
@@ -327,7 +311,25 @@ void
 testLiveVerbsTopology() {
     NIXL_INFO << "5. Testing live topology";
 
-    nixlLibfabricTopology topology;
+    // The same query topology discovery makes. A host with no usable provider (no NIC behind the
+    // hardware providers, or FI_PROVIDER excluding them all) is not a failure of anything tested
+    // here, but the topology constructor throws for it -- so skip only that case, and let a
+    // topology failure on a provider that *was* found count against the run.
+    if (LibfabricUtils::getAvailableNetworkDevices().first == "none") {
+        NIXL_INFO << "   no usable libfabric provider on this host, skipping the live checks";
+        return;
+    }
+
+    std::optional<nixlLibfabricTopology> live;
+    try {
+        live.emplace();
+    }
+    catch (const std::exception &e) {
+        check(false, std::string("topology discovery succeeds when a provider is available: ") +
+                  e.what());
+        return;
+    }
+    nixlLibfabricTopology &topology = *live;
     const std::string provider = topology.getProviderName();
     NIXL_INFO << "   provider: " << provider << ", " << topology.getAllDevices().size()
               << " device(s), " << topology.getTotalNicCount() << " NIC(s) with PCIe info";
@@ -386,7 +388,13 @@ testFallbackPeerRails() {
     NIXL_INFO << "Testing fallback peer rail assignment";
     using V = std::vector<size_t>;
     const size_t none = NIXL_LF_NO_PEER_RAIL;
-    const auto assign = nixlLibfabricRailManager::assignFallbackPeerRails;
+    const auto assign = [](const V &selected,
+                           const V &registered,
+                           const V &peering,
+                           const nixlLibfabricRailUnreachable &unreachable = {}) {
+        return nixlLibfabricRailManager::assignFallbackPeerRails(
+            selected, registered, peering, unreachable);
+    };
 
     // No fabric information: same id wins, even when it is not the rank pairing. On a rail-optimised
     // fabric local rail 2 only reaches peer rail 2, so rank pairing (2->0, 3->1) would hang.
@@ -415,6 +423,54 @@ testFallbackPeerRails() {
 
     check(assign({0, 1}, {}, {}) == V({none, none}),
           "no registered peer rail leaves the rails unassigned rather than indexing an empty list");
+
+    // Rails cabled across (0->1, 1->0), buffer registered on peer rail 0 only. Local rail 0 sits
+    // on peer rail 1's segment, so peer rail 0 is unreachable from it: sharing must not hand it
+    // over, or rail 0 posts into a -FI_EAGAIN retry that never ends.
+    const nixlLibfabricRailUnreachable crossed = {{true, false}, {false, true}};
+    check(assign({0, 1}, {0}, {1, 0}, crossed) == V({none, 0}),
+          "a rail that reaches no registered peer rail is left unassigned, not given another's");
+    check(assign({0, 1}, {0}, {1, 0}) == V({0, 0}),
+          "without reachability information, sharing is unchanged");
+
+    // One subnet, identity pairing, buffers on disjoint rail sets: every pair is reachable, so
+    // the rails take the registered peer rails rather than being dropped for a missing match.
+    const nixlLibfabricRailUnreachable flat(4, std::vector<bool>(4, false));
+    check(assign({0, 1}, {2, 3}, {0, 1, 2, 3}, flat) == V({2, 3}),
+          "on a single segment, an unregistered matched peer rail does not strand the rail");
+
+    // Sharing (step 4) also skips unreachable peer rails: three local rails, peer rails 0 and 1
+    // registered, local rail 2 reaching only peer rail 1.
+    const nixlLibfabricRailUnreachable partial = {
+        {false, false}, {false, false}, {true, false}};
+    check(assign({0, 1, 2}, {0, 1}, {}, partial) == V({0, 1, 1}),
+          "sharing picks among the peer rails a rail can reach");
+
+    // Both local rails on segment A, peer rail 0 on A and peer rail 1 on B: greedy pairing gives
+    // 0->0 and leaves local rail 1 unmatched. Step 2's same-id pairing must not hand it peer
+    // rail 1, which it cannot reach; it shares peer rail 0 instead.
+    const nixlLibfabricRailUnreachable one_segment = {{false, true}, {false, true}};
+    check(assign({0, 1}, {0, 1}, {0, none}, one_segment) == V({0, 0}),
+          "same-id pairing skips a peer rail the rail is known not to reach");
+
+    std::vector<size_t> storage;
+    const auto usable = [&](const V &selected,
+                            const V &registered,
+                            const nixlLibfabricRailUnreachable &unreachable) {
+        return nixlLibfabricRailManager::usableRails(selected, registered, unreachable, storage);
+    };
+    check(usable({0, 1}, {0}, crossed) == V({1}),
+          "usableRails drops a rail that reaches no registered peer rail");
+    check(usable({1, 0}, {0, 1}, crossed) == V({1, 0}),
+          "usableRails keeps every rail, in policy order, when each reaches one");
+    check(usable({0}, {0}, crossed).empty(), "usableRails is empty when no rail is usable");
+    check(usable({0, 1}, {0}, {}) == V({0, 1}),
+          "usableRails keeps every rail without reachability information");
+    const V selected = {0, 1};
+    check(&nixlLibfabricRailManager::usableRails(selected, {0, 1}, crossed, storage) == &selected,
+          "usableRails returns the caller's list, not a copy, when nothing is dropped");
+    check(&nixlLibfabricRailManager::usableRails(selected, {0}, {}, storage) == &selected,
+          "usableRails returns the caller's list at once when no pair is marked unreachable");
 }
 
 int

@@ -344,6 +344,24 @@ providerNeedsFullTopology(const std::string &prov_name) {
     return (provider != nullptr) && provider->needs_full_topology;
 }
 
+std::pair<std::string, std::vector<std::string>>
+selectProvider(const nixlProviderDeviceMap &provider_device_map) {
+    // First table entry with usable domains wins; see knownProviders() for the order and why.
+    for (const nixlLibfabricProviderInfo *provider : knownProviders()) {
+        std::vector<std::string> domains = (provider->select_domains != nullptr) ?
+            provider->select_domains(provider_device_map) :
+            selectDomainsGeneric(provider_device_map, provider->name);
+        if (domains.empty()) {
+            continue;
+        }
+        if (provider->single_domain && domains.size() > 1) {
+            domains.resize(1);
+        }
+        return {provider->name, domains};
+    }
+    return {"none", {}};
+}
+
 std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
 getAvailableNetworkDevices() {
 
@@ -439,20 +457,10 @@ getAvailableNetworkDevices() {
         }
     }
 
-    // First table entry with usable domains wins; see knownProviders() for the order and why.
-    for (const nixlLibfabricProviderInfo *provider : knownProviders()) {
-        std::vector<std::string> domains = (provider->select_domains != nullptr) ?
-            provider->select_domains(provider_device_map) :
-            selectDomainsGeneric(provider_device_map, provider->name);
-        if (domains.empty()) {
-            continue;
-        }
-        if (provider->single_domain && domains.size() > 1) {
-            domains.resize(1);
-        }
-
-        // Selection is a name-filtering problem and stays one, so it remains unit-testable against
-        // synthetic maps. Enrichment is a lookup afterwards.
+    // Selection is a name-filtering problem and stays one, so it remains unit-testable against
+    // synthetic maps. Enrichment is a lookup afterwards.
+    const auto [provider_name, domains] = selectProvider(provider_device_map);
+    if (provider_name != "none") {
         std::vector<nixlLibfabricDeviceInfo> devices;
         devices.reserve(domains.size());
         for (const auto &domain : domains) {
@@ -464,13 +472,13 @@ getAvailableNetworkDevices() {
                 dev.domain_name = domain;
                 devices.push_back(dev);
             }
-            NIXL_TRACE << "Selected " << provider->name << " domain " << devices.back().domain_name
+            NIXL_TRACE << "Selected " << provider_name << " domain " << devices.back().domain_name
                        << " pcie="
                        << (devices.back().pcie_address.empty() ? "unknown"
                                                               : devices.back().pcie_address)
                        << " link_speed=" << devices.back().link_speed;
         }
-        return {provider->name, devices};
+        return {provider_name, devices};
     }
 
     NIXL_ERROR << "No network devices found with any provider";

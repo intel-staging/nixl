@@ -128,7 +128,11 @@ hardware the `ofi_rxm` rail already covers.
 To force a different choice, restrict what libfabric reports rather than looking for a NIXL-specific
 knob — for example `FI_PROVIDER=tcp` or `FI_PROVIDER=^verbs`.
 
-Two notes specific to verbs:
+Three notes specific to verbs:
+
+- verbs works with or without the progress thread. Without it, the rails are opened with
+  `FI_PROGRESS_AUTO`, so `ofi_rxm` accepts peers' connections on its own thread; see *Connection
+  setup with a layered provider and `useProgThread = false`* under troubleshooting.
 
 - verbs does not report a PCIe bus address through libfabric (`bus_type` is `FI_BUS_UNKNOWN`), so the
   plugin resolves each NIC's address through hwloc instead, by looking up the verbs domain name as an
@@ -161,8 +165,25 @@ Nothing new goes on the wire, and every combination was already addressable: `in
 inserts every peer endpoint into every local rail's address vector, so this only changes *which* one a
 transfer uses.
 
-Two consequences worth knowing:
+Four consequences worth knowing:
 
+- **A buffer pair no rail can serve is an error, not a hang.** When a buffer is registered on only
+  some of the peer's rails, a local rail whose matched peer rail is not among them takes another
+  registered peer rail -- but only one it is not known to be unable to reach. A local rail that
+  reaches none of them is left out of that transfer, and if every selected rail is left out,
+  `postXfer()` fails with `NIXL_ERR_BACKEND` before posting anything, instead of retrying
+  `-FI_EAGAIN` forever.
+- **"Known to be unable to reach" is inferred from subnets, and only on a segmented fabric.** A peer
+  rail counts as unreachable from a local rail only when both addresses are readable, the local
+  netmask is known, the local rail shares its subnet with *some* peer rail, and this peer rail is not
+  on that subnet. A local rail with no peer rail on its subnet is taken to be on a routed network
+  and may use any of them, so hosts on different routed subnets are unaffected. The inference is
+  wrong for one mixed layout: a host where one NIC shares a subnet with a peer NIC while its other
+  paths to that peer are routed. There the routed peer rails are treated as unreachable from the
+  NIC that has a same-subnet peer. Usually that only means the NIC uses fewer peer rails than it
+  could. But if a remote buffer is registered only on those routed peer rails and no other local rail
+  of the buffer can reach them, the transfer fails with the error above even though a routed path
+  exists.
 - **Control traffic follows the pairing too.** Notifications and handshakes must *arrive* on the
   peer's rail 0, because that is the only rail with the receive callbacks installed. So they are sent
   from whichever local rail is paired with peer rail 0 (`nixlLibfabricConnection::control_rail_`).
@@ -398,41 +419,29 @@ completion queue by `FI_UNIVERSE_SIZE`, so a default `ulimit -l` of a few megaby
 Check it with `ulimit -l` and raise it to `unlimited` (`memlock` in `/etc/security/limits.conf`, or
 `--ulimit memlock=-1` for a container), as any verbs-based stack requires.
 
-**Transfers hang on a layered provider with `useProgThread = false`:**
+**Connection setup with a layered provider and `useProgThread = false`:**
 
-**A progress thread is still required for verbs.** Enable it (`nixlAgentConfig::useProgThread`, or
-`--enable_pt=1` under nixlbench).
+A layered provider such as `verbs;ofi_rxm` establishes its per-peer MSG connection lazily, and the
+*passive* side must progress it for that connection to be accepted. Two things are needed for that:
 
-A layered provider such as `verbs;ofi_rxm` establishes its per-peer MSG connection lazily and the
-*passive* side must poll its completion queue for that connection to be accepted. Two things are
-needed for that to happen, and only one of them is in place:
-
-- *Which* rails get polled — handled. `progressActiveRails()` used to poll only rail 0 plus rails with
-  a non-zero active refcount, and a target that has posted nothing has no active rails, so any rail
-  above rail 0 was never polled on that side. The provider table now marks such providers
+- *Which* rails get progressed. `progressActiveRails()` used to poll only rail 0 plus rails with a
+  non-zero active refcount, and a target that has posted nothing has no active rails, so any rail
+  above rail 0 was never polled on that side. The provider table marks such providers
   `needs_all_rail_progress` and every rail is polled for them regardless of refcount.
-- *When* progress is called — **not handled.** Without a progress thread the only thing that polls is
-  `progressActiveRails()`, reached from `checkXfer()`/`getNotifs()`. Neither is called during
-  connection and metadata setup, so nothing drains the CQ in that window and the rxm connection
-  never completes.
+- *When* progress happens. Without a progress thread the plugin polls only from
+  `checkXfer()`/`getNotifs()`, and neither is called during connection and metadata setup. So for
+  these providers the rails are opened with `FI_PROGRESS_AUTO` (and `FI_THREAD_SAFE`, which it
+  requires): `ofi_rxm` then runs its own thread per endpoint, asleep in `poll()` on the connection
+  event queue, that accepts connections as they arrive. Data completions are still read by the
+  plugin as before. The log says so per rail: `progresses connection setup on its own thread`.
 
-Measured on two ConnectX-7 RoCE hosts against libfabric 2.2.0rc1: with the progress thread enabled a
-two-host DRAM run completes normally (19.7 GB/s at 4 MB blocks). With it disabled both sides reach
-"All processes are ready to proceed" and stall there — no EAGAIN spin, simply nothing progressing.
-Fixing that properly means driving progress during setup rather than only from the transfer-side
-entry points.
+Before this, a two-host DRAM run on ConnectX-7 RoCE hosts (libfabric 2.2.0rc1) with the progress
+thread disabled reached "All processes are ready to proceed" on both sides and stalled there; with
+it enabled it completed normally (19.7 GB/s at 4 MB blocks). If the provider does not grant
+`FI_PROGRESS_AUTO`, rail creation fails with an error saying so; enable the progress thread
+(`nixlAgentConfig::useProgThread`, or `--enable_pt=1` under nixlbench) or pick another provider with
+`FI_PROVIDER`.
 
 Connectionless RDM providers (`efa`, `cxi`, `tcp`) need no accept and are unaffected.
-
-**A second transfer to the same peer fails with "Handshake from peer ... not received after 60s":**
-
-The inbound handshake that tells an agent its own index at the peer is sent only from
-`loadRemoteConnInfo()`, and only on the path that creates a new connection -- an existing
-connection returns early with "already exists, skipping duplicate loadRemoteConnInfo". So after one
-side calls `invalidateRemoteMD()` and then re-loads the peer's metadata, it creates a fresh
-connection and waits for a handshake the peer will never re-send, because the peer's own connection
-object still exists. The wait times out after `NIXL_LIBFABRIC_HANDSHAKE_TIMEOUT_S` and the transfer
-fails with `NIXL_ERR_REMOTE_DISCONNECT`. This is independent of the provider in use. Until it is
-fixed, do not invalidate and re-load a peer's metadata within the lifetime of an agent pair.
 
 For additional support, check the NIXL documentation and Libfabric provider-specific guides.

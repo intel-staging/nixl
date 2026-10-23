@@ -415,10 +415,15 @@ if nvshmem_available
     nvcc_args += ['-L' + meson.current_build_dir() + '/src/utils']
     nvcc_args += ['-L' + meson.current_build_dir() + '/src/runtime']
     nvcc_args += ['-L' + meson.current_build_dir() + '/src/worker']
-    nvcc_args += ['-lnixl', '-lnixl_build', '-lserdes', '-lcuda', '-lcudart', '-lnvshmem']
+    # -ldl for the dlopen() in neuron.cpp and ze.cpp; part of libc since glibc 2.34
+    nvcc_args += ['-lnixl', '-lnixl_build', '-lserdes', '-lcuda', '-lcudart', '-lnvshmem', '-ldl']
     nvcc_args += args
+    # Every object of utils_lib: utils.cpp calls into neuron.cpp and ze.cpp unconditionally
+    # (their stubs live there too when the runtime is absent)
     nvcc_cmd_files = [
                  meson.current_build_dir() + '/src/utils/libutils.a.p/utils.cpp.o',
+                 meson.current_build_dir() + '/src/utils/libutils.a.p/neuron.cpp.o',
+                 meson.current_build_dir() + '/src/utils/libutils.a.p/ze.cpp.o',
                  meson.current_build_dir() + '/src/runtime/libruntime.a.p/runtime.cpp.o',
                  meson.current_build_dir() + '/src/worker/libworker.a.p/worker.cpp.o',
                  meson.current_build_dir() + '/src/worker/nixl/libnixl_worker.a.p/nixl_worker.cpp.o',

@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "libfabric/libfabric_rail.h"
+#include "libfabric/libfabric_rail_manager.h"
 
 /** Multi-rail connection metadata for remote agents */
 struct nixlLibfabricConnection : public nixlBackendConnMD {
@@ -58,6 +59,13 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
      * order. Empty when the provider's address format cannot be read at all.
      */
     std::vector<size_t> peer_rail_for_local_rail_;
+
+    /**
+     * @brief Which of this peer's rails each local rail is known not to reach, from the same
+     *        computeRailPeering() call. Lets a transfer leave out a local rail that reaches none of
+     *        the peer rails a buffer is registered on; see nixlLibfabricRailUnreachable.
+     */
+    nixlLibfabricRailUnreachable rail_unreachable_;
 
     /**
      * @brief Local rail to send notifications and handshakes from. Defaults to rail 0.

@@ -31,6 +31,26 @@
 /** @brief No peer rail shares this local rail's fabric; fall back to index order. */
 static constexpr size_t NIXL_LF_NO_PEER_RAIL = static_cast<size_t>(-1);
 
+/**
+ * @brief Which peer rails each local rail is known *not* to reach, indexed [local rail][peer rail].
+ *
+ * True only for a local rail that has at least one peer rail on its own segment, and only for the
+ * peer rails that are not: that is a segmented (rail-optimised) fabric, where a NIC reaches the
+ * peer NICs on its subnet and nothing else. A local rail with no peer rail on its segment is more
+ * likely on a routed network, where every peer rail may be reachable, so its row stays false. So
+ * false means "reachable or unknown", and the table is left empty when nothing is marked -- no
+ * readable identities, a routed or single-segment network, or a test supplying none.
+ */
+using nixlLibfabricRailUnreachable = std::vector<std::vector<bool>>;
+
+/** False only where @p unreachable marks peer rail @p peer as unreachable from local rail
+ *  @p rail_id. The one predicate both the fallback assignment and usableRails() apply. */
+inline bool
+railReaches(const nixlLibfabricRailUnreachable &unreachable, size_t rail_id, size_t peer) {
+    return rail_id >= unreachable.size() || peer >= unreachable[rail_id].size() ||
+        !unreachable[rail_id][peer];
+}
+
 // Forward declarations
 class nixlLibfabricTopology;
 class nixlLibfabricRailManager;
@@ -71,9 +91,13 @@ public:
     /** Initialize rail manager with topology discovery and create rails based on available
      * network devices
      * @param striping_threshold Size threshold for enabling multi-rail striping
+     * @param progress_thread_enabled Whether the backend runs a progress thread. Without one, a
+     *        provider that connects lazily has its rails created with FI_PROGRESS_AUTO; see
+     *        nixlLibfabricRail::nixlLibfabricRail()
      * @throws std::runtime_error if initialization fails
      */
-    nixlLibfabricRailManager(size_t striping_threshold);
+    explicit nixlLibfabricRailManager(size_t striping_threshold,
+                                      bool progress_thread_enabled = true);
     /** Destroy rail manager and cleanup all resources */
     ~nixlLibfabricRailManager();
 
@@ -138,12 +162,32 @@ public:
      * @param remote_selected_endpoints Peer rails that registered the buffer, ascending
      * @param peer_rail_for_local_rail computeRailPeering() result: empty when fabric ids were
      *        unreadable, NIXL_LF_NO_PEER_RAIL for a rail with no peer on its fabric
-     * @return Peer rail per entry of @p selected_rails, indexed like it
+     * @param unreachable computeRailPeering() reachability; a peer rail marked unreachable from a
+     *        local rail is never assigned to it
+     * @return Peer rail per entry of @p selected_rails, indexed like it. NIXL_LF_NO_PEER_RAIL for
+     *         a rail that reaches none of @p remote_selected_endpoints -- usableRails() drops those
+     *         before a transfer gets here.
      */
     static std::vector<size_t>
     assignFallbackPeerRails(const std::vector<size_t> &selected_rails,
                             const std::vector<size_t> &remote_selected_endpoints,
-                            const std::vector<size_t> &peer_rail_for_local_rail);
+                            const std::vector<size_t> &peer_rail_for_local_rail,
+                            const nixlLibfabricRailUnreachable &unreachable = {});
+
+    /** The rails of @p selected_rails a transfer to a buffer registered on
+     * @p remote_selected_endpoints can post on: those that reach at least one of those peer rails.
+     * A rail reaching none would post to an address on another segment, which retries -FI_EAGAIN
+     * forever rather than failing. The round-robin rail choice and the caller's FI_MORE flush
+     * precompute must agree on this list, so both call this.
+     * @param storage Filled only when some rail is dropped
+     * @return @p selected_rails itself when every rail is usable (the common case, no copy), else
+     *         @p storage. Empty when no rail is usable.
+     */
+    static const std::vector<size_t> &
+    usableRails(const std::vector<size_t> &selected_rails,
+                const std::vector<size_t> &remote_selected_endpoints,
+                const nixlLibfabricRailUnreachable &unreachable,
+                std::vector<size_t> &storage);
 
     /** Round-robin index of a descriptor into a selection array of `count` entries.
      * batch_write groups NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE consecutive descriptors per entry.
@@ -203,11 +247,14 @@ public:
      * @brief Pairs each local rail with the peer rail on its own fabric segment.
      *
      * @param endpoints The peer's rail endpoint names, in the peer's rail order.
+     * @param unreachable_out Set to which local/peer rail pairs are known to be on different
+     *        segments; see @ref nixlLibfabricRailUnreachable. Empty whenever the result is.
      * @return One entry per local rail: an index into @p endpoints, or @ref NIXL_LF_NO_PEER_RAIL.
      *         Empty if no local rail has a readable fabric identity, which leaves pairing as it was.
      */
     std::vector<size_t>
-    computeRailPeering(const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints) const;
+    computeRailPeering(const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,
+                       nixlLibfabricRailUnreachable &unreachable_out) const;
 
     nixl_status_t
     insertAllAddresses(const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,
@@ -226,6 +273,12 @@ public:
      *  each peer must stamp its writes with a write tag. See providerNeedsWriteTag(). */
     bool
     needsWriteTag() const;
+
+    /** True when the selected provider connects lazily and so needs every rail polled, from a
+     *  progress thread, for a peer's connection to be accepted.
+     *  See providerNeedsAllRailProgress(). */
+    bool
+    needsAllRailProgress() const;
 
     /** Map @p write_tag to @p agent_idx on every rail. See nixlLibfabricRail::mapWriteTag(). */
     void
@@ -252,6 +305,9 @@ public:
      * @param local_mrs Local memory registrations
      * @param remote_keys Remote access keys
      * @param remote_selected_endpoints Selected remote endpoints, where remote keys are registered
+     * @param peer_rail_for_local_rail computeRailPeering() pairing for this peer
+     * @param unreachable computeRailPeering() reachability for this peer; rails reaching none of
+     *        @p remote_selected_endpoints are left out, see usableRails()
      * @param dest_addrs Destination addresses for each rail
      * @param xfer_id Transfer ID for tracking
      * @param completion_callback Callback for completion notification
@@ -280,6 +336,7 @@ public:
                              const std::vector<uint64_t> &remote_keys,
                              const std::vector<size_t> &remote_selected_endpoints,
                              const std::vector<size_t> &peer_rail_for_local_rail,
+                             const nixlLibfabricRailUnreachable &unreachable,
                              const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
                              uint16_t xfer_id,
                              uint8_t write_tag,
@@ -430,6 +487,8 @@ public:
 
 private:
     size_t striping_threshold_;
+    // Whether the backend runs a progress thread; decides FI_PROGRESS_AUTO in createRails().
+    bool progress_thread_enabled_;
 
     /** Mapping type that a VRAM registration requests when it exports a CUDA dmabuf. Auto
      * takes a per-NIC verdict from the PCIe-path topology; ForcePcie and ForceDefault request

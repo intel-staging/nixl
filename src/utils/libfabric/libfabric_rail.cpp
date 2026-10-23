@@ -43,6 +43,28 @@ shmProviderSupportsRuntime(enum fi_hmem_iface runtime) {
     return runtime != FI_HMEM_NEURON;
 }
 
+// Deadline for a post that keeps returning -FI_EAGAIN; see NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S.
+std::chrono::steady_clock::time_point
+eagainDeadline() {
+    return std::chrono::steady_clock::now() +
+        std::chrono::seconds(NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S);
+}
+
+// True, after logging, once @p deadline has passed for an -FI_EAGAIN retry loop.
+bool
+eagainDeadlinePassed(std::chrono::steady_clock::time_point deadline,
+                     const char *op,
+                     uint16_t rail_id,
+                     int attempt) {
+    if (std::chrono::steady_clock::now() < deadline) {
+        return false;
+    }
+    NIXL_ERROR << op << " on rail " << rail_id << " still refused with -FI_EAGAIN after "
+               << NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S << "s (" << attempt
+               << " attempts); giving up";
+    return true;
+}
+
 } // namespace
 
 // RequestPool Base Class Implementation
@@ -408,7 +430,8 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
                                      uint16_t id,
-                                     enum fi_hmem_iface runtime)
+                                     enum fi_hmem_iface runtime,
+                                     bool auto_progress)
     : rail_id(id),
       device_name(device),
       provider_name(provider),
@@ -459,6 +482,18 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
     }
     hints->domain_attr->name = strdup(device_name.c_str());
     hints->domain_attr->threading = FI_THREAD_COMPLETION;
+    if (auto_progress) {
+        /*
+         * ofi_rxm starts a per-endpoint thread for FI_PROGRESS_AUTO that sleeps in poll() on the
+         * endpoint's connection-event queue and accepts peers' connections as they arrive -- what
+         * this backend's progress thread otherwise does by polling every rail. rxm requires
+         * FI_THREAD_SAFE for it, since that thread then shares the endpoint with ours. Data
+         * completions are still read by checkXfer()/getNotifs() as before.
+         */
+        hints->domain_attr->threading = FI_THREAD_SAFE;
+        hints->domain_attr->control_progress = FI_PROGRESS_AUTO;
+        hints->domain_attr->data_progress = FI_PROGRESS_AUTO;
+    }
 
     // The EFA provider accepts FI_MR_DMABUF from libfabric API 1.20 on, so request 1.20
     // where the library provides it and 1.18 elsewhere. The fabric carries the requested
@@ -517,6 +552,20 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             // Provider found with FI_HMEM
             provider_supports_hmem_ = true;
             NIXL_INFO << "Using provider with FI_HMEM support for rail " << rail_id;
+        }
+
+        if (auto_progress && info->domain_attr->data_progress != FI_PROGRESS_AUTO) {
+            NIXL_ERROR << "Provider " << provider << " did not grant FI_PROGRESS_AUTO on rail "
+                       << rail_id << "; without it or a progress thread, connection setup would "
+                       << "stall. Enable the progress thread (nixlAgentConfig::useProgThread, or "
+                       << "--enable_pt=1 under nixlbench), or select another provider with "
+                       << "FI_PROVIDER";
+            throw std::runtime_error("FI_PROGRESS_AUTO not granted for rail " +
+                                     std::to_string(rail_id));
+        }
+        if (auto_progress) {
+            NIXL_INFO << "Rail " << rail_id << ": no progress thread, so " << provider
+                      << " progresses connection setup on its own thread (FI_PROGRESS_AUTO)";
         }
 
         // Create fabric for this rail
@@ -915,7 +964,9 @@ nixlLibfabricRail::progressCompletionQueue() {
         }
     }
 
-    return (ret > 0) ? NIXL_SUCCESS : NIXL_IN_PROG;
+    // A parked post is work still to do: report it as progress so the progress thread retries
+    // promptly instead of sleeping its idle delay.
+    return (ret > 0 || pending_post_) ? NIXL_SUCCESS : NIXL_IN_PROG;
 }
 
 void
@@ -1262,9 +1313,10 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
                << " XFER_ID=" << NIXL_GET_XFER_ID_FROM_IMM(immediate_data)
                << " dest_addr=" << dest_addr << std::dec << " context=" << &req->ctx;
 
-    // Retry indefinitely until senddata succeeds or fails for all providers
+    // Retry until senddata succeeds, fails, or keeps returning -FI_EAGAIN past the deadline
     int ret = -FI_EAGAIN;
     int attempt = 0;
+    const auto deadline = eagainDeadline();
 
     while (true) {
         // Libfabric fi_senddata call
@@ -1294,8 +1346,11 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
         }
 
         if (ret == -FI_EAGAIN) {
-            // Resource temporarily unavailable - retry indefinitely for all providers
+            // Resource temporarily unavailable - retry until the deadline, for all providers
             attempt++;
+            if (eagainDeadlinePassed(deadline, "fi_senddata", rail_id, attempt)) {
+                return NIXL_ERR_BACKEND;
+            }
 
             // Log every N attempts to avoid log spam
             if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {
@@ -1351,7 +1406,15 @@ nixlLibfabricRail::drainPostQueue() {
     // drain the queue up to configured limit,
     // to ensure requests from other rails do not wait too much time
     size_t post_req_count = 0;
-    while (post_req_count < POST_MAX_BATCH_SIZE && post_ring_.pop(pr)) {
+    while (post_req_count < POST_MAX_BATCH_SIZE) {
+        // A post parked by an earlier drain goes first, ahead of anything queued behind it.
+        const bool was_parked = pending_post_.has_value();
+        if (was_parked) {
+            pr = *pending_post_;
+            pending_post_.reset();
+        } else if (!post_ring_.pop(pr)) {
+            break;
+        }
         ++post_req_count;
         int ret = -FI_EAGAIN;
 
@@ -1382,7 +1445,7 @@ nixlLibfabricRail::drainPostQueue() {
             continue;
         }
 
-        while (ret == -FI_EAGAIN) {
+        for (size_t attempt = 0; ret == -FI_EAGAIN && attempt < POST_EAGAIN_RETRIES; ++attempt) {
             if (pr.type == nixlLibfabricPostRequest::WRITE) {
                 struct iovec iov{};
                 iov.iov_base = pr.local_addr;
@@ -1435,6 +1498,31 @@ nixlLibfabricRail::drainPostQueue() {
             }
         }
 
+        /*
+         * Still -FI_EAGAIN: park the request and return rather than spin here. Reaping this rail's
+         * own CQ is not always what clears it -- a lazily connecting provider (verbs;ofi_rxm) may
+         * be waiting for the peer to accept a connection, and the peer's progress thread can be
+         * just as stuck posting on another rail, waiting for this agent to poll *that* one.
+         * Spinning on one rail would deadlock both; returning lets progressActiveRails() visit the
+         * others.
+         * The parked request is retried first next time, so posts keep their order. One still
+         * refused after NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S fails below like any other post error,
+         * so a peer that is gone ends the transfer with an error instead of blocking this rail.
+         */
+        if (ret == -FI_EAGAIN) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!was_parked) {
+                pending_since_ = now;
+            }
+            if (now - pending_since_ < std::chrono::seconds(NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S)) {
+                pending_post_ = pr;
+                return NIXL_SUCCESS;
+            }
+            NIXL_ERROR << "drainPostQueue: post on rail " << rail_id << " still refused with "
+                       << "-FI_EAGAIN after " << NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S
+                       << "s; failing it";
+        }
+
         if (ret != 0) {
             NIXL_ERROR << "drainPostQueue: post failed ret=" << ret << " (" << fi_strerror(-ret)
                        << ") on rail " << rail_id;
@@ -1478,9 +1566,10 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
                << " dest_addr=" << dest_addr << " remote_addr=" << (void *)remote_addr
                << " remote_key=" << remote_key << " context=" << &req->ctx;
 
-    // Retry indefinitely until writedata succeeds or fails for all providers
+    // Retry until the write succeeds, fails, or keeps returning -FI_EAGAIN past the deadline
     int ret = -FI_EAGAIN;
     int attempt = 0;
+    const auto deadline = eagainDeadline();
 
     struct iovec iov{};
 
@@ -1519,8 +1608,11 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
 
         if (ret == -FI_EAGAIN) {
             // SQ full - do inline CQ progress to free slots, then retry
-            // Resource temporarily unavailable - retry indefinitely for all providers
+            // Resource temporarily unavailable - retry until the deadline, for all providers
             attempt++;
+            if (eagainDeadlinePassed(deadline, "fi_writemsg", rail_id, attempt)) {
+                return NIXL_ERR_BACKEND;
+            }
 
             // Log every N attempts to avoid log spam
             if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {
@@ -1574,9 +1666,10 @@ nixlLibfabricRail::postRead(void *local_buffer,
                << " dest_addr=" << dest_addr << " remote_addr=" << (void *)remote_addr
                << " remote_key=" << remote_key << " context=" << &req->ctx;
 
-    // Retry indefinitely until readdata succeeds or fails for all providers
+    // Retry until the read succeeds, fails, or keeps returning -FI_EAGAIN past the deadline
     int ret = -FI_EAGAIN;
     int attempt = 0;
+    const auto deadline = eagainDeadline();
 
     while (true) {
         // Libfabric fi_read call
@@ -1602,8 +1695,11 @@ nixlLibfabricRail::postRead(void *local_buffer,
 
         if (ret == -FI_EAGAIN) {
             // SQ full - do inline CQ progress to free slots, then retry
-            // Resource temporarily unavailable - retry indefinitely for all providers
+            // Resource temporarily unavailable - retry until the deadline, for all providers
             attempt++;
+            if (eagainDeadlinePassed(deadline, "fi_read", rail_id, attempt)) {
+                return NIXL_ERR_BACKEND;
+            }
 
             // Log every N attempts to avoid log spam
             if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {

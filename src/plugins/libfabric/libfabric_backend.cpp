@@ -253,7 +253,7 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
     : nixlBackendEngine(init_params),
       progress_thread_enabled_(init_params->enableProgTh),
       progress_thread_delay_(std::chrono::microseconds(init_params->pthrDelay)),
-      rail_manager_(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD),
+      rail_manager_(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD, init_params->enableProgTh),
       post_thread_count_(NIXL_LIBFABRIC_DEFAULT_POST_THREADS),
       post_split_batch_size_(NIXL_LIBFABRIC_DEFAULT_POST_SPLIT_BATCH_SIZE) {
 
@@ -645,7 +645,8 @@ nixlLibfabricEngine::createAgentConnection(
      * endpoint was just inserted into every local rail's address vector above, so any pairing is
      * addressable; the question is only which one is reachable, and that is what this answers.
      */
-    conn->peer_rail_for_local_rail_ = rail_manager_.computeRailPeering(data_rail_endpoints);
+    conn->peer_rail_for_local_rail_ =
+        rail_manager_.computeRailPeering(data_rail_endpoints, conn->rail_unreachable_);
 
     /*
      * Control traffic has to land on the peer's rail 0, since that is where the notification and
@@ -1130,19 +1131,31 @@ nixlLibfabricEngine::estimateXferCost(const nixl_xfer_op_t &operation,
 
 int
 nixlLibfabricEngine::batchingRail(const nixl_meta_dlist_t &local,
+                                  const nixl_meta_dlist_t &remote,
+                                  const nixlLibfabricConnection &conn,
                                   int desc_idx,
                                   size_t xfer_base_offset) const {
     auto *md = static_cast<nixlLibfabricPrivateMetadata *>(local[desc_idx].metadataP);
-    if (!md || md->selected_rails_.empty()) {
+    auto *remote_md = static_cast<nixlLibfabricPublicMetadata *>(remote[desc_idx].metadataP);
+    if (!md || !remote_md || md->selected_rails_.empty()) {
+        return -1;
+    }
+    std::vector<size_t> storage;
+    const std::vector<size_t> &rails =
+        nixlLibfabricRailManager::usableRails(md->selected_rails_,
+                                              remote_md->remote_selected_endpoints_,
+                                              conn.rail_unreachable_,
+                                              storage);
+    if (rails.empty()) {
         return -1;
     }
     // Striped descriptors are split across their rails and posted without FI_MORE, so they
     // are not part of the single-rail batching tracked here.
-    if (rail_manager_.usesStriping(local[desc_idx].len, md->selected_rails_.size())) {
+    if (rail_manager_.usesStriping(local[desc_idx].len, rails.size())) {
         return -1;
     }
-    return (int)md->selected_rails_[nixlLibfabricRailManager::railSelectionIndex(
-        xfer_base_offset, desc_idx, /*batch_write=*/true, md->selected_rails_.size())];
+    return (int)rails[nixlLibfabricRailManager::railSelectionIndex(
+        xfer_base_offset, desc_idx, /*batch_write=*/true, rails.size())];
 }
 
 bool
@@ -1230,7 +1243,7 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
     std::vector<int> posts_since_flush(rail_manager_.getNumRails(), 0);
     if (batch_writes) {
         for (int i = start_idx; i < end_idx; ++i) {
-            const int rail_id = batchingRail(local, i, xfer_base_offset);
+            const int rail_id = batchingRail(local, remote, *conn, i, xfer_base_offset);
             if (rail_id >= 0) {
                 last_desc_idx_per_rail[rail_id] = i;
             }
@@ -1247,7 +1260,8 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
     std::optional<nixlAccelScope> accel_scope;
 
     for (int desc_idx = start_idx; desc_idx < end_idx; ++desc_idx) {
-        const int rail_id = batch_writes ? batchingRail(local, desc_idx, xfer_base_offset) : -1;
+        const int rail_id =
+            batch_writes ? batchingRail(local, remote, *conn, desc_idx, xfer_base_offset) : -1;
         const bool apply_fi_more =
             useFiMore(desc_idx, rail_id, last_desc_idx_per_rail, posts_since_flush);
 
@@ -1286,6 +1300,7 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
             remote_md->rail_remote_key_list_,
             remote_md->remote_selected_endpoints_,
             conn->peer_rail_for_local_rail_,
+            conn->rail_unreachable_,
             conn->rail_remote_addr_list_,
             backend_handle->post_xfer_id,
             conn->peer_write_tag_.load(std::memory_order_acquire),
@@ -1395,6 +1410,20 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
         if (remote_md->conn_ != conn) {
             NIXL_ERROR << "Connection mismatch for descriptor " << desc_idx;
             return NIXL_ERR_MISMATCH;
+        }
+
+        // A buffer pair no local rail can serve -- every selected rail reaches none of the peer
+        // rails the remote buffer is registered on -- fails here, not halfway through posting.
+        std::vector<size_t> storage;
+        if (nixlLibfabricRailManager::usableRails(local_md->selected_rails_,
+                                                  remote_md->remote_selected_endpoints_,
+                                                  conn->rail_unreachable_,
+                                                  storage)
+                .empty()) {
+            NIXL_ERROR << "Descriptor " << desc_idx << ": none of the "
+                       << local_md->selected_rails_.size() << " local rail(s) of its buffer "
+                       << "reaches a peer rail the remote buffer is registered on";
+            return NIXL_ERR_BACKEND;
         }
     }
 
@@ -1802,11 +1831,11 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
             return NIXL_ERR_BACKEND;
         }
 
-        // Progress rail 0 to ensure the message is sent
+        // Progress the sending rail to ensure the message is sent
         if (!progress_thread_enabled_) {
             status = rail_manager_.getRail(rail_id).progressCompletionQueue();
             if (status != NIXL_SUCCESS && status != NIXL_IN_PROG) {
-                NIXL_ERROR << "Failed to progress rail 0 in notifSendPriv";
+                NIXL_ERROR << "Failed to progress rail " << rail_id << " in notifSendPriv";
                 return status;
             }
         }
@@ -1833,7 +1862,8 @@ nixlLibfabricEngine::notifXferErrorPriv(const std::string &remote_agent,
         connection = it->second;
     }
 
-    const size_t rail_id = 0; // Control messages always travel on rail 0
+    // Send from the rail paired with the peer's rail 0; see nixlLibfabricConnection::control_rail_.
+    const size_t rail_id = connection->control_rail_;
     nixlLibfabricReq *control_request = rail_manager_.getRail(rail_id).allocateControlRequest(
         sizeof(XferErrorPayload), notif_xfer_id);
     if (!control_request) {
@@ -1877,7 +1907,7 @@ nixlLibfabricEngine::notifXferErrorPriv(const std::string &remote_agent,
     if (!progress_thread_enabled_) {
         status = rail_manager_.getRail(rail_id).progressCompletionQueue();
         if (status != NIXL_SUCCESS && status != NIXL_IN_PROG) {
-            NIXL_ERROR << "Failed to progress rail 0 in notifXferErrorPriv";
+            NIXL_ERROR << "Failed to progress rail " << rail_id << " in notifXferErrorPriv";
             return status;
         }
     }

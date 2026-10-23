@@ -57,6 +57,11 @@
 
 // Handshake timeout (seconds) for waiting on peer's inbound handshake
 #define NIXL_LIBFABRIC_HANDSHAKE_TIMEOUT_S 60
+// How long a post may keep returning -FI_EAGAIN before it is failed -- a progress-thread post
+// parked by drainPostQueue(), or a direct postSend/postWrite/postRead retry loop: long enough for a
+// lazily connecting provider to finish connection setup, short of hanging a transfer forever on a
+// peer that is gone. Same bound as the handshake, which waits on the same kind of peer.
+#define NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S 60
 
 // Handshake SerDes tag names
 constexpr const char *NIXL_HANDSHAKE_TAG_VER = "ver";
@@ -598,6 +603,16 @@ selectVerbsDomains(const nixlProviderDeviceMap &provider_device_map);
  */
 std::vector<std::string>
 selectDomainsGeneric(const nixlProviderDeviceMap &provider_device_map, const char *name);
+
+/**
+ * @brief The selection rule getAvailableNetworkDevices() applies to what fi_getinfo reported: the
+ *        first knownProviders() entry with usable domains, through its select_domains hook, cut to
+ *        one domain for a single_domain provider.
+ *
+ * @return The chosen core provider name and its domains in rail order; {"none", {}} if none.
+ */
+std::pair<std::string, std::vector<std::string>>
+selectProvider(const nixlProviderDeviceMap &provider_device_map);
 // String utilities
 std::string
 hexdump(const void *data, size_t size);
