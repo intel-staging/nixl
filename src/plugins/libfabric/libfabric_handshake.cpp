@@ -34,6 +34,10 @@
 //   "conn"     : string = serialized connection info (only if has_conn == 1).
 //                 Included when the peer hasn't sent us a handshake yet,
 //                 meaning they likely don't have our endpoint addresses.
+//   "wtag"     : uint8  = optional, last. The write tag the receiver stamps on its writes to us
+//                 (nixlLibfabricConnection::local_write_tag_). Sent only when our provider cannot
+//                 attribute a remote write by source address; absent means "no tag", which is also
+//                 how a receiver that predates it treats us, as it stops reading before this field.
 //
 // Protocol version 1 sent "idx" (the agent index for imm_data) instead of "ver". It is not
 // interoperable with version 2, so the version check rejects it at connection setup.
@@ -84,6 +88,9 @@ nixlLibfabricEngine::postHandshakeTo(const nixlLibfabricConnection &conn, bool b
     sd.addBuf(NIXL_HANDSHAKE_TAG_HAS_CONN, &has_conn, sizeof(has_conn));
     if (has_conn) {
         sd.addStr(NIXL_HANDSHAKE_TAG_CONN, piggybacked_conn_info);
+    }
+    if (conn.local_write_tag_ != 0) {
+        sd.addBuf(NIXL_HANDSHAKE_TAG_WRITE_TAG, &conn.local_write_tag_, sizeof(conn.local_write_tag_));
     }
     std::string payload = sd.exportStr();
 
@@ -254,9 +261,19 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
             return;
         }
     }
+    // Optional, so only read when it is there; see the wire format above.
+    uint8_t peer_write_tag = 0;
+    if (sd.peekBufLen(NIXL_HANDSHAKE_TAG_WRITE_TAG) == sizeof(peer_write_tag) &&
+        sd.getBuf(NIXL_HANDSHAKE_TAG_WRITE_TAG, &peer_write_tag, sizeof(peer_write_tag)) !=
+            NIXL_SUCCESS) {
+        NIXL_ERROR << "Handshake from '" << peer_agent_name << "' has an unreadable '"
+                   << NIXL_HANDSHAKE_TAG_WRITE_TAG << "' field";
+        return;
+    }
 
     NIXL_DEBUG << "Received handshake from peer '" << peer_agent_name
-               << "' proto_ver=" << peer_proto_ver
+               << "' proto_ver=" << peer_proto_ver << " write_tag="
+               << static_cast<unsigned>(peer_write_tag)
                << " piggybacked_conn_info_len=" << piggybacked_conn_info.size();
 
     // Process the decoded handshake.
@@ -272,7 +289,7 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
     if (!conn) {
         {
             std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
-            pending_inbound_handshakes_.insert(peer_agent_name);
+            pending_inbound_handshakes_[peer_agent_name] = peer_write_tag;
             NIXL_DEBUG << "Buffered handshake from not-yet-known peer '" << peer_agent_name
                        << "'; will apply on createAgentConnection";
         }
@@ -300,6 +317,8 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
         {
             std::lock_guard<std::mutex> hlk(conn->handshake_mutex_);
             had_handshake = conn->handshake_received_.load(std::memory_order_acquire);
+            // Before handshake_received_, which is what lets us start writing to the peer.
+            conn->peer_write_tag_.store(peer_write_tag, std::memory_order_release);
             conn->handshake_received_.store(true, std::memory_order_release);
         }
         conn->handshake_cv_.notify_all();

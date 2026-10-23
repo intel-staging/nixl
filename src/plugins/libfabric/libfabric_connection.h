@@ -70,6 +70,22 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
      * while making the departure side reachable.
      */
     size_t control_rail_ = 0;
+
+    /**
+     * @brief Write tags, for providers whose remote-write completions carry no usable source address.
+     *
+     * A target must know which peer each of its incoming writes came from, to credit it to that
+     * peer's pending notification. It normally learns that from the completion's source address,
+     * but ofi_rxm reports none for a write (see providerNeedsWriteTag()). On such a provider each
+     * agent hands every peer a tag in its handshake, and the peer stamps it on the writes it sends
+     * back. 0 means no tag: the target resolves the source address as usual.
+     *
+     * local_write_tag_ is the tag we handed this peer, mapped on our rails to its agent index and
+     * released on disconnect. peer_write_tag_ is the one it handed us, stamped on our writes to it;
+     * set from its handshake (or to local_write_tag_ for the self-connection), before any write.
+     */
+    uint8_t local_write_tag_ = 0;
+    std::atomic<uint8_t> peer_write_tag_{0};
     std::atomic<ConnectionState> overall_state_; // Current connection state
 
     // Set once the peer holds our endpoints in its AV, so it can attribute our traffic.

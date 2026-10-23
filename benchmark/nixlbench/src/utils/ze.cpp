@@ -95,8 +95,19 @@ public:
     alloc(void **addr, size_t size, int devid) {
         if (!validDevice(devid)) return ZE_RESULT_ERROR_INVALID_ARGUMENT;
 
+        /* Allocate as dma-buf exportable. The NIC reaches this memory through the dma-buf libfabric
+           exports, and without this the driver may compress the allocation (it does when the
+           context holds a single device, e.g. under ZE_AFFINITY_MASK): the GPU still reads its own
+           data back, but the NIC sees the raw compressed bytes and transfers garbage. It also keeps
+           the allocation out of the driver's USM pool, whose shared BO the export would hand out
+           with the wrong offset. */
+        ze_external_memory_export_desc_t export_desc = {};
+        export_desc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_DESC;
+        export_desc.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
+
         ze_device_mem_alloc_desc_t desc = {};
         desc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+        desc.pNext = &export_desc;
         desc.ordinal = 0;
 
         ze_result_t r =

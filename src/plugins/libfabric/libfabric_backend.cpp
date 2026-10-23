@@ -325,6 +325,13 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
             NIXL_DEBUG << "Set XFER_ID callback for rail " << rail_id;
         }
 
+        assign_write_tags_ = rail_manager_.needsWriteTag();
+        if (assign_write_tags_) {
+            NIXL_INFO << "Provider reports no source address for remote writes; peers will tag "
+                         "their writes to this agent (at most "
+                      << NIXL_LIBFABRIC_MAX_WRITE_TAG << " connected agents)";
+        }
+
         // Create self-connection
         std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> data_endpoints(
             rail_manager_.getNumRails());
@@ -560,6 +567,7 @@ nixlLibfabricEngine::disconnect(const std::string &remote_agent) {
     // reconnect would look like two agents claiming one address.
     rail_manager_.unmapAgentAddresses(it->second->rail_remote_addr_list_,
                                       static_cast<uint32_t>(it->second->agent_index_));
+    releaseWriteTag(*it->second);
     connections_.erase(it);
     return status;
 }
@@ -598,6 +606,24 @@ nixlLibfabricEngine::createAgentConnection(
     // next peer. The dead name a failure leaves is harmless: agent_names_ is used for its size.
     agent_names_.push_back(agent_name);
 
+    if (assign_write_tags_) {
+        conn->local_write_tag_ = allocateWriteTag();
+        if (conn->local_write_tag_ == 0) {
+            NIXL_ERROR << "Cannot connect to agent " << agent_name << ": all "
+                       << NIXL_LIBFABRIC_MAX_WRITE_TAG
+                       << " write tags are in use. This provider reports no source address for "
+                          "remote writes, so it supports at most that many connected agents";
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+        // Mapped before our handshake goes out: the peer only writes to us after receiving it.
+        rail_manager_.mapWriteTag(conn->local_write_tag_,
+                                  static_cast<uint32_t>(conn->agent_index_));
+        if (agent_name == localAgent) {
+            // Our writes to ourselves are attributed by the tag we just handed ourselves.
+            conn->peer_write_tag_.store(conn->local_write_tag_, std::memory_order_release);
+        }
+    }
+
     conn->rail_remote_addr_list_.reserve(rail_manager_.getNumRails());
 
     // Process all rails in one operation
@@ -610,6 +636,7 @@ nixlLibfabricEngine::createAgentConnection(
                                          conn->src_ep_names_);
     if (data_status != NIXL_SUCCESS) {
         NIXL_ERROR << "insertAllAddresses failed for rails with status: " << data_status;
+        releaseWriteTag(*conn);
         return data_status;
     }
 
@@ -646,10 +673,16 @@ nixlLibfabricEngine::createAgentConnection(
     // them locally.
     if (agent_name != localAgent) {
         bool buffered = false;
+        uint8_t buffered_write_tag = 0;
         std::optional<uint16_t> rejected_ver;
         {
             std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
-            buffered = (pending_inbound_handshakes_.erase(agent_name) > 0);
+            auto inbound = pending_inbound_handshakes_.find(agent_name);
+            if (inbound != pending_inbound_handshakes_.end()) {
+                buffered = true;
+                buffered_write_tag = inbound->second;
+                pending_inbound_handshakes_.erase(inbound);
+            }
             auto rejected = pending_rejected_handshakes_.find(agent_name);
             if (rejected != pending_rejected_handshakes_.end()) {
                 rejected_ver = rejected->second;
@@ -664,6 +697,7 @@ nixlLibfabricEngine::createAgentConnection(
         if (buffered) {
             {
                 std::lock_guard<std::mutex> hlk(conn->handshake_mutex_);
+                conn->peer_write_tag_.store(buffered_write_tag, std::memory_order_release);
                 conn->handshake_received_.store(true, std::memory_order_release);
             }
             conn->handshake_cv_.notify_all();
@@ -675,6 +709,28 @@ nixlLibfabricEngine::createAgentConnection(
               << rail_manager_.getNumRails() << " rails";
 
     return NIXL_SUCCESS;
+}
+
+uint8_t
+nixlLibfabricEngine::allocateWriteTag() {
+    for (size_t tried = 0; tried < NIXL_LIBFABRIC_MAX_WRITE_TAG; ++tried) {
+        const uint8_t tag = next_write_tag_;
+        next_write_tag_ = (tag == NIXL_LIBFABRIC_MAX_WRITE_TAG) ? 1 : tag + 1;
+        if (!write_tags_in_use_.test(tag)) {
+            write_tags_in_use_.set(tag);
+            return tag;
+        }
+    }
+    return 0;
+}
+
+void
+nixlLibfabricEngine::releaseWriteTag(const nixlLibfabricConnection &conn) {
+    if (conn.local_write_tag_ == 0) {
+        return;
+    }
+    rail_manager_.unmapWriteTag(conn.local_write_tag_, static_cast<uint32_t>(conn.agent_index_));
+    write_tags_in_use_.reset(conn.local_write_tag_);
 }
 
 nixl_status_t
@@ -1232,6 +1288,7 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
             conn->peer_rail_for_local_rail_,
             conn->rail_remote_addr_list_,
             backend_handle->post_xfer_id,
+            conn->peer_write_tag_.load(std::memory_order_acquire),
             [backend_handle](nixl_status_t status) {
                 backend_handle->complete_request(status);
             }, // Completion callback

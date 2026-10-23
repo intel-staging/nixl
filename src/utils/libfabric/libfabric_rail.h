@@ -18,6 +18,7 @@
 #ifndef NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_H
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_H
 
+#include <array>
 #include <vector>
 #include <deque>
 #include <limits>
@@ -493,6 +494,20 @@ public:
     [[nodiscard]] uint32_t
     resolveSourceAddress(fi_addr_t src_addr) const;
 
+    /** Map a write tag this agent handed a peer (see nixlLibfabricConnection::local_write_tag_)
+     *  to that peer's agent index. */
+    void
+    mapWriteTag(uint8_t write_tag, uint32_t agent_idx) const;
+
+    /** Drop a write tag's mapping if it still names agent_idx. */
+    void
+    unmapWriteTag(uint8_t write_tag, uint32_t agent_idx) const;
+
+    /** Resolve the write tag of a remote write's imm_data to a local agent index. Returns
+     *  kUnknownAgentIdx if it is unmapped; callers must then drop it. */
+    [[nodiscard]] uint32_t
+    resolveWriteTag(uint8_t write_tag) const;
+
     // Memory descriptor helper methods
     /** Get libfabric memory descriptor for MR */
     void *
@@ -666,6 +681,11 @@ private:
     // FI_AV_TABLE). Written at connection setup, read on the completion path.
     mutable std::vector<uint32_t> src_addr_to_agent_;
     mutable std::shared_mutex src_addr_mutex_;
+
+    // Write tag -> local agent index, for remote writes that carry one instead of a usable source
+    // address (see providerNeedsWriteTag()). Slot 0 is "no tag" and stays unmapped. Guarded by
+    // src_addr_mutex_.
+    mutable std::array<uint32_t, NIXL_LIBFABRIC_MAX_WRITE_TAG + 1> write_tag_to_agent_;
 
     // Separate request pools for optimal performance
     ControlRequestPool control_request_pool_;

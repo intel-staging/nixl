@@ -222,6 +222,19 @@ public:
     unmapAgentAddresses(const std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs,
                         uint32_t agent_idx);
 
+    /** True when this agent's rails cannot attribute a remote write by its source address, so
+     *  each peer must stamp its writes with a write tag. See providerNeedsWriteTag(). */
+    bool
+    needsWriteTag() const;
+
+    /** Map @p write_tag to @p agent_idx on every rail. See nixlLibfabricRail::mapWriteTag(). */
+    void
+    mapWriteTag(uint8_t write_tag, uint32_t agent_idx);
+
+    /** Drop @p write_tag's mapping on every rail if it still names @p agent_idx. */
+    void
+    unmapWriteTag(uint8_t write_tag, uint32_t agent_idx);
+
     /** Clean up connection resources for rails
      * @param fi_addrs_to_remove Libfabric addresses to remove
      * @return NIXL_SUCCESS on success, error code on failure
@@ -242,6 +255,8 @@ public:
      * @param dest_addrs Destination addresses for each rail
      * @param xfer_id Transfer ID for tracking
      * @param completion_callback Callback for completion notification
+     * @param write_tag Tag the target assigned us for its write attribution, carried in each
+     *        write's imm_data; 0 when it assigned none. Ignored for READ.
      * @param submitted_count_out Number of requests successfully submitted
      * @param desc_idx Index of current descriptor within the transfer
      * @param base_offset Pre-reserved round-robin offset from reserveBaseOffset()
@@ -267,6 +282,7 @@ public:
                              const std::vector<size_t> &peer_rail_for_local_rail,
                              const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
                              uint16_t xfer_id,
+                             uint8_t write_tag,
                              std::function<void(nixl_status_t)> completion_callback,
                              size_t &submitted_count_out,
                              int desc_idx,
@@ -277,6 +293,7 @@ public:
     void
     deferTransferRequest(nixlLibfabricReq::OpType op_type,
                          uint16_t xfer_id,
+                         uint8_t write_tag,
                          uint64_t fi_flags,
                          fi_addr_t dest_addr,
                          const struct nfi_hmem_info &hmem_info,

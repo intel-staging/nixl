@@ -205,6 +205,7 @@ const nixlLibfabricProviderInfo k_cxi_provider = {
     /*needs_prov_name_hint=*/false,
     /*needs_full_topology=*/true,
     /*needs_all_rail_progress=*/false,
+    /*needs_write_tag=*/false,
     /*single_domain=*/false,
     /*select_domains=*/nullptr,
 };
@@ -218,6 +219,7 @@ const nixlLibfabricProviderInfo k_efa_provider = {
     /*needs_prov_name_hint=*/false,
     /*needs_full_topology=*/true,
     /*needs_all_rail_progress=*/false,
+    /*needs_write_tag=*/false,
     /*single_domain=*/false,
     /*select_domains=*/nullptr,
 };
@@ -232,6 +234,8 @@ const nixlLibfabricProviderInfo k_verbs_provider = {
     /*needs_full_topology=*/true,
     // Layered over a connection-oriented core, so the passive side must poll for the accept.
     /*needs_all_rail_progress=*/true,
+    // ofi_rxm gives a remote write no usable source address; see providerNeedsWriteTag().
+    /*needs_write_tag=*/true,
     /*single_domain=*/false,
     /*select_domains=*/selectVerbsDomains,
 };
@@ -245,6 +249,7 @@ const nixlLibfabricProviderInfo k_tcp_provider = {
     /*needs_prov_name_hint=*/false,
     /*needs_full_topology=*/false,
     /*needs_all_rail_progress=*/false,
+    /*needs_write_tag=*/false,
     /*single_domain=*/true,
     /*select_domains=*/nullptr,
 };
@@ -258,6 +263,7 @@ const nixlLibfabricProviderInfo k_sockets_provider = {
     /*needs_prov_name_hint=*/false,
     /*needs_full_topology=*/false,
     /*needs_all_rail_progress=*/false,
+    /*needs_write_tag=*/false,
     /*single_domain=*/true,
     /*select_domains=*/nullptr,
 };
@@ -324,6 +330,12 @@ bool
 providerNeedsAllRailProgress(const std::string &prov_name) {
     const nixlLibfabricProviderInfo *provider = findProviderInfo(prov_name);
     return (provider != nullptr) && provider->needs_all_rail_progress;
+}
+
+bool
+providerNeedsWriteTag(const std::string &prov_name) {
+    const nixlLibfabricProviderInfo *provider = findProviderInfo(prov_name);
+    return (provider != nullptr) && provider->needs_write_tag;
 }
 
 bool

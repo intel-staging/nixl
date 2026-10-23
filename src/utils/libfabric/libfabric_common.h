@@ -65,6 +65,8 @@ constexpr const char *NIXL_HANDSHAKE_TAG_V1_IDX = "idx";
 constexpr const char *NIXL_HANDSHAKE_TAG_NAME = "name";
 constexpr const char *NIXL_HANDSHAKE_TAG_HAS_CONN = "has_conn";
 constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
+// Optional, last: the write tag the receiver of this handshake puts in imm_data for writes to us.
+constexpr const char *NIXL_HANDSHAKE_TAG_WRITE_TAG = "wtag";
 
 // Wire-protocol version of the libfabric plugin, exchanged in the handshake. Bump it on any
 // incompatible imm_data or control-message change. 1: 8-bit agent index in imm_data (sends
@@ -72,8 +74,12 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 #define NIXL_LIBFABRIC_PROTO_VERSION 2u
 
 // The immediate data associated with an RDMA operation is 32 bits and is divided as follows:
-// | 4-bit MSG TYPE flag | 8-bit RESERVED | 16-bit XFER_ID | 4-bit SEQ_ID |
-// RESERVED held the 8-bit peer agent index in protocol version 1; it must now be zero.
+// | 4-bit MSG TYPE flag | 8-bit WRITE TAG | 16-bit XFER_ID | 4-bit SEQ_ID |
+// WRITE TAG held the 8-bit peer agent index in protocol version 1. It is zero unless the target
+// handed us a nonzero tag in its handshake ("wtag"), which it does only when its provider cannot
+// report the source address of a remote write (verbs;ofi_rxm). Tag t means the target's agent
+// index t - 1 for us; zero means "resolve from the source address". See
+// nixlLibfabricConnection::write_tag_.
 
 // Optimized bit field constants (compile-time computed)
 #define NIXL_MSG_TYPE_BITS 4
@@ -105,6 +111,7 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 // Single-operation immediate data extraction (no intermediate shifts)
 #define NIXL_GET_MSG_TYPE_FROM_IMM(data) ((data) & NIXL_MSG_TYPE_MASK)
 #define NIXL_GET_IMM_RESERVED(data) (((data) >> NIXL_IMM_RESERVED_SHIFT) & NIXL_IMM_RESERVED_MASK)
+#define NIXL_GET_WRITE_TAG_FROM_IMM(data) NIXL_GET_IMM_RESERVED(data)
 #define NIXL_GET_XFER_ID_FROM_IMM(data) (((data) >> NIXL_XFER_ID_SHIFT) & NIXL_XFER_ID_MASK)
 #define NIXL_GET_SEQ_ID_FROM_IMM(data) (((data) >> NIXL_SEQ_ID_SHIFT) & NIXL_SEQ_ID_MASK)
 
@@ -113,6 +120,14 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
     (((uint64_t)(msg_type) & NIXL_MSG_TYPE_MASK) |                       \
      (((uint64_t)(xfer_id) & NIXL_XFER_ID_MASK) << NIXL_XFER_ID_SHIFT) | \
      (((uint64_t)(seq_id) & NIXL_SEQ_ID_MASK) << NIXL_SEQ_ID_SHIFT))
+
+// Same, with the target-assigned write tag (0 = none) in the WRITE TAG field.
+#define NIXL_MAKE_TAGGED_IMM_DATA(msg_type, write_tag, xfer_id, seq_id) \
+    (NIXL_MAKE_IMM_DATA(msg_type, xfer_id, seq_id) |                   \
+     (((uint64_t)(write_tag) & NIXL_IMM_RESERVED_MASK) << NIXL_IMM_RESERVED_SHIFT))
+
+// Largest write tag: tags are 1-based, so they cover agent indices 0..254.
+#define NIXL_LIBFABRIC_MAX_WRITE_TAG NIXL_IMM_RESERVED_MASK
 
 #define NIXL_LIBFABRIC_CQ_BATCH_SIZE 16
 
@@ -413,6 +428,12 @@ struct nixlLibfabricProviderInfo {
     bool needs_all_rail_progress;
 
     /**
+     * @brief Whether a remote write must name its sender in imm_data -- see
+     *        @ref providerNeedsWriteTag.
+     */
+    bool needs_write_tag;
+
+    /**
      * @brief Whether to use only the first domain found rather than one rail per domain.
      *
      * True for tcp and sockets, where every domain reaches every peer and extra rails would only
@@ -518,6 +539,19 @@ sameFabric(const nixlLibfabricFabricId &local, const nixlLibfabricFabricId &peer
  */
 bool
 providerNeedsAllRailProgress(const std::string &prov_name);
+
+/**
+ * @brief True when a remote-write completion does not identify its sender by source address.
+ *
+ * The receiver matches each write to its peer's pending notification by the completion's source
+ * address. ofi_rxm (verbs) does not set one for a write: libfabric up to at least 1.22 leaves
+ * whatever an earlier completion put in that CQ slot, later versions report FI_ADDR_NOTAVAIL. Either
+ * way the write is credited to the wrong peer or dropped and the notification never completes. A
+ * receiver on such a provider gives each peer a tag in its handshake, and the peer puts it in the
+ * write's imm_data instead.
+ */
+bool
+providerNeedsWriteTag(const std::string &prov_name);
 
 /**
  * @brief True when this provider does hwloc topology discovery and accelerator-to-NIC grouping.
