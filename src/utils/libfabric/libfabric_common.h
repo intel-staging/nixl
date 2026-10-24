@@ -57,6 +57,11 @@
 
 // Handshake timeout (seconds) for waiting on peer's inbound handshake
 #define NIXL_LIBFABRIC_HANDSHAKE_TIMEOUT_S 60
+// How long a post may keep returning -FI_EAGAIN before it is failed -- a progress-thread post
+// parked by drainPostQueue(), or a direct postSend/postWrite/postRead retry loop: long enough for a
+// lazily connecting provider to finish connection setup, short of hanging a transfer forever on a
+// peer that is gone. Same bound as the handshake, which waits on the same kind of peer.
+#define NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S 60
 
 // Handshake SerDes tag names
 constexpr const char *NIXL_HANDSHAKE_TAG_VER = "ver";
@@ -65,6 +70,8 @@ constexpr const char *NIXL_HANDSHAKE_TAG_V1_IDX = "idx";
 constexpr const char *NIXL_HANDSHAKE_TAG_NAME = "name";
 constexpr const char *NIXL_HANDSHAKE_TAG_HAS_CONN = "has_conn";
 constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
+// Optional, last: the write tag the receiver of this handshake puts in imm_data for writes to us.
+constexpr const char *NIXL_HANDSHAKE_TAG_WRITE_TAG = "wtag";
 
 // Wire-protocol version of the libfabric plugin, exchanged in the handshake. Bump it on any
 // incompatible imm_data or control-message change. 1: 8-bit agent index in imm_data (sends
@@ -72,8 +79,12 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 #define NIXL_LIBFABRIC_PROTO_VERSION 2u
 
 // The immediate data associated with an RDMA operation is 32 bits and is divided as follows:
-// | 4-bit MSG TYPE flag | 8-bit RESERVED | 16-bit XFER_ID | 4-bit SEQ_ID |
-// RESERVED held the 8-bit peer agent index in protocol version 1; it must now be zero.
+// | 4-bit MSG TYPE flag | 8-bit WRITE TAG | 16-bit XFER_ID | 4-bit SEQ_ID |
+// WRITE TAG held the 8-bit peer agent index in protocol version 1. It is zero unless the target
+// handed us a nonzero tag in its handshake ("wtag"), which it does only when its provider cannot
+// report the source address of a remote write (verbs;ofi_rxm). Tag t means the target's agent
+// index t - 1 for us; zero means "resolve from the source address". See
+// nixlLibfabricConnection::write_tag_.
 
 // Optimized bit field constants (compile-time computed)
 #define NIXL_MSG_TYPE_BITS 4
@@ -105,6 +116,7 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 // Single-operation immediate data extraction (no intermediate shifts)
 #define NIXL_GET_MSG_TYPE_FROM_IMM(data) ((data) & NIXL_MSG_TYPE_MASK)
 #define NIXL_GET_IMM_RESERVED(data) (((data) >> NIXL_IMM_RESERVED_SHIFT) & NIXL_IMM_RESERVED_MASK)
+#define NIXL_GET_WRITE_TAG_FROM_IMM(data) NIXL_GET_IMM_RESERVED(data)
 #define NIXL_GET_XFER_ID_FROM_IMM(data) (((data) >> NIXL_XFER_ID_SHIFT) & NIXL_XFER_ID_MASK)
 #define NIXL_GET_SEQ_ID_FROM_IMM(data) (((data) >> NIXL_SEQ_ID_SHIFT) & NIXL_SEQ_ID_MASK)
 
@@ -113,6 +125,14 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
     (((uint64_t)(msg_type) & NIXL_MSG_TYPE_MASK) |                       \
      (((uint64_t)(xfer_id) & NIXL_XFER_ID_MASK) << NIXL_XFER_ID_SHIFT) | \
      (((uint64_t)(seq_id) & NIXL_SEQ_ID_MASK) << NIXL_SEQ_ID_SHIFT))
+
+// Same, with the target-assigned write tag (0 = none) in the WRITE TAG field.
+#define NIXL_MAKE_TAGGED_IMM_DATA(msg_type, write_tag, xfer_id, seq_id) \
+    (NIXL_MAKE_IMM_DATA(msg_type, xfer_id, seq_id) |                   \
+     (((uint64_t)(write_tag) & NIXL_IMM_RESERVED_MASK) << NIXL_IMM_RESERVED_SHIFT))
+
+// Largest write tag: tags are 1-based, so they cover agent indices 0..254.
+#define NIXL_LIBFABRIC_MAX_WRITE_TAG NIXL_IMM_RESERVED_MASK
 
 #define NIXL_LIBFABRIC_CQ_BATCH_SIZE 16
 
@@ -313,9 +333,286 @@ resetSeqId();
 
 // Utility functions
 namespace LibfabricUtils {
-// Device discovery with fallback to sockets
-std::pair<std::string, std::vector<std::string>>
+/**
+ * @brief One libfabric domain as device discovery saw it.
+ *
+ * Everything the topology layer needs about a NIC, harvested during the single fi_getinfo() that
+ * selects the provider. There used to be a second fi_getinfo() in
+ * nixlLibfabricTopology::buildPcieToLibfabricMapping() purely to read these two fields back off the
+ * same devices, with different hints -- which meant the two queries could disagree about which
+ * domains exist, and needed a per-provider flag to paper over one provider's reaction to the
+ * difference. One query cannot disagree with itself.
+ */
+struct nixlLibfabricDeviceInfo {
+    /** @brief libfabric domain name, i.e. the name a rail is created on. */
+    std::string domain_name;
+
+    /**
+     * @brief PCIe address in hwloc's "%x:%02x:%02x.%x" normalisation, or empty.
+     *
+     * Empty when libfabric reported no usable bus info -- verbs leaves bus_attr at FI_BUS_UNKNOWN.
+     * Resolving that fallback needs hwloc, so it happens in the topology layer rather than here.
+     */
+    std::string pcie_address;
+
+    /** @brief Link speed in bits/s from nic->link_attr, or 0 if libfabric reported none. */
+    size_t link_speed = 0;
+};
+
+/**
+ * @brief Selects a provider and returns its usable domains, with fallback to tcp/sockets.
+ *
+ * @return The chosen core provider name and one entry per domain that will become a rail, in rail
+ *         order. {"none", {}} when nothing usable was found.
+ */
+std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
 getAvailableNetworkDevices();
+
+/**
+ * @brief The core provider part of a libfabric prov_name.
+ *
+ * A prov_name may name a stack of layered providers, e.g. "verbs;ofi_rxm". Everything before
+ * the first ';' is the core provider. Returns @p prov_name unchanged when it is not layered.
+ */
+std::string
+baseProviderName(const std::string &prov_name);
+
+/** @brief prov_name → domain names, as gathered from fi_getinfo. */
+using nixlProviderDeviceMap = std::unordered_map<std::string, std::vector<std::string>>;
+
+/**
+ * @brief Everything the plugin knows about one core libfabric provider.
+ *
+ * The provider analogue of libfabric_hmem.cpp's accelerator vendor table, and it exists for the
+ * same reason: provider-specific behaviour used to be seven independent `provider == "..."`
+ * comparisons spread across device discovery, rail setup, topology discovery and CQ progress, so
+ * adding a provider meant finding all seven. Now it is one table entry.
+ *
+ * Table order is the preference order used by @ref getAvailableNetworkDevices.
+ */
+struct nixlLibfabricProviderInfo {
+    /** @brief Core provider name, as it appears before any ';' in a libfabric prov_name. */
+    const char *name;
+
+    /** @brief Human-readable name for the discovery log line. */
+    const char *description;
+
+    /** @brief Extra capability bits OR'd into a rail's hints->caps. FI_RMA_EVENT for cxi. */
+    uint64_t extra_caps;
+
+    /** @brief hints->domain_attr->mr_mode for a rail of this provider. */
+    uint64_t mr_mode;
+
+    /** @brief hints->domain_attr->mr_key_size for a rail. 0 leaves the choice to the provider. */
+    size_t mr_key_size;
+
+    /**
+     * @brief Whether a rail must name this provider in hints->fabric_attr->prov_name.
+     *
+     * Normally the domain name identifies one provider on its own. verbs is the exception: an
+     * InfiniBand device is offered by both verbs and psm3 under the same domain name, and psm3 is
+     * returned first, so without the hint a rail comes up on whichever libfabric happened to list
+     * first. Asking for the core name is correct even though the RDM endpoint arrives as
+     * "verbs;ofi_rxm" -- verbs has no native RDM endpoint, so libfabric layers ofi_rxm on top of
+     * the name asked for.
+     */
+    bool needs_prov_name_hint;
+
+    /**
+     * @brief Whether rails are chosen by PCIe proximity to an accelerator.
+     *
+     * True for the RDMA providers (efa, cxi, verbs), which do hwloc topology discovery and
+     * accelerator-to-NIC grouping. False for tcp and sockets, which reach every peer through the
+     * host stack, so there is nothing for grouping to optimise.
+     */
+    bool needs_full_topology;
+
+    /**
+     * @brief Whether @ref providerNeedsAllRailProgress applies -- see that function for why.
+     */
+    bool needs_all_rail_progress;
+
+    /**
+     * @brief Whether a remote write must name its sender in imm_data -- see
+     *        @ref providerNeedsWriteTag.
+     */
+    bool needs_write_tag;
+
+    /**
+     * @brief Whether to use only the first domain found rather than one rail per domain.
+     *
+     * True for tcp and sockets, where every domain reaches every peer and extra rails would only
+     * multiply host-stack copies.
+     */
+    bool single_domain;
+
+    /**
+     * @brief Provider-specific domain selection, or nullptr for the generic rule.
+     *
+     * The generic rule takes every domain whose prov_name has this entry's @ref name as its core
+     * provider, de-duplicated, in the order fi_getinfo returned them. Set this only for a provider
+     * that needs more; see @ref selectVerbsDomains.
+     */
+    std::vector<std::string> (*select_domains)(const nixlProviderDeviceMap &);
+};
+
+/**
+ * @brief The provider table, in preference order (highest first).
+ */
+const std::vector<const nixlLibfabricProviderInfo *> &
+knownProviders();
+
+/**
+ * @brief Table entry for @p prov_name, or nullptr if it is not one the plugin knows.
+ *
+ * Accepts a layered prov_name ("verbs;ofi_rxm") as well as a core name ("verbs").
+ */
+const nixlLibfabricProviderInfo *
+findProviderInfo(const std::string &prov_name);
+
+/**
+ * @brief Settings for a provider with no table entry: the plain-RDMA defaults that suited efa.
+ *
+ * Lets callers hold a non-null entry unconditionally instead of testing for one, so an unlisted
+ * provider still gets a working rail rather than a special code path.
+ */
+const nixlLibfabricProviderInfo &
+defaultProviderInfo();
+
+/**
+ * @brief A rail's position on the fabric, for pairing local rails with a peer's rails.
+ *
+ * Rails are addressed by index, and a transfer pairs local rail *k* with the peer's rail *k*. That is
+ * only correct if both agents enumerate rails onto the same fabrics in the same order, which nothing
+ * guarantees: libfabric domain names are host-local (one host calls a NIC `mlx5_0`, another calls the
+ * same model `rocep153s0f0`), and the cabling need not follow the naming. When the assumption breaks,
+ * rail *k* posts to a peer NIC on a different segment; the address is unreachable rather than
+ * invalid, so the write retries -FI_EAGAIN forever instead of failing.
+ *
+ * This is the identity used to pair rails by where they actually are instead. It is derived from the
+ * endpoint name the peer already sends during connection setup, so nothing new goes on the wire.
+ */
+struct nixlLibfabricFabricId {
+    /** @brief Whether @ref addr holds a usable identity. False for address formats we cannot read. */
+    bool valid = false;
+    /** @brief IPv4 address of the rail's NIC, network byte order. */
+    uint32_t addr = 0;
+    /** @brief Netmask of the local interface owning @ref addr, or 0 if unknown (peer identities). */
+    uint32_t mask = 0;
+};
+
+/**
+ * @brief Extracts a @ref nixlLibfabricFabricId from a libfabric endpoint name.
+ *
+ * @param addr_format The provider's fi_info::addr_format. Only the sockaddr formats can be read;
+ *                    anything else yields an invalid id, which makes pairing fall back to index
+ *                    order. efa and cxi use opaque formats and are unaffected -- they also do not
+ *                    need this, since their rails are enumerated consistently across hosts.
+ * @param ep_name Endpoint name bytes as produced by fi_getname().
+ * @param len Length of @p ep_name in bytes.
+ */
+nixlLibfabricFabricId
+fabricIdFromEpName(uint32_t addr_format, const void *ep_name, size_t len);
+
+/**
+ * @brief Fills in @ref nixlLibfabricFabricId::mask by looking @p id's address up in getifaddrs().
+ *
+ * Only meaningful for a *local* rail: the netmask is what decides which peer addresses share this
+ * rail's segment, and only the owning host knows it. Leaves mask at 0 when the address is not on any
+ * local interface, which makes @ref sameFabric fall back to an exact-address comparison.
+ */
+void
+resolveLocalFabricMask(nixlLibfabricFabricId &id);
+
+/**
+ * @brief Whether a peer rail at @p peer sits on the same fabric segment as local rail @p local.
+ *
+ * Uses the local rail's netmask, since that is the only one available. Both ids must be valid.
+ */
+bool
+sameFabric(const nixlLibfabricFabricId &local, const nixlLibfabricFabricId &peer);
+
+/**
+ * @brief True when every rail must be progressed, not just the rails this agent posted on.
+ *
+ * A provider layered over a connection-oriented core (verbs, via ofi_rxm) establishes its
+ * per-peer MSG connection lazily on the first send, and the *passive* side has to poll that
+ * rail's completion queue for the connection to be accepted. An agent that has only received
+ * has no rail of its own to progress, so restricting progress to rail 0 plus the rails with
+ * outstanding local requests leaves any higher rail permanently unaccepted, and the peer that
+ * posted on it never completes. Connectionless RDM providers (efa, cxi, tcp) need no accept.
+ */
+bool
+providerNeedsAllRailProgress(const std::string &prov_name);
+
+/**
+ * @brief True when a remote-write completion does not identify its sender by source address.
+ *
+ * The receiver matches each write to its peer's pending notification by the completion's source
+ * address. ofi_rxm (verbs) does not set one for a write: libfabric up to at least 1.22 leaves
+ * whatever an earlier completion put in that CQ slot, later versions report FI_ADDR_NOTAVAIL. Either
+ * way the write is credited to the wrong peer or dropped and the notification never completes. A
+ * receiver on such a provider gives each peer a tag in its handshake, and the peer puts it in the
+ * write's imm_data instead.
+ */
+bool
+providerNeedsWriteTag(const std::string &prov_name);
+
+/**
+ * @brief True when this provider does hwloc topology discovery and accelerator-to-NIC grouping.
+ *
+ * See @ref nixlLibfabricProviderInfo::needs_full_topology.
+ */
+bool
+providerNeedsFullTopology(const std::string &prov_name);
+
+/**
+ * @brief Selects the verbs domains usable as nixl rails from a prov_name → domains map.
+ *
+ * The @ref nixlLibfabricProviderInfo::select_domains hook for verbs, which needs more filtering
+ * than the generic rule gives:
+ *
+ *  - verbs has no native RDM endpoint, so its prov_name is the composite "verbs;ofi_rxm".
+ *    Never compare it equal to "verbs".
+ *  - fi_getinfo returns one entry per (domain x capability variant), so the same domain comes
+ *    back several times and would otherwise become several rails on one NIC.
+ *  - the ofi_rxd variant re-exposes the same NICs under their DGRAM "-dgram" domains.
+ *
+ * Exposed rather than kept file-local so it can be unit tested without a fabric.
+ *
+ * @return Unique domain names in sorted order, or empty if verbs has nothing usable.
+ */
+std::vector<std::string>
+selectVerbsDomains(const nixlProviderDeviceMap &provider_device_map);
+
+/**
+ * @brief Every domain offered under exactly the prov_name @p name, de-duplicated, in fi_getinfo
+ * order.
+ *
+ * The generic @ref nixlLibfabricProviderInfo::select_domains rule. Deliberately not sorted, unlike
+ * selectVerbsDomains(): a rail's index has to be stable across runs and across peers, and for a
+ * provider whose domains all arrive under one prov_name key the fi_getinfo order already is. Sorting
+ * would be equally stable but would renumber the rails of every existing efa and cxi deployment.
+ *
+ * Exactly @p name, not every key with that base name, as before the provider table existed: a
+ * layered variant such as "efa;ofi_rxd" reaches the same NICs through slower emulation, so merging
+ * it would add duplicate rails, and since provider_device_map is unordered it would also make rail
+ * order depend on hash order.
+ *
+ * Exposed rather than kept file-local so it can be unit tested without a fabric.
+ */
+std::vector<std::string>
+selectDomainsGeneric(const nixlProviderDeviceMap &provider_device_map, const char *name);
+
+/**
+ * @brief The selection rule getAvailableNetworkDevices() applies to what fi_getinfo reported: the
+ *        first knownProviders() entry with usable domains, through its select_domains hook, cut to
+ *        one domain for a single_domain provider.
+ *
+ * @return The chosen core provider name and its domains in rail order; {"none", {}} if none.
+ */
+std::pair<std::string, std::vector<std::string>>
+selectProvider(const nixlProviderDeviceMap &provider_device_map);
 // String utilities
 std::string
 hexdump(const void *data, size_t size);
@@ -360,32 +657,12 @@ extern nixl_status_t
 getCustomIntParam(const nixl_b_params_t &custom_params, const std::string &key, size_t &value);
 } // namespace LibfabricUtils
 
-// CUDA context workaround temporary API for exposing to progress thread
-namespace LibfabricUtils {
-
-/**
- * @brief Mediator class for abstracting engine internals, while allowing consumers (e.g. progress
- * thread) to have access to the API without having an engine pointer.
+/*
+ * The accelerator-context mediator that used to live here is gone. It existed so the utils-layer
+ * progress thread could reach a binder owned by the plugin without seeing its type; now the shim
+ * (nfi_hmem.h) is in the utils layer itself and nfi_hmem_scope_push() needs no back-pointer to
+ * anything. See the note in libfabric_backend.cpp for why the binder disappeared too.
  */
-class nixlLibfaricCudaCtxMediator {
-public:
-    virtual ~nixlLibfaricCudaCtxMediator() {}
 
-    virtual nixl_status_t
-    cudaSetCtx(bool &use_cuda_addr_wa) = 0;
-
-protected:
-    nixlLibfaricCudaCtxMediator() {}
-};
-
-extern void
-setCudaCtxMediator(std::unique_ptr<nixlLibfaricCudaCtxMediator> &&mediator);
-
-extern void
-clearCudaCtxMediator();
-
-extern nixl_status_t
-cudaSetCtx(bool &use_cuda_addr_wa);
-} // namespace LibfabricUtils
 
 #endif // NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_COMMON_H

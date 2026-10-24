@@ -349,6 +349,71 @@ testRemoteWriteCompletionAttribution(nixlLibfabricRailManager &mgr) {
 }
 
 static int
+testTaggedWriteCompletionAttribution(nixlLibfabricRailManager &mgr) {
+    NIXL_INFO << "  testTaggedWriteCompletionAttribution";
+    mock_av_reset();
+    queue_reset();
+
+    nixlLibfabricRail &rail = mgr.getRail(0);
+
+    // P is inserted, so a write whose tag is ignored would still resolve -- to the wrong peer.
+    const auto eps_p = makeEndpoints("peerP", 1);
+    fi_addr_t addr_p = FI_ADDR_UNSPEC;
+    TEST_ASSERT(rail.insertAddress(eps_p[0].data(), 300, &addr_p) == NIXL_SUCCESS, "insert P");
+    mgr.mapWriteTag(7, 90000);
+    mgr.mapWriteTag(NIXL_LIBFABRIC_MAX_WRITE_TAG, 12);
+
+    std::vector<std::pair<uint16_t, uint32_t>> seen; // (xfer_id, agent_idx)
+    rail.setXferIdCallback([&seen](uint64_t imm_data, uint32_t agent_idx) {
+        seen.emplace_back(static_cast<uint16_t>(NIXL_GET_XFER_ID_FROM_IMM(imm_data)), agent_idx);
+    });
+
+    auto make_write = [](uint8_t write_tag, uint16_t xfer_id, fi_addr_t src) {
+        FakeCompletion fc{};
+        fc.entry.flags = FI_REMOTE_WRITE | FI_REMOTE_CQ_DATA | FI_RMA;
+        fc.entry.len = 4096;
+        fc.entry.data = NIXL_MAKE_TAGGED_IMM_DATA(
+            NIXL_LIBFABRIC_MSG_TRANSFER, write_tag, xfer_id, NIXL_SEQ_ID_MASK);
+        fc.src_addr = src;
+        return fc;
+    };
+
+    // The source address of a tagged write is whatever the provider left there; ofi_rxm leaves a
+    // stale one. The tag must win over it.
+    pending_completions.push_back(make_write(7, 0xFFFF, addr_p));
+    pending_completions.push_back(make_write(NIXL_LIBFABRIC_MAX_WRITE_TAG, 1, FI_ADDR_NOTAVAIL));
+    pending_completions.push_back(make_write(0, 2, addr_p));
+
+    nixl_status_t st = rail.progressCompletionQueue();
+    TEST_ASSERT(st == NIXL_SUCCESS, "progressCompletionQueue processed the batch");
+    TEST_ASSERT(seen.size() == 3, "all three write completions reached the callback");
+    TEST_ASSERT(seen[0].first == 0xFFFF && seen[0].second == 90000u,
+                "tagged write credited by its tag, not its source address; xfer_id intact");
+    TEST_ASSERT(seen[1].first == 1 && seen[1].second == 12u,
+                "highest tag resolves with no source address at all");
+    TEST_ASSERT(seen[2].first == 2 && seen[2].second == 300u,
+                "untagged write still resolved by source address");
+
+    // A released tag is no longer attributable, and unmapping on behalf of another agent is a no-op.
+    mgr.unmapWriteTag(NIXL_LIBFABRIC_MAX_WRITE_TAG, 99);
+    mgr.unmapWriteTag(7, 90000);
+    TEST_ASSERT(rail.resolveWriteTag(NIXL_LIBFABRIC_MAX_WRITE_TAG) == 12u,
+                "unmap for a different agent leaves the mapping");
+    TEST_ASSERT(mgr.getRail(1).resolveWriteTag(7) == nixlLibfabricRail::kUnknownAgentIdx,
+                "unmap cleared the tag on every rail");
+    queue_reset();
+    seen.clear();
+    pending_completions.push_back(make_write(7, 3, addr_p));
+    st = rail.progressCompletionQueue();
+    TEST_ASSERT(st == NIXL_SUCCESS, "write with a released tag is dropped, not an error");
+    TEST_ASSERT(seen.empty(), "write with a released tag is not credited to any peer");
+
+    mgr.unmapWriteTag(NIXL_LIBFABRIC_MAX_WRITE_TAG, 12);
+    rail.setXferIdCallback(nullptr);
+    return 0;
+}
+
+static int
 testRecvCompletionAttribution(nixlLibfabricRailManager &mgr) {
     NIXL_INFO << "  testRecvCompletionAttribution";
     mock_av_reset();
@@ -496,6 +561,9 @@ main() {
         return res;
     }
     if ((res = testRemoteWriteCompletionAttribution(mgr)) != 0) {
+        return res;
+    }
+    if ((res = testTaggedWriteCompletionAttribution(mgr)) != 0) {
         return res;
     }
     if ((res = testRecvCompletionAttribution(mgr)) != 0) {

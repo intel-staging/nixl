@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <filesystem>
+#include <list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -128,6 +129,11 @@ protected:
             params["num_workers"] = std::to_string(getNumWorkers());
             params["num_threads"] = std::to_string(getNumThreads());
             params["split_batch_size"] = "32";
+        } else if (getBackendName() == "LIBFABRIC") {
+            // The libfabric plugin has no notion of workers; it takes the same posting thread
+            // pool parameters as UCX. num_threads == 0 keeps the serial posting path.
+            params["num_threads"] = std::to_string(getNumThreads());
+            params["split_batch_size"] = "32";
         }
 
         params["engine_config"] = GetParam().engineConfig;
@@ -140,6 +146,24 @@ protected:
         agents.emplace_back(std::make_unique<nixlAgent>(
             getAgentName(agent_num), getConfig(getPort(agent_num), capture_telemetry)));
         nixlBackendH *backend_handle = nullptr;
+
+        // The libfabric plugin reports the host's own PCIe/NUMA asymmetry while discovering
+        // topology, and drops to the all-rails DRAM policy when it cannot derive a per-node
+        // bandwidth limit from it. Both are properties of the machine the test happens to run on
+        // -- a host whose NICs all sit on one NUMA node reports them every time -- so they must
+        // not be counted as unexpected warnings.
+        std::list<LogIgnoreGuard> topology_warnings;
+        if (getBackendName() == "LIBFABRIC") {
+            topology_warnings.emplace_back("Non-uniform NUMA node .* PCIe capacity");
+            topology_warnings.emplace_back("NUMA PCIe capacity is non-uniform across all nodes");
+            topology_warnings.emplace_back("Non-uniform NIC .* speed");
+            topology_warnings.emplace_back("NIC bandwidth is non-uniform across all PCIe devices");
+            topology_warnings.emplace_back(
+                "NIC upstream link bandwidth is non-uniform across all PCIe devices");
+            topology_warnings.emplace_back(
+                "Using default \\(all\\) rail selection policy for DRAM memory type");
+        }
+
         nixl_status_t status =
             agents.back()->createBackend(getBackendName(), getBackendParams(), backend_handle);
         ASSERT_EQ(status, NIXL_SUCCESS);
@@ -706,6 +730,19 @@ TEST_P(TestTransferTelemetry, GetXferTelemetryDisabled) {
 
 NIXL_INSTANTIATE_TEST(ucx, TestTransfer, "UCX", true, 2, 0, "");
 NIXL_INSTANTIATE_TEST(ucx_no_pt, TestTransfer, "UCX", false, 2, 0, "");
+#ifdef HAVE_LIBFABRIC
+// The libfabric plugin picks its own provider at startup and falls back to tcp/sockets when no
+// RDMA fabric is present, so this runs anywhere the plugin was built. On a verbs host it needs a
+// raised locked-memory limit -- see the troubleshooting section of the plugin README.
+//
+// Only the progress-thread-enabled configuration is instantiated. These tests drive both agents
+// from one thread, and with useProgThread=false nothing progresses an agent while that thread is
+// busy in the other: a provider whose connections are made on demand -- tcp as much as
+// verbs;ofi_rxm -- needs the passive side progressed to accept, so the first send blocks waiting
+// on itself. Real deployments, one agent per process, do not have that problem; verbs rails get
+// FI_PROGRESS_AUTO for exactly that case. See the plugin README for the details.
+NIXL_INSTANTIATE_TEST(libfabric, TestTransfer, "LIBFABRIC", true, 2, 0, "");
+#endif
 NIXL_INSTANTIATE_TEST(ucx_threadpool, TestTransfer, "UCX", true, 6, 4, "");
 NIXL_INSTANTIATE_TEST(ucx_threadpool_no_pt, TestTransfer, "UCX", false, 6, 4, "");
 

@@ -20,12 +20,13 @@
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
 #include "libfabric_common.h"
+#include "libfabric_accel.h"
 
-#ifdef HAVE_CUDA
-#include <cuda_runtime.h>
-#endif
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <stack>
 
@@ -40,6 +41,28 @@ namespace {
 bool
 shmProviderSupportsRuntime(enum fi_hmem_iface runtime) {
     return runtime != FI_HMEM_NEURON;
+}
+
+// Deadline for a post that keeps returning -FI_EAGAIN; see NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S.
+std::chrono::steady_clock::time_point
+eagainDeadline() {
+    return std::chrono::steady_clock::now() +
+        std::chrono::seconds(NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S);
+}
+
+// True, after logging, once @p deadline has passed for an -FI_EAGAIN retry loop.
+bool
+eagainDeadlinePassed(std::chrono::steady_clock::time_point deadline,
+                     const char *op,
+                     uint16_t rail_id,
+                     int attempt) {
+    if (std::chrono::steady_clock::now() < deadline) {
+        return false;
+    }
+    NIXL_ERROR << op << " on rail " << rail_id << " still refused with -FI_EAGAIN after "
+               << NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S << "s (" << attempt
+               << " attempts); giving up";
+    return true;
 }
 
 } // namespace
@@ -407,7 +430,8 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
                                      uint16_t id,
-                                     enum fi_hmem_iface runtime)
+                                     enum fi_hmem_iface runtime,
+                                     bool auto_progress)
     : rail_id(id),
       device_name(device),
       provider_name(provider),
@@ -415,6 +439,7 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
       data_request_pool_(NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL, id),
       provider_supports_hmem_(false),
       runtime_(runtime) {
+    write_tag_to_agent_.fill(kUnknownAgentIdx);
     // Initialize all pointers to nullptr
     info = nullptr;
     fabric = nullptr;
@@ -440,23 +465,35 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
     hints->caps |= FI_SOURCE;
     hints->mode = FI_CONTEXT;
     hints->ep_attr->type = FI_EP_RDM;
-    // Configure memory registration mode based on provider capabilities
-    if (provider == "tcp" || provider == "sockets") {
-        // TCP provider doesn't support FI_MR_PROV_KEY or FI_MR_VIRT_ADDR, use basic mode
-        hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED;
-        hints->domain_attr->mr_key_size = 0; // Let provider decide
-    } else if (provider == "cxi") {
-        hints->caps |= FI_RMA_EVENT;
-        hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED |
-            FI_MR_PROV_KEY | FI_MR_ENDPOINT;
-    } else {
-        // EFA and other providers support advanced memory registration
-        hints->domain_attr->mr_mode =
-            FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-        hints->domain_attr->mr_key_size = 2;
+    // Capabilities and memory registration mode come from the provider table; an unlisted provider
+    // gets the plain-RDMA defaults rather than a special case here.
+    const LibfabricUtils::nixlLibfabricProviderInfo *prov_info =
+        LibfabricUtils::findProviderInfo(provider);
+    if (prov_info == nullptr) {
+        prov_info = &LibfabricUtils::defaultProviderInfo();
+        NIXL_DEBUG << "Provider " << provider << " has no table entry, using defaults from "
+                   << prov_info->name;
+    }
+    hints->caps |= prov_info->extra_caps;
+    hints->domain_attr->mr_mode = prov_info->mr_mode;
+    hints->domain_attr->mr_key_size = prov_info->mr_key_size;
+    if (prov_info->needs_prov_name_hint) {
+        hints->fabric_attr->prov_name = strdup(prov_info->name);
     }
     hints->domain_attr->name = strdup(device_name.c_str());
     hints->domain_attr->threading = FI_THREAD_COMPLETION;
+    if (auto_progress) {
+        /*
+         * ofi_rxm starts a per-endpoint thread for FI_PROGRESS_AUTO that sleeps in poll() on the
+         * endpoint's connection-event queue and accepts peers' connections as they arrive -- what
+         * this backend's progress thread otherwise does by polling every rail. rxm requires
+         * FI_THREAD_SAFE for it, since that thread then shares the endpoint with ours. Data
+         * completions are still read by checkXfer()/getNotifs() as before.
+         */
+        hints->domain_attr->threading = FI_THREAD_SAFE;
+        hints->domain_attr->control_progress = FI_PROGRESS_AUTO;
+        hints->domain_attr->data_progress = FI_PROGRESS_AUTO;
+    }
 
     // The EFA provider accepts FI_MR_DMABUF from libfabric API 1.20 on, so request 1.20
     // where the library provides it and 1.18 elsewhere. The fabric carries the requested
@@ -515,6 +552,20 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             // Provider found with FI_HMEM
             provider_supports_hmem_ = true;
             NIXL_INFO << "Using provider with FI_HMEM support for rail " << rail_id;
+        }
+
+        if (auto_progress && info->domain_attr->data_progress != FI_PROGRESS_AUTO) {
+            NIXL_ERROR << "Provider " << provider << " did not grant FI_PROGRESS_AUTO on rail "
+                       << rail_id << "; without it or a progress thread, connection setup would "
+                       << "stall. Enable the progress thread (nixlAgentConfig::useProgThread, or "
+                       << "--enable_pt=1 under nixlbench), or select another provider with "
+                       << "FI_PROVIDER";
+            throw std::runtime_error("FI_PROGRESS_AUTO not granted for rail " +
+                                     std::to_string(rail_id));
+        }
+        if (auto_progress) {
+            NIXL_INFO << "Rail " << rail_id << ": no progress thread, so " << provider
+                      << " progresses connection setup on its own thread (FI_PROGRESS_AUTO)";
         }
 
         // Create fabric for this rail
@@ -647,6 +698,28 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         if (ret) {
             NIXL_ERROR << "fi_getname failed for rail " << rail_id << ": " << fi_strerror(-ret);
             throw std::runtime_error("fi_getname failed for rail " + std::to_string(rail_id));
+        }
+
+        /*
+         * Remember how this rail is addressed so it can be paired with the right peer rail later.
+         * The peer sends the same bytes for its own rails during connection setup, so comparing them
+         * is what lets a transfer post to a NIC on the same segment instead of trusting that both
+         * hosts enumerated their rails in the same order. See LibfabricUtils::sameFabric.
+         */
+        this->ep_name_len = ep_name_len;
+        this->addr_format = (info != nullptr) ? info->addr_format : FI_FORMAT_UNSPEC;
+        fabric_id = LibfabricUtils::fabricIdFromEpName(this->addr_format, ep_name, ep_name_len);
+        LibfabricUtils::resolveLocalFabricMask(fabric_id);
+        if (fabric_id.valid) {
+            char ip[INET_ADDRSTRLEN] = {0};
+            struct in_addr a;
+            a.s_addr = fabric_id.addr;
+            inet_ntop(AF_INET, &a, ip, sizeof(ip));
+            NIXL_DEBUG << "Rail " << rail_id << " (" << device_name << ") fabric address " << ip;
+        } else {
+            NIXL_DEBUG << "Rail " << rail_id << " (" << device_name
+                       << ") has an address format this build cannot read (" << this->addr_format
+                       << "); rail pairing will use index order";
         }
 
         // Initialize control request pool with buffers
@@ -891,7 +964,9 @@ nixlLibfabricRail::progressCompletionQueue() {
         }
     }
 
-    return (ret > 0) ? NIXL_SUCCESS : NIXL_IN_PROG;
+    // A parked post is work still to do: report it as progress so the progress thread retries
+    // promptly instead of sleeping its idle delay.
+    return (ret > 0 || pending_post_) ? NIXL_SUCCESS : NIXL_IN_PROG;
 }
 
 void
@@ -1149,10 +1224,14 @@ nixlLibfabricRail::processRemoteWriteCompletion(struct fi_cq_data_entry *comp,
     // For remote write completions, we don't need to post a new receive
     // The write operation doesn't consume a receive buffer
     if (msg_type == NIXL_LIBFABRIC_MSG_TRANSFER) {
-        const uint32_t agent_idx = resolveSourceAddress(src_addr);
+        // A tagged write names its sender itself: its provider reports no usable source address.
+        const uint8_t write_tag = static_cast<uint8_t>(NIXL_GET_WRITE_TAG_FROM_IMM(comp->data));
+        const uint32_t agent_idx =
+            write_tag != 0 ? resolveWriteTag(write_tag) : resolveSourceAddress(src_addr);
         if (agent_idx == kUnknownAgentIdx) {
             NIXL_ERROR << "Remote write completion on rail " << rail_id
-                       << " from unknown src_addr=" << src_addr << " XFER_ID=" << xfer_id
+                       << " from unknown src_addr=" << src_addr
+                       << " write_tag=" << static_cast<unsigned>(write_tag) << " XFER_ID=" << xfer_id
                        << "; cannot credit it to a pending notification";
             // Handled by dropping it; not an error for whichever caller progressed the CQ.
             return NIXL_SUCCESS;
@@ -1215,7 +1294,10 @@ nixlLibfabricRail::postRecv(nixlLibfabricReq *req) const {
 }
 
 nixl_status_t
-nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLibfabricReq *req) {
+nixlLibfabricRail::postSend(uint64_t immediate_data,
+                            fi_addr_t dest_addr,
+                            nixlLibfabricReq *req,
+                            bool blocking) {
     if (req->buffer_size == 0 || req->buffer_size > NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE) {
         NIXL_ERROR << "Invalid message size=" << req->buffer_size
                    << " (max: " << NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE << ")";
@@ -1231,9 +1313,10 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
                << " XFER_ID=" << NIXL_GET_XFER_ID_FROM_IMM(immediate_data)
                << " dest_addr=" << dest_addr << std::dec << " context=" << &req->ctx;
 
-    // Retry indefinitely until senddata succeeds or fails for all providers
+    // Retry until senddata succeeds, fails, or keeps returning -FI_EAGAIN past the deadline
     int ret = -FI_EAGAIN;
     int attempt = 0;
+    const auto deadline = eagainDeadline();
 
     while (true) {
         // Libfabric fi_senddata call
@@ -1256,9 +1339,18 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
             return NIXL_SUCCESS;
         }
 
+        if (ret == -FI_EAGAIN && !blocking) {
+            NIXL_TRACE << "fi_senddata returned EAGAIN on rail " << rail_id
+                       << ", caller will retry later";
+            return NIXL_IN_PROG;
+        }
+
         if (ret == -FI_EAGAIN) {
-            // Resource temporarily unavailable - retry indefinitely for all providers
+            // Resource temporarily unavailable - retry until the deadline, for all providers
             attempt++;
+            if (eagainDeadlinePassed(deadline, "fi_senddata", rail_id, attempt)) {
+                return NIXL_ERR_BACKEND;
+            }
 
             // Log every N attempts to avoid log spam
             if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {
@@ -1306,65 +1398,54 @@ nixl_status_t
 nixlLibfabricRail::drainPostQueue() {
     nixlLibfabricPostRequest pr;
     int posted = 0;
-#if HAVE_CUDA
-    bool use_cuda_addr_wa = false;
-    int current_cuda_device = -1;
-#endif
+
+    // One binding across the batch, rebound only when a request's buffer lives on another device;
+    // see the note inside the loop. Pops when the drain returns.
+    std::optional<nixlAccelScope> accel_scope;
 
     // drain the queue up to configured limit,
     // to ensure requests from other rails do not wait too much time
     size_t post_req_count = 0;
-    while (post_req_count < POST_MAX_BATCH_SIZE && post_ring_.pop(pr)) {
+    while (post_req_count < POST_MAX_BATCH_SIZE) {
+        // A post parked by an earlier drain goes first, ahead of anything queued behind it.
+        const bool was_parked = pending_post_.has_value();
+        if (was_parked) {
+            pr = *pending_post_;
+            pending_post_.reset();
+        } else if (!post_ring_.pop(pr)) {
+            break;
+        }
         ++post_req_count;
         int ret = -FI_EAGAIN;
 
-#if HAVE_CUDA
-        if (pr.is_cuda_vram) {
-            // NOTE: for now we do not call engine to try to set context in work-around mode - this
-            // is postponsed to another PR, which requires substantial refactoring - instead we
-            // directly call cudaSetDevice() when needed
-            use_cuda_addr_wa = false;
-            nixl_status_t status = LibfabricUtils::cudaSetCtx(use_cuda_addr_wa);
-            if (status != NIXL_SUCCESS) {
-                // completion is notified also for failed requests
-                // (otherwise counters would never match)
-                if (pr.req && pr.req->completion_callback) {
-                    pr.req->completion_callback(status);
-                }
-                if (pr.req) {
-                    releaseRequest(pr.req);
-                }
-
-                // defrred request cannot be executed, continue to the next
-                NIXL_ERROR << "Failed to set CUDA context, while posting deferred descriptor";
-                continue;
-            }
-
-            // other-wise set cuda device before call if needed
-            if (!use_cuda_addr_wa && pr.device_id != current_cuda_device) {
-                cudaError_t cuda_ret = cudaSetDevice(pr.device_id);
-                if (cuda_ret != cudaSuccess) {
-                    // completion is notified also for failed requests
-                    // (otherwise counters would never match)
-                    if (pr.req && pr.req->completion_callback) {
-                        pr.req->completion_callback(NIXL_ERR_BACKEND);
-                    }
-                    if (pr.req) {
-                        releaseRequest(pr.req);
-                    }
-
-                    // defrred request cannot be executed, continue to the next
-                    NIXL_ERROR << "Failed to set CUDA device " << pr.device_id
-                               << " while posting deferred descriptor: "
-                               << cudaGetErrorString(cuda_ret);
-                    continue;
-                }
-                current_cuda_device = pr.device_id;
-            }
+        /*
+         * Bind the accelerator device this request's buffer lives on. Kept across consecutive
+         * requests on the same device rather than pushed and popped per request -- that put driver
+         * calls on every post -- and replaced, not stacked, when the device changes, so one
+         * request's device cannot leak into the next's. A no-op for host memory and for any runtime
+         * with no thread-current state, which is why there is no flag to test.
+         */
+        if (!(accel_scope && accel_scope->holds(pr.hmem_info))) {
+            accel_scope.reset();
+            accel_scope.emplace(pr.hmem_info);
         }
-#endif
+        if (!accel_scope->ok()) {
+            // completion is notified also for failed requests
+            // (otherwise counters would never match)
+            if (pr.req && pr.req->completion_callback) {
+                pr.req->completion_callback(NIXL_ERR_BACKEND);
+            }
+            if (pr.req) {
+                releaseRequest(pr.req);
+            }
 
-        while (ret == -FI_EAGAIN) {
+            // deferred request cannot be executed, continue to the next
+            NIXL_ERROR << "Failed to bind accelerator device " << pr.hmem_info.device
+                       << " while posting deferred descriptor";
+            continue;
+        }
+
+        for (size_t attempt = 0; ret == -FI_EAGAIN && attempt < POST_EAGAIN_RETRIES; ++attempt) {
             if (pr.type == nixlLibfabricPostRequest::WRITE) {
                 struct iovec iov{};
                 iov.iov_base = pr.local_addr;
@@ -1417,6 +1498,31 @@ nixlLibfabricRail::drainPostQueue() {
             }
         }
 
+        /*
+         * Still -FI_EAGAIN: park the request and return rather than spin here. Reaping this rail's
+         * own CQ is not always what clears it -- a lazily connecting provider (verbs;ofi_rxm) may
+         * be waiting for the peer to accept a connection, and the peer's progress thread can be
+         * just as stuck posting on another rail, waiting for this agent to poll *that* one.
+         * Spinning on one rail would deadlock both; returning lets progressActiveRails() visit the
+         * others.
+         * The parked request is retried first next time, so posts keep their order. One still
+         * refused after NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S fails below like any other post error,
+         * so a peer that is gone ends the transfer with an error instead of blocking this rail.
+         */
+        if (ret == -FI_EAGAIN) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!was_parked) {
+                pending_since_ = now;
+            }
+            if (now - pending_since_ < std::chrono::seconds(NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S)) {
+                pending_post_ = pr;
+                return NIXL_SUCCESS;
+            }
+            NIXL_ERROR << "drainPostQueue: post on rail " << rail_id << " still refused with "
+                       << "-FI_EAGAIN after " << NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S
+                       << "s; failing it";
+        }
+
         if (ret != 0) {
             NIXL_ERROR << "drainPostQueue: post failed ret=" << ret << " (" << fi_strerror(-ret)
                        << ") on rail " << rail_id;
@@ -1460,9 +1566,10 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
                << " dest_addr=" << dest_addr << " remote_addr=" << (void *)remote_addr
                << " remote_key=" << remote_key << " context=" << &req->ctx;
 
-    // Retry indefinitely until writedata succeeds or fails for all providers
+    // Retry until the write succeeds, fails, or keeps returning -FI_EAGAIN past the deadline
     int ret = -FI_EAGAIN;
     int attempt = 0;
+    const auto deadline = eagainDeadline();
 
     struct iovec iov{};
 
@@ -1501,8 +1608,11 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
 
         if (ret == -FI_EAGAIN) {
             // SQ full - do inline CQ progress to free slots, then retry
-            // Resource temporarily unavailable - retry indefinitely for all providers
+            // Resource temporarily unavailable - retry until the deadline, for all providers
             attempt++;
+            if (eagainDeadlinePassed(deadline, "fi_writemsg", rail_id, attempt)) {
+                return NIXL_ERR_BACKEND;
+            }
 
             // Log every N attempts to avoid log spam
             if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {
@@ -1556,9 +1666,10 @@ nixlLibfabricRail::postRead(void *local_buffer,
                << " dest_addr=" << dest_addr << " remote_addr=" << (void *)remote_addr
                << " remote_key=" << remote_key << " context=" << &req->ctx;
 
-    // Retry indefinitely until readdata succeeds or fails for all providers
+    // Retry until the read succeeds, fails, or keeps returning -FI_EAGAIN past the deadline
     int ret = -FI_EAGAIN;
     int attempt = 0;
+    const auto deadline = eagainDeadline();
 
     while (true) {
         // Libfabric fi_read call
@@ -1584,8 +1695,11 @@ nixlLibfabricRail::postRead(void *local_buffer,
 
         if (ret == -FI_EAGAIN) {
             // SQ full - do inline CQ progress to free slots, then retry
-            // Resource temporarily unavailable - retry indefinitely for all providers
+            // Resource temporarily unavailable - retry until the deadline, for all providers
             attempt++;
+            if (eagainDeadlinePassed(deadline, "fi_read", rail_id, attempt)) {
+                return NIXL_ERR_BACKEND;
+            }
 
             // Log every N attempts to avoid log spam
             if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {
@@ -1655,12 +1769,16 @@ nixlLibfabricRail::canRegisterWithDmabuf(nixl_mem_t mem_type, enum fi_hmem_iface
 #endif
 }
 
+bool
+nixlLibfabricRail::canCarryDeviceMemory() const {
+    return provider_supports_hmem_ || (provider_name != "tcp" && provider_name != "sockets");
+}
+
 nixl_status_t
 nixlLibfabricRail::registerMemory(void *buffer,
                                   size_t length,
                                   nixl_mem_t mem_type,
-                                  int device_id,
-                                  enum fi_hmem_iface iface,
+                                  const struct nfi_hmem_info &hmem_info,
                                   struct fid_mr **mr_out,
                                   uint64_t *key_out,
                                   const LibfabricUtils::CudaDmabufExport *dmabuf) const {
@@ -1716,40 +1834,19 @@ nixlLibfabricRail::registerMemory(void *buffer,
     // Set HMEM interface based on memory type and provider capability
     if (mem_type == VRAM_SEG) {
         if (provider_supports_hmem_) {
-            mr_attr.iface = iface;
-            if (iface == FI_HMEM_CUDA) {
-                mr_attr.device.cuda = device_id;
-                NIXL_DEBUG << "CUDA memory registration - iface: FI_HMEM_CUDA, device.cuda: "
-                           << device_id;
-            } else if (iface == FI_HMEM_ROCR) {
-                // AMD ROCr memory registration
-                // ROCr uses HSA agent handles for device identification.
-                // The device_id corresponds to the GPU index (0-based).
-                // The device.rocr union member was added in libfabric v2.3; on
-                // older libfabric the union has no rocr member (and the EFA
-                // provider ignores the device handle for ROCr), so the
-                // zero-initialized union is sufficient.
-#if FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION) >= FI_VERSION(2, 3)
-                mr_attr.device.rocr = device_id;
-#endif
-                NIXL_DEBUG << "ROCr memory registration - iface: FI_HMEM_ROCR, device_id: "
-                           << device_id;
-            } else if (iface == FI_HMEM_NEURON) {
-                /*
-                 * Store a sentinel; libfabric requires this to be initialized.
-                 * Libfabric requires the device.neuron field to be set for Neuron HMEM,
-                 * but the EFA provider does not use the value. Store an invalid device id
-                 * sentinel to both follow the Libfabric spec and cause an error if a
-                 * provider uses the value in the future.
-                 */
-                mr_attr.device.neuron = -1;
-                NIXL_DEBUG << "NEURON memory registration - iface: FI_HMEM_NEURON, device_id: "
-                           << device_id;
-            }
-        } else {
+            // Which fi_mr_attr::device union arm applies is decided by iface, so it is
+            // libfabric's own knowledge and lives in the shim. This layer stays vendor-blind and
+            // just forwards the opaque info block it was given.
+            nfi_hmem_fill_mr_attr(&hmem_info, &mr_attr);
+        } else if (canCarryDeviceMemory()) {
             NIXL_WARN << "VRAM memory requested but provider does not support FI_HMEM - falling "
                          "back to system memory registration";
             mr_attr.iface = FI_HMEM_SYSTEM;
+        } else {
+            // Normally unreachable: getSupportedMems() does not offer VRAM_SEG for such a rail.
+            NIXL_ERROR << "Provider " << provider_name << " on rail " << rail_id
+                       << " has no FI_HMEM support and cannot carry device memory";
+            return NIXL_ERR_NOT_SUPPORTED;
         }
     } else {
         mr_attr.iface = FI_HMEM_SYSTEM;
@@ -1761,7 +1858,7 @@ nixlLibfabricRail::registerMemory(void *buffer,
     struct iovec iov;
     uint64_t regattr_flags = 0;
     const bool use_dmabuf =
-        dmabuf != nullptr && dmabuf->fd >= 0 && canRegisterWithDmabuf(mem_type, iface);
+        dmabuf != nullptr && dmabuf->fd >= 0 && canRegisterWithDmabuf(mem_type, hmem_info.iface);
 
 #ifdef FI_MR_DMABUF
     struct fi_mr_dmabuf dmabuf_desc = {};
@@ -1937,6 +2034,14 @@ nixlLibfabricRail::removeAddress(fi_addr_t fi_addr) const {
 }
 
 void
+nixlLibfabricRail::unmapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx) const {
+    std::unique_lock<std::shared_mutex> lk(src_addr_mutex_);
+    if (fi_addr < src_addr_to_agent_.size() && src_addr_to_agent_[fi_addr] == agent_idx) {
+        src_addr_to_agent_[fi_addr] = kUnknownAgentIdx;
+    }
+}
+
+void
 nixlLibfabricRail::mapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx) const {
     if (fi_addr == FI_ADDR_NOTAVAIL) {
         NIXL_ERROR << "Refusing to map invalid fi_addr " << fi_addr << " on rail " << rail_id;
@@ -1959,6 +2064,31 @@ nixlLibfabricRail::mapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx) const
 
     NIXL_TRACE << "Mapped fi_addr " << fi_addr << " -> agent index " << agent_idx << " on rail "
                << rail_id;
+}
+
+void
+nixlLibfabricRail::mapWriteTag(uint8_t write_tag, uint32_t agent_idx) const {
+    if (write_tag == 0) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lk(src_addr_mutex_);
+    write_tag_to_agent_[write_tag] = agent_idx;
+    NIXL_TRACE << "Mapped write tag " << static_cast<unsigned>(write_tag) << " -> agent index "
+               << agent_idx << " on rail " << rail_id;
+}
+
+void
+nixlLibfabricRail::unmapWriteTag(uint8_t write_tag, uint32_t agent_idx) const {
+    std::unique_lock<std::shared_mutex> lk(src_addr_mutex_);
+    if (write_tag != 0 && write_tag_to_agent_[write_tag] == agent_idx) {
+        write_tag_to_agent_[write_tag] = kUnknownAgentIdx;
+    }
+}
+
+uint32_t
+nixlLibfabricRail::resolveWriteTag(uint8_t write_tag) const {
+    std::shared_lock<std::shared_mutex> lk(src_addr_mutex_);
+    return write_tag_to_agent_[write_tag];
 }
 
 uint32_t
