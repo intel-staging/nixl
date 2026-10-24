@@ -19,6 +19,7 @@
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_COMMON_H
 
 #include <vector>
+#include <span>
 #include <string>
 #include <unordered_set>
 #include <unordered_map>
@@ -459,7 +460,7 @@ struct nixlLibfabricProviderInfo {
 /**
  * @brief The provider table, in preference order (highest first).
  */
-const std::vector<const nixlLibfabricProviderInfo *> &
+std::span<const nixlLibfabricProviderInfo *const>
 knownProviders();
 
 /**

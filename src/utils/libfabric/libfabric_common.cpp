@@ -20,6 +20,7 @@
 #include "common/nixl_log.h"
 
 #include <algorithm>
+#include <array>
 #include <iomanip>
 #include <sstream>
 #include <atomic>
@@ -288,26 +289,31 @@ selectDomainsGeneric(const nixlProviderDeviceMap &provider_device_map, const cha
 }
 
 
-const std::vector<const nixlLibfabricProviderInfo *> &
+/*
+ * Preference order, highest first. verbs sits below cxi/efa and above tcp: it is a real RDMA
+ * provider, and on a host with an Intel Xe GPU it is the only one that can carry device memory at
+ * all -- efa_hmem_ifaces[] has no FI_HMEM_ZE entry, while verbs carries [FI_HMEM_ZE] = TRY in its
+ * dmabuf failover table (prov/verbs/src/verbs_mr.c).
+ *
+ * Anyone who wants a different choice can restrict what fi_getinfo returns with libfabric's own
+ * FI_PROVIDER, e.g. FI_PROVIDER=tcp or FI_PROVIDER=^verbs; there is deliberately no nixl-specific
+ * knob for it.
+ *
+ * constexpr, so it has no destructor: the progress thread reads it through findProviderInfo() on
+ * every pass, and exit() run while that thread is still going (nixlbench does so on a failed
+ * registration) would otherwise destroy it under the thread's feet.
+ */
+constexpr std::array<const nixlLibfabricProviderInfo *, 5> k_known_providers = {
+    &k_cxi_provider,
+    &k_efa_provider,
+    &k_verbs_provider,
+    &k_tcp_provider,
+    &k_sockets_provider,
+};
+
+std::span<const nixlLibfabricProviderInfo *const>
 knownProviders() {
-    /*
-     * Preference order, highest first. verbs sits below cxi/efa and above tcp: it is a real RDMA
-     * provider, and on a host with an Intel Xe GPU it is the only one that can carry device memory
-     * at all -- efa_hmem_ifaces[] has no FI_HMEM_ZE entry, while verbs carries [FI_HMEM_ZE] = TRY
-     * in its dmabuf failover table (prov/verbs/src/verbs_mr.c).
-     *
-     * Anyone who wants a different choice can restrict what fi_getinfo returns with libfabric's own
-     * FI_PROVIDER, e.g. FI_PROVIDER=tcp or FI_PROVIDER=^verbs; there is deliberately no
-     * nixl-specific knob for it.
-     */
-    static const std::vector<const nixlLibfabricProviderInfo *> providers = {
-        &k_cxi_provider,
-        &k_efa_provider,
-        &k_verbs_provider,
-        &k_tcp_provider,
-        &k_sockets_provider,
-    };
-    return providers;
+    return k_known_providers;
 }
 
 const nixlLibfabricProviderInfo *
