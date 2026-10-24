@@ -264,6 +264,13 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
         throw std::runtime_error("Failed to initialize the rail manager");
     }
 
+    if (nfi_hmem_available() && !rail_manager_.canCarryDeviceMemory()) {
+        NIXL_WARN << "libfabric provider " << rail_manager_.getRail(0).provider_name
+                  << " has no FI_HMEM support and moves data through host copies, so VRAM_SEG "
+                  << "is not offered by this backend; use an RDMA provider, or a libfabric whose "
+                  << "provider supports FI_HMEM";
+    }
+
 
     // The CUDA address workaround this used to switch off is gone (see the note above
     // nixlLibfabricBackendH), so the variable no longer does anything. Say so rather than let a
@@ -822,11 +829,15 @@ nixlLibfabricEngine::getSupportedMems() const {
     // Any usable runtime is enough: VRAM_SEG is vendor-blind, and the shim decides which runtime
     // owns a given buffer at registration time. Asks every vendor SDK, not just the first usable
     // one the rail manager names in its log.
-    if (nfi_hmem_available()) {
+    if (!nfi_hmem_available()) {
+        NIXL_DEBUG << "No accelerator runtime, skipping VRAM support";
+    } else if (!rail_manager_.canCarryDeviceMemory()) {
+        // E.g. tcp on a libfabric whose tcp provider lacks FI_HMEM. Not offered, so registering a
+        // VRAM_SEG fails up front instead of the first transfer failing with EFAULT.
+        NIXL_DEBUG << "Provider cannot carry device memory, skipping VRAM support";
+    } else {
         NIXL_DEBUG << "Accelerator runtime available, adding VRAM support";
         mems.push_back(VRAM_SEG);
-    } else {
-        NIXL_DEBUG << "No accelerator runtime, skipping VRAM support";
     }
     return mems;
 }
@@ -1590,17 +1601,24 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
                    << ", expected_completions: " << backend_handle->get_submitted_requests_count();
     }
 
-    // Progress rails to kick off transfers
+    // Progress rails to kick off transfers. A rail error is not returned, for the reason given in
+    // checkXfer(): this transfer is judged by its own handle.
     if (!progress_thread_enabled_) {
         nixl_status_t progress_status = rail_manager_.progressActiveRails();
         if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
-            NIXL_ERROR << "Failed to progress rails in postXfer";
-            return progress_status;
+            NIXL_ERROR << "Failed to progress rails in postXfer (status " << progress_status
+                       << "); checking this transfer's own completions";
         }
     }
 
     // For very small transfers we can check for local completions immediately.
     if (backend_handle->is_completed()) {
+        const nixl_status_t err = backend_handle->get_error_status();
+        if (err != NIXL_SUCCESS) {
+            NIXL_ERROR << "Transfer completed with CQ error status " << err;
+            notifXferFailure(backend_handle, err);
+            return err;
+        }
         if (backend_handle->has_notif && backend_handle->operation_ == nixl_xfer_op_t::NIXL_READ) {
             nixl_status_t notif_status = notifSendPriv(remote_agent,
                                                        backend_handle->binary_notifs,
@@ -1623,10 +1641,17 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
     auto backend_handle = static_cast<nixlLibfabricBackendH *>(handle);
 
     if (!progress_thread_enabled_) {
+        /*
+         * Not returned: a CQ error reaches the request it belongs to through that request's
+         * completion callback, and that may be another transfer's. This one is judged by its own
+         * handle below -- the same handling the progress thread gives an error, which logs it and
+         * carries on. Returning here instead skipped notifXferFailure(), so the target of a failed
+         * notified WRITE was never told and kept waiting.
+         */
         nixl_status_t progress_status = rail_manager_.progressActiveRails();
         if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
-            NIXL_ERROR << "Failed to progress rails in checkXfer";
-            return progress_status;
+            NIXL_ERROR << "Failed to progress rails in checkXfer (status " << progress_status
+                       << "); checking this transfer's own completions";
         }
     }
 

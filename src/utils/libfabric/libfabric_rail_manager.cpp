@@ -1312,8 +1312,10 @@ nixlLibfabricRailManager::computeRailPeering(
     for (size_t rail_id = 0; rail_id < peering.size(); ++rail_id) {
         if (peering[rail_id] == NIXL_LF_NO_PEER_RAIL) {
             NIXL_WARN << "Rail " << rail_id << " (" << rails_[rail_id]->device_name
-                      << ") found no peer rail on its fabric; falling back to index order for it,"
-                         " which may be unreachable";
+                      << ") found no peer rail on its subnet (shown as none below). Transfers on"
+                         " it post to the same-numbered peer rail when that one holds the buffer,"
+                         " otherwise to another peer rail that does; on an unrouted fabric those"
+                         " may be unreachable";
             continue;
         }
         matched++;
@@ -1323,7 +1325,9 @@ nixlLibfabricRailManager::computeRailPeering(
 
     // Worth INFO rather than DEBUG when it is not the identity permutation: that is precisely the
     // case index pairing used to get wrong, and it is otherwise invisible.
-    bool is_identity = (peering.size() == endpoints.size());
+    // Identity means every local rail i went to peer rail i. The peer may have more rails than
+    // this agent; the ones nobody pairs with do not make the pairing any less the index order.
+    bool is_identity = true;
     for (size_t i = 0; is_identity && i < peering.size(); ++i) {
         is_identity = (peering[i] == i);
     }

@@ -269,6 +269,13 @@ public:
     unmapAgentAddresses(const std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs,
                         uint32_t agent_idx);
 
+    /** Whether the rails can carry device memory; see nixlLibfabricRail::canCarryDeviceMemory().
+     *  Every rail uses one provider, so rail 0 answers for all. */
+    bool
+    canCarryDeviceMemory() const {
+        return !rails_.empty() && rails_[0]->canCarryDeviceMemory();
+    }
+
     /** True when this agent's rails cannot attribute a remote write by its source address, so
      *  each peer must stamp its writes with a write tag. See providerNeedsWriteTag(). */
     bool

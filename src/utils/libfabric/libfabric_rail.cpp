@@ -1769,6 +1769,11 @@ nixlLibfabricRail::canRegisterWithDmabuf(nixl_mem_t mem_type, enum fi_hmem_iface
 #endif
 }
 
+bool
+nixlLibfabricRail::canCarryDeviceMemory() const {
+    return provider_supports_hmem_ || (provider_name != "tcp" && provider_name != "sockets");
+}
+
 nixl_status_t
 nixlLibfabricRail::registerMemory(void *buffer,
                                   size_t length,
@@ -1833,10 +1838,15 @@ nixlLibfabricRail::registerMemory(void *buffer,
             // libfabric's own knowledge and lives in the shim. This layer stays vendor-blind and
             // just forwards the opaque info block it was given.
             nfi_hmem_fill_mr_attr(&hmem_info, &mr_attr);
-        } else {
+        } else if (canCarryDeviceMemory()) {
             NIXL_WARN << "VRAM memory requested but provider does not support FI_HMEM - falling "
                          "back to system memory registration";
             mr_attr.iface = FI_HMEM_SYSTEM;
+        } else {
+            // Normally unreachable: getSupportedMems() does not offer VRAM_SEG for such a rail.
+            NIXL_ERROR << "Provider " << provider_name << " on rail " << rail_id
+                       << " has no FI_HMEM support and cannot carry device memory";
+            return NIXL_ERR_NOT_SUPPORTED;
         }
     } else {
         mr_attr.iface = FI_HMEM_SYSTEM;

@@ -475,6 +475,14 @@ public:
     bool
     canRegisterWithDmabuf(nixl_mem_t mem_type, enum fi_hmem_iface iface) const;
 
+    /** Whether this rail can carry device memory at all. True with FI_HMEM. Without it, true only
+     *  for an RDMA provider, which registers the device pointer as host memory -- that works where
+     *  the NIC driver resolves GPU addresses itself (NVIDIA peer memory). Never for tcp or sockets:
+     *  they move data with CPU copies through the kernel, so a device pointer registers fine and
+     *  then fails on the first transfer with EFAULT. */
+    bool
+    canCarryDeviceMemory() const;
+
     /** Deregister memory from libfabric */
     nixl_status_t
     deregisterMemory(struct fid_mr *mr) const;
