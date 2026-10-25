@@ -311,7 +311,9 @@ private:
                   uint32_t expected_completions) const;
 
     // Tell the target that notif_xfer_id failed on this side and that only final_completions of
-    // its writes will arrive, so it stops waiting for the rest.
+    // its writes will arrive, so it stops waiting for the rest and drops the notification. Resends
+    // until the message's own send completes, for up to NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S, since
+    // the failure that triggers it can flush it on a broken connection.
     nixl_status_t
     notifXferErrorPriv(const std::string &remote_agent,
                        uint16_t notif_xfer_id,
