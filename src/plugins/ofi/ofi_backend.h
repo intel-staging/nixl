@@ -151,15 +151,11 @@ private:
     static nixl_status_t getEndpointAddress(fid_ep* endpoint, std::string& address);
     static void detectHmemCapabilities(struct fi_info* fi_info,
                                        const std::string& provider_name,
-                                       bool& cuda_supported,
-                                       bool& ze_supported,
                                        bool& synapseai_supported);
     static const ProviderConfig* findProviderConfig(const std::string& provider_name);
     
     // parameter helpers
-    void getStringParam(const nixlBackendInitParams* init_params, const std::string& key, std::string& value);
     void getLongParam(const nixlBackendInitParams* init_params, const std::string& key, long& value, long min_val, long max_val);
-    void getSizeTParam(const nixlBackendInitParams* init_params, const std::string& key, size_t& value);
     
     // connection helpers
     nixl_status_t connect_unlocked(const std::string &remote_agent);
@@ -170,7 +166,6 @@ private:
     static uint64_t getMemoryRegistrationAccessFlags(const struct fi_info* fi_info);
     fi_hmem_iface selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const;
     nixl_status_t registerDramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
-    nixl_status_t registerHmemMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta, fi_hmem_iface iface, uint64_t device_id) const;
 
     // data members
     fid_fabric *fabric_;
@@ -208,8 +203,6 @@ private:
     // intelligent main-thread progress rate limiting
     mutable std::atomic<std::chrono::steady_clock::time_point> lastProgressTime_;
     static const std::chrono::milliseconds PROGRESS_INTERVAL;
-    bool hmemZeSupported_;
-    bool hmemCudaSupported_;
     bool hmemSynapseaiSupported_;
 
     std::string localAgentName_;

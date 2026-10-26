@@ -18,77 +18,30 @@
 #include "backend/backend_plugin.h"
 #include "ofi_backend.h"
 
-namespace
-{
-    static const char *PLUGIN_NAME = "OFI";
-    static const char *PLUGIN_VERSION = "0.1.0";
-    
-    // create a new OFI backend engine instance
-    static nixlBackendEngine *
-    create_ofi_engine (const nixlBackendInitParams *init_params) {
-        return new nixlOfiEngine (init_params);
-    }
-    
-    static void
-    destroy_ofi_engine (nixlBackendEngine *engine) {
-        delete engine;
-    }
+using ofi_plugin_t = nixlBackendPluginCreator<nixlOfiEngine>;
 
-    static const char *
-    get_plugin_name() {
-        return PLUGIN_NAME;
-    }
-    
-    static const char *
-    get_plugin_version() {
-        return PLUGIN_VERSION;
-    }
-    
-    static nixl_b_params_t
-    get_backend_options() {
-        nixl_b_params_t params;
-        params["provider"] = "verbs";  // Default to verbs as per requirements
-        params["eq_timeout_ms"] = "100";
-        return params;
-    }
-    
-    static nixl_mem_list_t
-    get_backend_mems() {
-        nixl_mem_list_t mems;
-        mems.push_back (DRAM_SEG);
-        mems.push_back (VRAM_SEG);
-        return mems;
-    }
-
-    // Static plugin structure
-    static nixlBackendPlugin plugin = {NIXL_PLUGIN_API_VERSION,
-                                       create_ofi_engine,
-                                       destroy_ofi_engine,
-                                       get_plugin_name,
-                                       get_plugin_version,
-                                       get_backend_options,
-                                       get_backend_mems};
+namespace {
+nixl_b_params_t
+get_ofi_backend_options() {
+    nixl_b_params_t params;
+    params["eq_timeout_ms"] = "100";
+    return params;
+}
 } // namespace
 
 #ifdef STATIC_PLUGIN_OFI
-
 nixlBackendPlugin *
 createStaticOFIPlugin() {
-    return &plugin; // Return the static plugin instance
+    return ofi_plugin_t::create(
+        NIXL_PLUGIN_API_VERSION, "OFI", "0.1.0", get_ofi_backend_options(), {DRAM_SEG, VRAM_SEG});
 }
-
 #else
-
-// Plugin initialization function
 extern "C" NIXL_PLUGIN_EXPORT nixlBackendPlugin *
 nixl_plugin_init() {
-    return &plugin;
+    return ofi_plugin_t::create(
+        NIXL_PLUGIN_API_VERSION, "OFI", "0.1.0", get_ofi_backend_options(), {DRAM_SEG, VRAM_SEG});
 }
 
-// Plugin cleanup function
 extern "C" NIXL_PLUGIN_EXPORT void
-nixl_plugin_fini() {
-    // Cleanup
-}
-
+nixl_plugin_fini() {}
 #endif

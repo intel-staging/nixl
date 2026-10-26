@@ -80,8 +80,6 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     connectionProgressEnabled_(false),
     connectionProgressDelay_(10000), // 10ms for connection events
     lastProgressTime_{std::chrono::steady_clock::now()},
-    hmemZeSupported_(false),
-    hmemCudaSupported_(false),
     hmemSynapseaiSupported_(false)
 {
     int ret = 0;
@@ -120,7 +118,7 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     }
 
     // HMEM determination strategy:
-    // 1 environment variables: HMEM=1 (auto-detect), HMEM_SYNAPSEAI=1, HMEM_CUDA=1, HMEM_ZE=1
+    // 1 environment variables: HMEM=1 (auto-detect), HMEM_SYNAPSEAI=1
     // 2 application registers VRAM memory type during registerMem() call
     // 3 device discovery during registration if not overridden
     
@@ -131,10 +129,10 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
         return env_val && (strcmp(env_val, "1") == 0 || strcmp(env_val, "true") == 0);
     };
     
-    const char* hmem_vars[] = {"HMEM_SYNAPSEAI", "HMEM_CUDA", "HMEM_ZE", "HMEM"};
-    const char* hmem_names[] = {"SynapseAI", "CUDA", "ZE", "auto-detection"};
+    const char* hmem_vars[] = {"HMEM_SYNAPSEAI", "HMEM"};
+    const char* hmem_names[] = {"SynapseAI", "auto-detection"};
     
-    for (size_t i = 0; i < 4; ++i) {
+    for (size_t i = 0; i < 2; ++i) {
         const char* env_val = getenv(hmem_vars[i]);
         if (isEnvTrue(env_val)) {
             need_hmem = true;
@@ -213,8 +211,7 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
                << " isConnectionless=" << isConnectionless_;
 
     // detect HMEM capabilities for this provider
-    detectHmemCapabilities(fi_, providerName_, hmemCudaSupported_,
-                           hmemZeSupported_, hmemSynapseaiSupported_);
+    detectHmemCapabilities(fi_, providerName_, hmemSynapseaiSupported_);
 
     ret = fi_fabric(fi_->fabric_attr, &fabric_, nullptr);
     if (ret) {
@@ -292,14 +289,6 @@ cleanup_teardown:
     this->initErr = true;
 }
 
-void nixlOfiEngine::getStringParam(const nixlBackendInitParams* init_params, const std::string& key, std::string& value) {
-    const auto &params = getCustomParams();
-    auto it = params.find(key);
-    if (it != params.end()) {
-        value = it->second;
-    }
-}
-
 void nixlOfiEngine::getLongParam(const nixlBackendInitParams* init_params, const std::string& key, long& value, long min_val, long max_val) {
     const auto &params = getCustomParams();
     auto it = params.find(key);
@@ -313,20 +302,6 @@ void nixlOfiEngine::getLongParam(const nixlBackendInitParams* init_params, const
             }
         } catch (const std::exception& e) {
             NIXL_WARN << "Invalid " << key << " parameter: " << it->second << ", using default " << value;
-        }
-    }
-}
-
-void nixlOfiEngine::getSizeTParam(const nixlBackendInitParams* init_params, const std::string& key, size_t& value) {
-    const auto &params = getCustomParams();
-    auto it = params.find(key);
-    if (it != params.end()) {
-        try {
-            size_t parsed_val = std::stoull(it->second);
-            value = parsed_val;
-            NIXL_DEBUG << "Set " << key << " to " << value;
-        } catch (const std::exception& e) {
-            NIXL_WARN << "Invalid " << key << ": " << it->second << ", keeping default " << value;
         }
     }
 }
@@ -513,13 +488,7 @@ nixl_status_t nixlOfiEngine::genNotif(const std::string &remote_agent, const std
 nixl_mem_list_t nixlOfiEngine::getSupportedMems() const {
     nixl_mem_list_t mems;
     mems.push_back(DRAM_SEG);
-    if (hmemCudaSupported_) {
-        mems.push_back(VRAM_SEG);
-    }
     if (hmemSynapseaiSupported_) {
-        mems.push_back(VRAM_SEG);
-    }
-    if (hmemZeSupported_) {
         mems.push_back(VRAM_SEG);
     }
     return mems;
@@ -766,8 +735,6 @@ nixl_status_t nixlOfiEngine::registerMem(const nixlBlobDesc &mem,
         
         if (iface == FI_HMEM_SYNAPSEAI) {
             status = registerSynapseAIMemoryExplicit(mem, ofi_meta);
-        } else if (iface != FI_HMEM_SYSTEM) {
-            status = registerHmemMemory(mem, ofi_meta, iface, device_id);
         } else {
             // VRAM requested but no device interface available - fallback
             NIXL_WARN << "VRAM requested but no HMEM interface available - falling back to system memory";
@@ -1540,8 +1507,6 @@ nixl_status_t nixlOfiEngine::getEndpointAddress(fid_ep* endpoint, std::string& a
 
 void nixlOfiEngine::detectHmemCapabilities(struct fi_info* fi_info,
                                             const std::string& provider_name,
-                                            bool& cuda_supported,
-                                            bool& ze_supported,
                                             bool& synapseai_supported) {
     // Check if provider supports generic HMEM capability
     if (!fi_info || !(fi_info->caps & FI_HMEM)) {
@@ -1555,21 +1520,12 @@ void nixlOfiEngine::detectHmemCapabilities(struct fi_info* fi_info,
         } else {
             synapseai_supported = false;
         }
-        
-        cuda_supported = false;
-        ze_supported = false;
         return;
     }
 
     NIXL_DEBUG << "Provider " << provider_name << " supports generic HMEM capability";
 
-    // for now, conservatively enable all interfaces if HMEM is supported
-    // TODO: determine which specific interfaces actually work
-    cuda_supported = true;
-    ze_supported = true; 
     synapseai_supported = true;
-
-    NIXL_DEBUG << "HMEM interfaces marked as potentially available - runtime detection will validate";
 }
 
 uint64_t nixlOfiEngine::getMemoryRegistrationAccessFlags(const struct fi_info* fi_info) {
@@ -1604,23 +1560,14 @@ fi_hmem_iface nixlOfiEngine::selectHmemInterface(const nixlBlobDesc &mem, uint64
         return true;
     };
     
-    auto validateCudaDevice = [](uint64_t dev_id) -> bool {
-        // TODO: add proper CUDA device validation
-        return true;
-    };
-    
-    auto validateZeDevice = [](uint64_t dev_id) -> bool {
-        // TODO: add proper ZE device validation
-        return true;
-    };
     
     // HMEM interface configuration
     struct HmemConfig {
         fi_hmem_iface iface;
         bool supported;
         const char* name;
-        const char* explicit_env;      // HMEM_SYNAPSEAI, HMEM_CUDA, etc.
-        const char* implicit_env;      // HABANA_VISIBLE_DEVICES, CUDA_VISIBLE_DEVICES, etc.
+        const char* explicit_env;      // HMEM_SYNAPSEAI
+        const char* implicit_env;      // HABANA_VISIBLE_DEVICES
         std::function<bool(uint64_t)> validate;
     };
     
@@ -1632,22 +1579,6 @@ fi_hmem_iface nixlOfiEngine::selectHmemInterface(const nixlBlobDesc &mem, uint64
             "HMEM_SYNAPSEAI", 
             "HABANA_VISIBLE_DEVICES",
             validateSynapseAIDevice
-        },
-        {
-            FI_HMEM_CUDA, 
-            hmemCudaSupported_, 
-            "CUDA",
-            "HMEM_CUDA", 
-            "CUDA_VISIBLE_DEVICES",
-            validateCudaDevice
-        },
-        {
-            FI_HMEM_ZE, 
-            hmemZeSupported_, 
-            "ZE",
-            "HMEM_ZE", 
-            "ZE_AFFINITY_MASK",
-            validateZeDevice
         }
     };
     
@@ -1712,49 +1643,6 @@ nixl_status_t nixlOfiEngine::registerDramMemory(const nixlBlobDesc &mem, nixlOfi
     
     return NIXL_SUCCESS;
 }
-
-nixl_status_t nixlOfiEngine::registerHmemMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta, fi_hmem_iface iface, uint64_t device_id) const {
-    if (device_id >= UINT32_MAX) {
-        NIXL_ERROR << "Invalid device ID: " << device_id;
-        return NIXL_ERR_INVALID_PARAM;
-    }
-    
-    struct fi_mr_attr mr_attr = {};
-    struct iovec iov = {};
-    
-    iov.iov_base = reinterpret_cast<void*>(mem.addr);
-    iov.iov_len = mem.len;
-    
-    mr_attr.mr_iov = &iov;
-    mr_attr.iov_count = 1;
-    mr_attr.access = getMemoryRegistrationAccessFlags(fi_);
-    mr_attr.iface = iface;
-    
-    switch (iface) {
-        case FI_HMEM_CUDA:
-            mr_attr.device.cuda = static_cast<uint32_t>(device_id);
-            break;
-        case FI_HMEM_ZE:
-            mr_attr.device.ze = static_cast<uint32_t>(device_id);
-            break;
-        case FI_HMEM_SYNAPSEAI:
-            mr_attr.device.synapseai = static_cast<uint32_t>(device_id);
-            break;
-        default:
-            NIXL_ERROR << "Unsupported HMEM interface: " << iface;
-            return NIXL_ERR_NOT_SUPPORTED;
-    }
-    
-    int ret = fi_mr_regattr(domain_, &mr_attr, 0, &ofi_meta->mr);
-    if (ret) {
-        NIXL_ERROR << "fi_mr_regattr failed for HMEM: " << fi_strerror(-ret);
-        ofi_meta->mr = nullptr;
-        return NIXL_ERR_BACKEND;
-    }
-    
-    return NIXL_SUCCESS;
-}
-
 
 nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const {
     // Try to get device info from the memory descriptor first
