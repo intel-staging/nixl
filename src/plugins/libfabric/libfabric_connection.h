@@ -91,9 +91,17 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
      * local_write_tag_ is the tag we handed this peer, mapped on our rails to its agent index and
      * released on disconnect. peer_write_tag_ is the one it handed us, stamped on our writes to it;
      * set from its handshake (or to local_write_tag_ for the self-connection), before any write.
+     *
+     * A tag is reused once its connection is gone, but its old holder is not told and may keep
+     * writing. So each tag also has a generation, bumped on every reuse and stamped in the SEQ_ID
+     * bits; the target drops a write whose generation is not the current one. local_write_gen_ and
+     * peer_write_gen_ pair with the two tags above; peer_write_gen_ stays 0 for a peer that
+     * predates generations, and then nothing is stamped or checked.
      */
     uint8_t local_write_tag_ = 0;
+    uint8_t local_write_gen_ = 0;
     std::atomic<uint8_t> peer_write_tag_{0};
+    std::atomic<uint8_t> peer_write_gen_{0};
     std::atomic<ConnectionState> overall_state_; // Current connection state
 
     // Set once the peer holds our endpoints in its AV, so it can attribute our traffic.

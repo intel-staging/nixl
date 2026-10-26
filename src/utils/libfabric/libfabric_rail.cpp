@@ -1226,13 +1226,23 @@ nixlLibfabricRail::processRemoteWriteCompletion(struct fi_cq_data_entry *comp,
     if (msg_type == NIXL_LIBFABRIC_MSG_TRANSFER) {
         // A tagged write names its sender itself: its provider reports no usable source address.
         const uint8_t write_tag = static_cast<uint8_t>(NIXL_GET_WRITE_TAG_FROM_IMM(comp->data));
-        const uint32_t agent_idx =
-            write_tag != 0 ? resolveWriteTag(write_tag) : resolveSourceAddress(src_addr);
+        const uint8_t write_gen = static_cast<uint8_t>(NIXL_GET_WRITE_GEN_FROM_IMM(comp->data));
+        const uint32_t agent_idx = write_tag != 0 ? resolveWriteTag(write_tag, write_gen) :
+                                                    resolveSourceAddress(src_addr);
         if (agent_idx == kUnknownAgentIdx) {
-            NIXL_ERROR << "Remote write completion on rail " << rail_id
-                       << " from unknown src_addr=" << src_addr
-                       << " write_tag=" << static_cast<unsigned>(write_tag) << " XFER_ID=" << xfer_id
-                       << "; cannot credit it to a pending notification";
+            // A peer we disconnected is not told and may keep writing, so this can repeat for every
+            // write it makes: log the 1st, 2nd, 4th, 8th, ... occurrence on this rail.
+            const uint64_t n = dropped_remote_writes_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0) {
+                NIXL_ERROR << "Remote write completion on rail " << rail_id
+                           << " from unknown src_addr=" << src_addr
+                           << " write_tag=" << static_cast<unsigned>(write_tag)
+                           << " write_gen=" << static_cast<unsigned>(write_gen)
+                           << " XFER_ID=" << xfer_id
+                           << "; cannot credit it to a pending notification (from a disconnected "
+                              "peer, or one whose tag has since been reassigned). "
+                           << n << " such write(s) dropped on this rail so far";
+            }
             // Handled by dropping it; not an error for whichever caller progressed the CQ.
             return NIXL_SUCCESS;
         }
@@ -2082,12 +2092,31 @@ nixlLibfabricRail::unmapWriteTag(uint8_t write_tag, uint32_t agent_idx) const {
     std::unique_lock<std::shared_mutex> lk(src_addr_mutex_);
     if (write_tag != 0 && write_tag_to_agent_[write_tag] == agent_idx) {
         write_tag_to_agent_[write_tag] = kUnknownAgentIdx;
+        write_tag_gen_[write_tag] = 0;
     }
 }
 
 uint32_t
 nixlLibfabricRail::resolveWriteTag(uint8_t write_tag) const {
     std::shared_lock<std::shared_mutex> lk(src_addr_mutex_);
+    return write_tag_to_agent_[write_tag];
+}
+
+void
+nixlLibfabricRail::requireWriteGen(uint8_t write_tag, uint32_t agent_idx, uint8_t write_gen) const {
+    std::unique_lock<std::shared_mutex> lk(src_addr_mutex_);
+    if (write_tag != 0 && write_tag_to_agent_[write_tag] == agent_idx) {
+        write_tag_gen_[write_tag] = write_gen;
+    }
+}
+
+uint32_t
+nixlLibfabricRail::resolveWriteTag(uint8_t write_tag, uint8_t write_gen) const {
+    std::shared_lock<std::shared_mutex> lk(src_addr_mutex_);
+    const uint8_t required = write_tag_gen_[write_tag];
+    if (required != 0 && required != write_gen) {
+        return kUnknownAgentIdx;
+    }
     return write_tag_to_agent_[write_tag];
 }
 

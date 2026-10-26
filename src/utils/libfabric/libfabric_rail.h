@@ -524,6 +524,17 @@ public:
     [[nodiscard]] uint32_t
     resolveWriteTag(uint8_t write_tag) const;
 
+    /** From now on accept @p write_tag only with generation @p write_gen, if the tag still names
+     *  @p agent_idx. Called once that peer has shown it stamps generations (its handshake carries
+     *  "wgen"); until then, and for a peer that never does, the generation bits are not checked. */
+    void
+    requireWriteGen(uint8_t write_tag, uint32_t agent_idx, uint8_t write_gen) const;
+
+    /** resolveWriteTag(), also returning kUnknownAgentIdx when the tag requires a generation and
+     *  @p write_gen is not it: a write from the peer that held the tag before. */
+    [[nodiscard]] uint32_t
+    resolveWriteTag(uint8_t write_tag, uint8_t write_gen) const;
+
     // Memory descriptor helper methods
     /** Get libfabric memory descriptor for MR */
     void *
@@ -712,6 +723,10 @@ private:
     // address (see providerNeedsWriteTag()). Slot 0 is "no tag" and stays unmapped. Guarded by
     // src_addr_mutex_.
     mutable std::array<uint32_t, NIXL_LIBFABRIC_MAX_WRITE_TAG + 1> write_tag_to_agent_;
+    // Generation each write tag must carry, 0 = not checked. Guarded by src_addr_mutex_.
+    mutable std::array<uint8_t, NIXL_LIBFABRIC_MAX_WRITE_TAG + 1> write_tag_gen_{};
+    // Remote writes dropped as unattributable; only logs are rate-limited by it.
+    mutable std::atomic<uint64_t> dropped_remote_writes_{0};
 
     // Separate request pools for optimal performance
     ControlRequestPool control_request_pool_;

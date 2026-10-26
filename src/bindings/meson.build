@@ -13,7 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-subdir('python')
+# Local build workaround (bmg6, air-gapped): skip Python bindings when pybind11
+# is unavailable. Not needed for the LIBFABRIC plugin / nixlbench.
+if dependency('pybind11', required: false).found()
+  subdir('python')
+else
+  message('pybind11 not found; skipping Python bindings')
+endif
 
 # Shared library exposing the nixl C API (nixl_capi_* symbols).
 # Always built so LD_PRELOAD can override stub symbols at runtime when

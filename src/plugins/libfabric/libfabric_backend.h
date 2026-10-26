@@ -189,6 +189,8 @@ private:
     std::bitset<NIXL_LIBFABRIC_MAX_WRITE_TAG + 1> write_tags_in_use_;
     // Where the search for a free tag starts, so a released tag is reused as late as possible.
     uint8_t next_write_tag_ = 1;
+    // Last generation handed out per tag; see nixlLibfabricConnection::local_write_gen_.
+    std::array<uint8_t, NIXL_LIBFABRIC_MAX_WRITE_TAG + 1> write_tag_gen_{};
 
     // Threading infrastructure - remaining members
     // Connection Management (CM) thread
@@ -261,9 +263,14 @@ private:
     std::unordered_map<uint64_t, PendingNotification> pending_notifications_;
 
     // Agents whose handshake arrived before the local createAgentConnection had registered
-    // them in connections_, with the write tag it carried (0 if none). Drained inside
-    // createAgentConnection.
-    std::unordered_map<std::string, uint8_t> pending_inbound_handshakes_;
+    // them in connections_, with the write tag and generation it carried (0 if none). Drained
+    // inside createAgentConnection.
+    struct BufferedWriteTag {
+        uint8_t tag = 0;
+        uint8_t gen = 0;
+        bool has_gen = false; // the peer sent "wgen", so it stamps the generation we handed it
+    };
+    std::unordered_map<std::string, BufferedWriteTag> pending_inbound_handshakes_;
     // Same, for handshakes rejected for their protocol version: agent name -> peer's version.
     std::unordered_map<std::string, uint16_t> pending_rejected_handshakes_;
     std::mutex pending_handshake_mutex_;
@@ -301,6 +308,11 @@ private:
     // connection_state_mutex_.
     void
     releaseWriteTag(const nixlLibfabricConnection &conn);
+
+    // The peer's handshake carried "wgen", so it stamps the generation of the tag we handed it:
+    // from now on drop writes under that tag with any other generation.
+    void
+    requireWriteGenFrom(const nixlLibfabricConnection &conn);
 
     // Private notification implementation with unified binary notification system
     nixl_status_t
@@ -706,13 +718,19 @@ public:
 
     // Notification Queuing Helper Methods
     /**
-     * @brief Process pending notifications that are now ready
+     * @brief Process the pending notification @p key if it is now ready
      *
-     * Checks pending notifications to see if their associated transfers
-     * have completed and moves them to the main notification list.
+     * Moves it to the main notification list once its transfer's writes and fragments are all in,
+     * or drops it if its transfer failed. Only the entry an event touched can have become ready, so
+     * only that one is looked at; scanning them all made every remote write cost O(entries).
      */
     void
-    checkPendingNotifications();
+    checkPendingNotification(uint64_t key);
+
+    // Drop the pending notifications of a disconnected sender. Its agent index is never reused, so
+    // nothing else would ever complete or remove them.
+    void
+    dropPendingNotificationsFrom(uint32_t sender_peer_idx);
 };
 
 #endif

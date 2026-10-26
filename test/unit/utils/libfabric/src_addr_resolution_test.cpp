@@ -413,6 +413,73 @@ testTaggedWriteCompletionAttribution(nixlLibfabricRailManager &mgr) {
     return 0;
 }
 
+// A reused tag carries a new generation; writes stamped with the old one come from the peer that
+// held the tag before (it is not told it was disconnected) and must not be credited to the new
+// holder.
+static int
+testWriteTagGenerations(nixlLibfabricRailManager &mgr) {
+    NIXL_INFO << "  testWriteTagGenerations";
+    mock_av_reset();
+    queue_reset();
+
+    nixlLibfabricRail &rail = mgr.getRail(0);
+    std::vector<std::pair<uint16_t, uint32_t>> seen; // (xfer_id, agent_idx)
+    rail.setXferIdCallback([&seen](uint64_t imm_data, uint32_t agent_idx) {
+        seen.emplace_back(static_cast<uint16_t>(NIXL_GET_XFER_ID_FROM_IMM(imm_data)), agent_idx);
+    });
+    auto make_write = [](uint8_t write_tag, uint8_t write_gen, uint16_t xfer_id) {
+        FakeCompletion fc{};
+        fc.entry.flags = FI_REMOTE_WRITE | FI_REMOTE_CQ_DATA | FI_RMA;
+        fc.entry.len = 4096;
+        fc.entry.data = NIXL_MAKE_TAGGED_IMM_DATA(
+            NIXL_LIBFABRIC_MSG_TRANSFER, write_tag, xfer_id, write_gen);
+        fc.src_addr = FI_ADDR_NOTAVAIL;
+        return fc;
+    };
+
+    // Agent 40 holds tag 9 at generation 3; until it has shown it stamps generations, any is taken.
+    mgr.mapWriteTag(9, 40);
+    pending_completions.push_back(make_write(9, 11, 1));
+    TEST_ASSERT(rail.progressCompletionQueue() == NIXL_SUCCESS, "progress (unchecked)");
+    TEST_ASSERT(seen.size() == 1 && seen[0].second == 40u,
+                "generation not checked before requireWriteGen (a peer that predates it)");
+
+    mgr.requireWriteGen(9, 40, 3);
+    mgr.requireWriteGen(9, 41, 5); // for an agent that does not hold the tag: no effect
+    queue_reset();
+    seen.clear();
+    pending_completions.push_back(make_write(9, 3, 2));
+    pending_completions.push_back(make_write(9, 2, 3));
+    TEST_ASSERT(rail.progressCompletionQueue() == NIXL_SUCCESS, "progress (checked)");
+    TEST_ASSERT(seen.size() == 1 && seen[0].first == 2 && seen[0].second == 40u,
+                "current generation credited, another generation dropped");
+
+    // Released and handed to agent 50 at generation 4: agent 40's late writes (generation 3) are
+    // dropped, agent 50's are credited.
+    mgr.unmapWriteTag(9, 40);
+    mgr.mapWriteTag(9, 50);
+    mgr.requireWriteGen(9, 50, 4);
+    queue_reset();
+    seen.clear();
+    pending_completions.push_back(make_write(9, 3, 7));
+    pending_completions.push_back(make_write(9, 4, 8));
+    TEST_ASSERT(rail.progressCompletionQueue() == NIXL_SUCCESS, "progress (reused tag)");
+    TEST_ASSERT(seen.size() == 1 && seen[0].first == 8 && seen[0].second == 50u,
+                "old holder's write dropped after reuse, new holder's credited");
+    TEST_ASSERT(mgr.getRail(1).resolveWriteTag(9, 3) == nixlLibfabricRail::kUnknownAgentIdx &&
+                    mgr.getRail(1).resolveWriteTag(9, 4) == 50u,
+                "generation required on every rail");
+
+    // Unmapping clears the requirement with the mapping.
+    mgr.unmapWriteTag(9, 50);
+    mgr.mapWriteTag(9, 60);
+    TEST_ASSERT(rail.resolveWriteTag(9, 1) == 60u, "unmap reset the required generation");
+
+    mgr.unmapWriteTag(9, 60);
+    rail.setXferIdCallback(nullptr);
+    return 0;
+}
+
 static int
 testRecvCompletionAttribution(nixlLibfabricRailManager &mgr) {
     NIXL_INFO << "  testRecvCompletionAttribution";
@@ -564,6 +631,9 @@ main() {
         return res;
     }
     if ((res = testTaggedWriteCompletionAttribution(mgr)) != 0) {
+        return res;
+    }
+    if ((res = testWriteTagGenerations(mgr)) != 0) {
         return res;
     }
     if ((res = testRecvCompletionAttribution(mgr)) != 0) {

@@ -55,6 +55,17 @@ Notes specific to Intel GPUs:
 - Device memory over `verbs` needs a libfabric build whose verbs provider advertises `FI_HMEM` — see
   the note under [Provider Selection](#provider-selection). `efa` cannot carry `FI_HMEM_ZE` at all
   (`efa_hmem_ifaces[]` has no entry for it).
+- **Allocate VRAM for NIXL as exportable.** Chain a `ze_external_memory_export_desc_t` with
+  `ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF` into `zeMemAllocDevice()`. Without it, in a context that
+  holds a single device (for example under `ZE_AFFINITY_MASK`), the driver may
+  - **pool** allocations up to 2 MiB into shared buffer objects. libfabric would then register
+    them at the wrong offset and the NIC would move another allocation's bytes. The plugin detects
+    this and refuses the registration (`registerMem()` fails, and the log says why).
+  - **compress** the allocation. The NIC sees raw compressed bytes, so the destination receives
+    garbage, and on the sending side the buffer has been seen to read back as zeros afterwards.
+    Level Zero offers no way to query compression, so this cannot be detected at registration.
+
+  With all GPUs visible, or with the export descriptor, neither happens.
 
 ### Network Hardware Requirements
 

@@ -295,6 +295,11 @@ public:
     void
     unmapWriteTag(uint8_t write_tag, uint32_t agent_idx);
 
+    /** Require @p write_gen with @p write_tag on every rail.
+     *  See nixlLibfabricRail::requireWriteGen(). */
+    void
+    requireWriteGen(uint8_t write_tag, uint32_t agent_idx, uint8_t write_gen);
+
     /** Clean up connection resources for rails
      * @param fi_addrs_to_remove Libfabric addresses to remove
      * @return NIXL_SUCCESS on success, error code on failure
@@ -320,6 +325,8 @@ public:
      * @param completion_callback Callback for completion notification
      * @param write_tag Tag the target assigned us for its write attribution, carried in each
      *        write's imm_data; 0 when it assigned none. Ignored for READ.
+     * @param write_gen Generation of @p write_tag, carried in the SEQ_ID bits; 0 when the target
+     *        sent none (it predates generations), in which case SEQ_ID is filled as before.
      * @param submitted_count_out Number of requests successfully submitted
      * @param desc_idx Index of current descriptor within the transfer
      * @param base_offset Pre-reserved round-robin offset from reserveBaseOffset()
@@ -347,6 +354,7 @@ public:
                              const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
                              uint16_t xfer_id,
                              uint8_t write_tag,
+                             uint8_t write_gen,
                              std::function<void(nixl_status_t)> completion_callback,
                              size_t &submitted_count_out,
                              int desc_idx,
@@ -358,6 +366,7 @@ public:
     deferTransferRequest(nixlLibfabricReq::OpType op_type,
                          uint16_t xfer_id,
                          uint8_t write_tag,
+                         uint8_t write_gen,
                          uint64_t fi_flags,
                          fi_addr_t dest_addr,
                          const struct nfi_hmem_info &hmem_info,

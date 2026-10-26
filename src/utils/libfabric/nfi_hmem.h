@@ -130,6 +130,19 @@ struct nfi_hmem_info {
 
 	/** PCI address, valid only when @ref bus_kind is not NFI_HMEM_BUS_NONE. */
 	struct nfi_hmem_bus_id bus;
+
+	/**
+	 * Nonzero when the dma-buf the runtime exports for this pointer is larger than the
+	 * allocation holding it: the allocation is a slice of a pooled buffer object. libfabric
+	 * registers such memory at the wrong offset into that object (it takes the offset from the
+	 * allocation's own base), so the NIC would move another allocation's bytes. The value is the
+	 * dma-buf size, and @ref alloc_size the allocation's. Level Zero only; 0 elsewhere and
+	 * whenever the size could not be determined.
+	 */
+	uint64_t pooled_dmabuf_size;
+
+	/** Size of the allocation holding the pointer; set together with @ref pooled_dmabuf_size. */
+	uint64_t alloc_size;
 };
 
 /**

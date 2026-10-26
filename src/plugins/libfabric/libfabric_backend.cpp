@@ -329,6 +329,11 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
             rail_manager_.getRail(rail_id).setXferIdCallback(
                 [this](uint64_t imm_data, uint32_t sender_peer_idx) {
                     uint16_t xfer_id = NIXL_GET_XFER_ID_FROM_IMM(imm_data);
+                    // A write of a transfer without a notification: nothing waits for it, and a
+                    // placeholder for it would never be removed.
+                    if (xfer_id == NIXL_UNTRACKED_XFER_ID) {
+                        return;
+                    }
                     addReceivedXferId(xfer_id, sender_peer_idx);
                 });
             NIXL_DEBUG << "Set XFER_ID callback for rail " << rail_id;
@@ -577,6 +582,7 @@ nixlLibfabricEngine::disconnect(const std::string &remote_agent) {
     rail_manager_.unmapAgentAddresses(it->second->rail_remote_addr_list_,
                                       static_cast<uint32_t>(it->second->agent_index_));
     releaseWriteTag(*it->second);
+    dropPendingNotificationsFrom(static_cast<uint32_t>(it->second->agent_index_));
     connections_.erase(it);
     return status;
 }
@@ -624,12 +630,18 @@ nixlLibfabricEngine::createAgentConnection(
                           "remote writes, so it supports at most that many connected agents";
             return NIXL_ERR_NOT_SUPPORTED;
         }
+        // A new generation on every reuse, so writes from the tag's previous holder are told apart.
+        uint8_t &gen = write_tag_gen_[conn->local_write_tag_];
+        gen = (gen >= NIXL_LIBFABRIC_MAX_WRITE_GEN) ? 1 : gen + 1;
+        conn->local_write_gen_ = gen;
         // Mapped before our handshake goes out: the peer only writes to us after receiving it.
         rail_manager_.mapWriteTag(conn->local_write_tag_,
                                   static_cast<uint32_t>(conn->agent_index_));
         if (agent_name == localAgent) {
             // Our writes to ourselves are attributed by the tag we just handed ourselves.
             conn->peer_write_tag_.store(conn->local_write_tag_, std::memory_order_release);
+            conn->peer_write_gen_.store(conn->local_write_gen_, std::memory_order_release);
+            requireWriteGenFrom(*conn);
         }
     }
 
@@ -683,7 +695,7 @@ nixlLibfabricEngine::createAgentConnection(
     // them locally.
     if (agent_name != localAgent) {
         bool buffered = false;
-        uint8_t buffered_write_tag = 0;
+        BufferedWriteTag buffered_write_tag;
         std::optional<uint16_t> rejected_ver;
         {
             std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
@@ -707,8 +719,12 @@ nixlLibfabricEngine::createAgentConnection(
         if (buffered) {
             {
                 std::lock_guard<std::mutex> hlk(conn->handshake_mutex_);
-                conn->peer_write_tag_.store(buffered_write_tag, std::memory_order_release);
+                conn->peer_write_tag_.store(buffered_write_tag.tag, std::memory_order_release);
+                conn->peer_write_gen_.store(buffered_write_tag.gen, std::memory_order_release);
                 conn->handshake_received_.store(true, std::memory_order_release);
+            }
+            if (buffered_write_tag.has_gen) {
+                requireWriteGenFrom(*conn);
             }
             conn->handshake_cv_.notify_all();
             NIXL_INFO << "Applied buffered handshake from '" << agent_name << "'";
@@ -732,6 +748,16 @@ nixlLibfabricEngine::allocateWriteTag() {
         }
     }
     return 0;
+}
+
+void
+nixlLibfabricEngine::requireWriteGenFrom(const nixlLibfabricConnection &conn) {
+    if (conn.local_write_tag_ == 0) {
+        return;
+    }
+    rail_manager_.requireWriteGen(conn.local_write_tag_,
+                                  static_cast<uint32_t>(conn.agent_index_),
+                                  conn.local_write_gen_);
 }
 
 void
@@ -910,6 +936,21 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
             NIXL_WARN << "No accelerator runtime claimed VRAM buffer " << (void *)mem.addr
                       << ", registering on all rails as iface "
                       << nfi_hmem_iface_name(fallback_iface) << " device " << mem.devId;
+        }
+
+        if (hmem_info.pooled_dmabuf_size != 0) {
+            // Refused rather than registered: libfabric would map it at the wrong offset into
+            // the pool, and every transfer would silently move another allocation's bytes.
+            NIXL_ERROR << "Cannot register VRAM buffer " << (void *)mem.addr << ": its "
+                       << hmem_info.alloc_size << "-byte allocation is part of a "
+                       << hmem_info.pooled_dmabuf_size << "-byte pooled "
+                       << nfi_hmem_iface_name(hmem_info.iface)
+                       << " buffer object, which the NIC would address at the wrong offset. "
+                       << "Allocate memory for NIXL with zeMemAllocDevice() and a chained "
+                       << "ze_external_memory_export_desc_t "
+                       << "(ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF); that also keeps it "
+                       << "uncompressed, which the NIC needs as well";
+            return NIXL_ERR_NOT_SUPPORTED;
         }
 
         NIXL_DEBUG << "Queried PCI bus ID: " << accelBusIdString(hmem_info) << " (iface "
@@ -1315,8 +1356,12 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
             conn->peer_rail_for_local_rail_,
             conn->rail_unreachable_,
             conn->rail_remote_addr_list_,
-            backend_handle->post_xfer_id,
+            // Only a notified WRITE's writes are matched by the target; see NIXL_UNTRACKED_XFER_ID.
+            (backend_handle->has_notif && op_type == nixlLibfabricReq::WRITE) ?
+                backend_handle->post_xfer_id :
+                static_cast<uint16_t>(NIXL_UNTRACKED_XFER_ID),
             conn->peer_write_tag_.load(std::memory_order_acquire),
+            conn->peer_write_gen_.load(std::memory_order_acquire),
             [backend_handle](nixl_status_t status) {
                 backend_handle->complete_request(status);
             }, // Completion callback
@@ -2152,12 +2197,6 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif,
                        << " expected_msg_fragments=" << notif_seq_len;
         }
 
-        // Initialize fragment vector on first fragment (check if vector is empty)
-        if (it->second.message_fragments.empty()) {
-            it->second.message_fragments.resize(notif_seq_len);
-            it->second.expected_msg_fragments = notif_seq_len;
-        }
-
         // Validate fragment index
         if (notif_seq_id >= notif_seq_len) {
             NIXL_ERROR << "Invalid fragment sequence: notif_seq_id=" << notif_seq_id
@@ -2165,11 +2204,27 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif,
             return;
         }
 
-        // Check for duplicate fragment
-        if (!it->second.message_fragments[notif_seq_id].empty()) {
-            NIXL_WARN << "Duplicate fragment received: sender_peer_idx=" << sender_peer_idx
-                      << " notif_xfer_id=" << notif_xfer_id << " notif_seq_id=" << notif_seq_id;
-            return;
+        /*
+         * Fragments already stored under this key with another fragment count, or in this
+         * fragment's slot, are not duplicates -- each fragment is sent once, over a reliable
+         * connection -- but an entry left behind by an earlier use of this XFER_ID: the
+         * notification of a failed transfer arriving after the transfer was dropped. Replace its
+         * notification with this one. Its write count stays: the failed transfer's writes had all
+         * arrived before it was dropped, so any counted since belong to this transfer.
+         */
+        if (it->second.message_fragments.empty()) {
+            it->second.message_fragments.resize(notif_seq_len);
+            it->second.expected_msg_fragments = notif_seq_len;
+        } else if (it->second.message_fragments.size() != notif_seq_len ||
+                   !it->second.message_fragments[notif_seq_id].empty()) {
+            NIXL_WARN << "Replacing a stale notification left under sender_peer_idx="
+                      << sender_peer_idx << " notif_xfer_id=" << notif_xfer_id
+                      << " by an earlier use of that XFER_ID";
+            it->second.message_fragments.assign(notif_seq_len, std::string());
+            it->second.expected_msg_fragments = notif_seq_len;
+            it->second.received_msg_fragments = 0;
+            it->second.expected_completions = INT_MAX;
+            it->second.xfer_failed = false;
         }
 
         // Store payload chunk (combined agent_name + message chunk)
@@ -2196,7 +2251,7 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif,
     }
 
     // Check if any notifications can now be completed (after releasing the lock)
-    checkPendingNotifications();
+    checkPendingNotification(makePendingKey(sender_peer_idx, notif_xfer_id));
 }
 
 void
@@ -2228,7 +2283,7 @@ nixlLibfabricEngine::handleXferError(uint16_t notif_xfer_id,
     }
 
     // Check if any notifications can now be completed
-    checkPendingNotifications();
+    checkPendingNotification(makePendingKey(sender_peer_idx, notif_xfer_id));
 }
 
 /****************************************
@@ -2261,7 +2316,7 @@ nixlLibfabricEngine::addReceivedXferId(uint16_t xfer_id, uint32_t sender_peer_id
     }
 
     // Check if any notifications can now be completed (after releasing the lock)
-    checkPendingNotifications();
+    checkPendingNotification(makePendingKey(sender_peer_idx, xfer_id));
 }
 
 /****************************************
@@ -2269,10 +2324,10 @@ nixlLibfabricEngine::addReceivedXferId(uint16_t xfer_id, uint32_t sender_peer_id
  *****************************************/
 
 void
-nixlLibfabricEngine::checkPendingNotifications() {
+nixlLibfabricEngine::checkPendingNotification(uint64_t key) {
     std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
-    auto it = pending_notifications_.begin();
-    while (it != pending_notifications_.end()) {
+    auto it = pending_notifications_.find(key);
+    if (it != pending_notifications_.end()) {
         // Check BOTH conditions: fragments complete AND writes complete
         bool fragments_complete =
             (it->second.received_msg_fragments >= it->second.expected_msg_fragments);
@@ -2296,8 +2351,8 @@ nixlLibfabricEngine::checkPendingNotifications() {
                        << it->second.received_completions
                        << " writes arrived, so the data is incomplete"
                        << (fragments_complete ? "" : " (its notification never arrived)");
-            it = pending_notifications_.erase(it);
-            continue;
+            pending_notifications_.erase(it);
+            return;
         }
 
         if (fragments_complete && writes_complete) {
@@ -2338,10 +2393,26 @@ nixlLibfabricEngine::checkPendingNotifications() {
                        << " message_len=" << message.length();
 
             // Remove from pending list
+            pending_notifications_.erase(it);
+        }
+    }
+}
+
+void
+nixlLibfabricEngine::dropPendingNotificationsFrom(uint32_t sender_peer_idx) {
+    std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
+    size_t dropped = 0;
+    for (auto it = pending_notifications_.begin(); it != pending_notifications_.end();) {
+        if ((it->first >> 16) == sender_peer_idx) {
             it = pending_notifications_.erase(it);
+            ++dropped;
         } else {
             ++it;
         }
+    }
+    if (dropped != 0) {
+        NIXL_WARN << "Dropped " << dropped << " incomplete notification(s) from disconnected agent "
+                  << "index " << sender_peer_idx;
     }
 }
 

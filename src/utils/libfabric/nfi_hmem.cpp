@@ -36,6 +36,7 @@
 #include "nfi_hmem.h"
 
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
@@ -438,6 +439,8 @@ struct nfi_ze_ops {
 	ze_result_t (*device_props)(ze_device_handle_t, ze_device_properties_t *);
 	ze_result_t (*mem_alloc_props)(ze_context_handle_t, const void *,
 				       ze_memory_allocation_properties_t *, ze_device_handle_t *);
+	/* Optional: without it the pooling check in nfi_ze_check_pooled() is skipped. */
+	ze_result_t (*mem_address_range)(ze_context_handle_t, const void *, void **, size_t *);
 };
 
 /**
@@ -484,6 +487,8 @@ nfi_ze_load(void *handle)
 			return false;
 		}
 	}
+	nfi_ze.mem_address_range = reinterpret_cast<decltype(nfi_ze.mem_address_range)>(
+		dlsym(handle, "zeMemGetAddressRange"));
 	return true;
 }
 
@@ -639,6 +644,63 @@ nfi_ze_device_index(ze_device_handle_t handle)
 	return -1;
 }
 
+/*
+ * Level Zero pools small allocations made without ze_external_memory_export_desc_t: in a context
+ * with one device, those up to 2 MiB share 2 MiB or 16 MiB buffer objects. Exporting any of them
+ * yields the dma-buf of the whole object, while zeMemGetAddressRange() reports the allocation
+ * alone, and libfabric's ze_hmem_get_dmabuf_fd() takes the dma-buf offset from the latter -- so the
+ * NIC reads or writes at the wrong place in the object, i.e. another allocation. Detect it the same
+ * way: export the dma-buf as libfabric will and compare its size with the allocation's, rounded up
+ * to the 64 KiB a buffer object has at least (a 4 KiB exportable allocation gets a 64 KiB one).
+ */
+static void
+nfi_ze_check_pooled(const void *addr, struct nfi_hmem_info *info)
+{
+	constexpr uint64_t min_bo_size = 64 * 1024;
+	void *base = nullptr;
+	size_t size = 0;
+
+	if (nfi_ze.mem_address_range == nullptr ||
+	    nfi_ze.mem_address_range(nfi_ze_context, addr, &base, &size) != ZE_RESULT_SUCCESS ||
+	    size == 0) {
+		return;
+	}
+
+	ze_external_memory_export_fd_t export_fd = {};
+	export_fd.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_FD;
+	export_fd.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
+	export_fd.fd = -1;
+	ze_memory_allocation_properties_t props = {};
+	props.stype = ZE_STRUCTURE_TYPE_MEMORY_ALLOCATION_PROPERTIES;
+	props.pNext = &export_fd;
+	ze_device_handle_t device = nullptr;
+	if (nfi_ze.mem_alloc_props(nfi_ze_context, addr, &props, &device) != ZE_RESULT_SUCCESS ||
+	    export_fd.fd < 0) {
+		/* Not exportable: libfabric will fail or fall back on its own, nothing to compare. */
+		return;
+	}
+	/*
+	 * Not closed: the driver hands out one fd per buffer object and keeps it, returning the same
+	 * one to every export -- libfabric's included, which never closes it either. Closing it here
+	 * made the registration that follows fail with EBADF. Being shared, its offset is restored.
+	 */
+	const off_t dmabuf_size = lseek(export_fd.fd, 0, SEEK_END);
+	lseek(export_fd.fd, 0, SEEK_SET);
+	if (dmabuf_size <= 0) {
+		return;
+	}
+
+	const uint64_t rounded = (static_cast<uint64_t>(size) + min_bo_size - 1) / min_bo_size *
+		min_bo_size;
+	if (static_cast<uint64_t>(dmabuf_size) > rounded) {
+		info->pooled_dmabuf_size = static_cast<uint64_t>(dmabuf_size);
+		info->alloc_size = static_cast<uint64_t>(size);
+		nfi_log(NFI_HMEM_LOG_DEBUG,
+			"Level Zero allocation of %zu bytes at %p is part of a %lld-byte pooled buffer",
+			size, base, static_cast<long long>(dmabuf_size));
+	}
+}
+
 static bool
 nfi_ze_query(const void *addr, struct nfi_hmem_info *info)
 {
@@ -686,6 +748,7 @@ nfi_ze_query(const void *addr, struct nfi_hmem_info *info)
 	info->iface = FI_HMEM_ZE;
 	/* Driver index is 0: libfabric's Level Zero support is single-driver. */
 	info->device = static_cast<uint64_t>(fi_hmem_ze_device(0, index));
+	nfi_ze_check_pooled(addr, info);
 	return true;
 }
 

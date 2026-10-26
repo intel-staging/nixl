@@ -73,6 +73,9 @@ constexpr const char *NIXL_HANDSHAKE_TAG_HAS_CONN = "has_conn";
 constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 // Optional, last: the write tag the receiver of this handshake puts in imm_data for writes to us.
 constexpr const char *NIXL_HANDSHAKE_TAG_WRITE_TAG = "wtag";
+// Optional, after "wtag": the generation of that tag, stamped in the SEQ_ID bits. Its presence also
+// tells the receiver that we stamp the generation it handed us on our own writes.
+constexpr const char *NIXL_HANDSHAKE_TAG_WRITE_GEN = "wgen";
 
 // Wire-protocol version of the libfabric plugin, exchanged in the handshake. Bump it on any
 // incompatible imm_data or control-message change. 1: 8-bit agent index in imm_data (sends
@@ -86,6 +89,14 @@ constexpr const char *NIXL_HANDSHAKE_TAG_WRITE_TAG = "wtag";
 // report the source address of a remote write (verbs;ofi_rxm). Tag t means the target's agent
 // index t - 1 for us; zero means "resolve from the source address". See
 // nixlLibfabricConnection::write_tag_.
+//
+// SEQ_ID carries the tag's generation instead ("wgen") when the target handed us one: a tag is
+// reused after its connection goes away, and the generation lets the target drop writes from the
+// peer that held it before, which is not told and may keep writing.
+//
+// XFER_ID NIXL_UNTRACKED_XFER_ID marks the writes of a transfer without a notification: the target
+// has nothing to match them against, so it does not track them. getNextXferId() never returns it.
+#define NIXL_UNTRACKED_XFER_ID 0
 
 // Optimized bit field constants (compile-time computed)
 #define NIXL_MSG_TYPE_BITS 4
@@ -120,6 +131,7 @@ constexpr const char *NIXL_HANDSHAKE_TAG_WRITE_TAG = "wtag";
 #define NIXL_GET_WRITE_TAG_FROM_IMM(data) NIXL_GET_IMM_RESERVED(data)
 #define NIXL_GET_XFER_ID_FROM_IMM(data) (((data) >> NIXL_XFER_ID_SHIFT) & NIXL_XFER_ID_MASK)
 #define NIXL_GET_SEQ_ID_FROM_IMM(data) (((data) >> NIXL_SEQ_ID_SHIFT) & NIXL_SEQ_ID_MASK)
+#define NIXL_GET_WRITE_GEN_FROM_IMM(data) NIXL_GET_SEQ_ID_FROM_IMM(data)
 
 // Single-operation immediate data creation (minimal bit operations)
 #define NIXL_MAKE_IMM_DATA(msg_type, xfer_id, seq_id)                    \
@@ -134,6 +146,8 @@ constexpr const char *NIXL_HANDSHAKE_TAG_WRITE_TAG = "wtag";
 
 // Largest write tag: tags are 1-based, so they cover agent indices 0..254.
 #define NIXL_LIBFABRIC_MAX_WRITE_TAG NIXL_IMM_RESERVED_MASK
+// Largest write-tag generation; generations are 1-based, 0 means "not stamped".
+#define NIXL_LIBFABRIC_MAX_WRITE_GEN NIXL_SEQ_ID_MASK
 
 #define NIXL_LIBFABRIC_CQ_BATCH_SIZE 16
 
