@@ -51,14 +51,13 @@ zeAccelMemset(void *addr, int val, size_t count);
 int
 zeAccelMemcpyDtoH(void *host_addr, const void *device_addr, size_t len);
 
-#define CHECK_ZE_ERROR(result, message)                                                \
-    do {                                                                               \
-        const auto _r = (result);                                                      \
-        if (_r != 0) {                                                                 \
-            std::cerr << "ZE: " << message << " (Error code: " << _r << ")"            \
-                      << std::endl;                                                    \
-            exit(EXIT_FAILURE);                                                        \
-        }                                                                              \
+#define CHECK_ZE_ERROR(result, message)                                                   \
+    do {                                                                                  \
+        const auto _r = (result);                                                         \
+        if (_r != 0) {                                                                    \
+            std::cerr << "ZE: " << message << " (Error code: " << _r << ")" << std::endl; \
+            exit(EXIT_FAILURE);                                                           \
+        }                                                                                 \
     } while (0)
 
 #endif

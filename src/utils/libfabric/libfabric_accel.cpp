@@ -196,6 +196,7 @@ nixlAccelKnownIfaces() {
         const enum fi_hmem_iface *raw = nfi_hmem_ifaces(&count);
         return std::vector<enum fi_hmem_iface>(raw, raw + count);
     }();
+
     return ifaces;
 }
 

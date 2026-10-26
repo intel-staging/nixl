@@ -40,28 +40,29 @@ namespace LibfabricUtils {
 
 namespace {
 
-/**
- * @brief Domain-name suffixes verbs appends for the endpoint variants nixl cannot use.
- *
- * verbs names the MSG domain after the device with no suffix at all, and appends "-xrc" for XRC
- * and "-dgram" for DGRAM (prov/verbs/src/verbs_info.c, verbs_msg_xrc_domain / verbs_dgram_domain).
- * The test is on the suffix and not on "the name contains a hyphen", which would drop any NIC
- * whose device name happens to be hyphenated. Note this list is verbs-specific on purpose: efa
- * spells its two variants "-rdm" and "-dgrm", and there "-rdm" is the one to keep.
- */
-constexpr const char *k_verbs_unusable_domain_suffixes[] = {"-xrc", "-dgram"};
+    /**
+     * @brief Domain-name suffixes verbs appends for the endpoint variants nixl cannot use.
+     *
+     * verbs names the MSG domain after the device with no suffix at all, and appends "-xrc" for XRC
+     * and "-dgram" for DGRAM (prov/verbs/src/verbs_info.c, verbs_msg_xrc_domain /
+     * verbs_dgram_domain). The test is on the suffix and not on "the name contains a hyphen", which
+     * would drop any NIC whose device name happens to be hyphenated. Note this list is
+     * verbs-specific on purpose: efa spells its two variants "-rdm" and "-dgrm", and there "-rdm"
+     * is the one to keep.
+     */
+    constexpr const char *k_verbs_unusable_domain_suffixes[] = {"-xrc", "-dgram"};
 
-bool
-hasUnusableVerbsSuffix(const std::string &domain) {
-    for (const char *suffix : k_verbs_unusable_domain_suffixes) {
-        const size_t suffix_len = strlen(suffix);
-        if (domain.size() > suffix_len &&
-            domain.compare(domain.size() - suffix_len, suffix_len, suffix) == 0) {
-            return true;
+    bool
+    hasUnusableVerbsSuffix(const std::string &domain) {
+        for (const char *suffix : k_verbs_unusable_domain_suffixes) {
+            const size_t suffix_len = strlen(suffix);
+            if (domain.size() > suffix_len &&
+                domain.compare(domain.size() - suffix_len, suffix_len, suffix) == 0) {
+                return true;
+            }
         }
+        return false;
     }
-    return false;
-}
 
 } // namespace
 
@@ -186,88 +187,88 @@ sameFabric(const nixlLibfabricFabricId &local, const nixlLibfabricFabricId &peer
 
 namespace {
 
-/*
- * mr_mode shared by every provider that supports advanced memory registration. cxi adds
- * FI_MR_ENDPOINT on top; tcp and sockets support neither FI_MR_PROV_KEY nor FI_MR_VIRT_ADDR and
- * get the basic pair instead.
- */
-constexpr uint64_t k_mr_mode_rdma =
-    FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-constexpr uint64_t k_mr_mode_basic = FI_MR_LOCAL | FI_MR_ALLOCATED;
+    /*
+     * mr_mode shared by every provider that supports advanced memory registration. cxi adds
+     * FI_MR_ENDPOINT on top; tcp and sockets support neither FI_MR_PROV_KEY nor FI_MR_VIRT_ADDR and
+     * get the basic pair instead.
+     */
+    constexpr uint64_t k_mr_mode_rdma =
+        FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+    constexpr uint64_t k_mr_mode_basic = FI_MR_LOCAL | FI_MR_ALLOCATED;
 
-const nixlLibfabricProviderInfo k_cxi_provider = {
-    /*name=*/"cxi",
-    /*description=*/"CXI",
-    /*extra_caps=*/FI_RMA_EVENT,
-    /*mr_mode=*/k_mr_mode_rdma | FI_MR_ENDPOINT,
-    // Left to the provider. cxi has always come up this way and supplying a key size here changes
-    // which fi_info entries it returns.
-    /*mr_key_size=*/0,
-    /*needs_prov_name_hint=*/false,
-    /*needs_full_topology=*/true,
-    /*needs_all_rail_progress=*/false,
-    /*needs_write_tag=*/false,
-    /*single_domain=*/false,
-    /*select_domains=*/nullptr,
-};
+    const nixlLibfabricProviderInfo k_cxi_provider = {
+        /*name=*/"cxi",
+        /*description=*/"CXI",
+        /*extra_caps=*/FI_RMA_EVENT,
+        /*mr_mode=*/k_mr_mode_rdma | FI_MR_ENDPOINT,
+        // Left to the provider. cxi has always come up this way and supplying a key size here
+        // changes which fi_info entries it returns.
+        /*mr_key_size=*/0,
+        /*needs_prov_name_hint=*/false,
+        /*needs_full_topology=*/true,
+        /*needs_all_rail_progress=*/false,
+        /*needs_write_tag=*/false,
+        /*single_domain=*/false,
+        /*select_domains=*/nullptr,
+    };
 
-const nixlLibfabricProviderInfo k_efa_provider = {
-    /*name=*/"efa",
-    /*description=*/"EFA",
-    /*extra_caps=*/0,
-    /*mr_mode=*/k_mr_mode_rdma,
-    /*mr_key_size=*/2,
-    /*needs_prov_name_hint=*/false,
-    /*needs_full_topology=*/true,
-    /*needs_all_rail_progress=*/false,
-    /*needs_write_tag=*/false,
-    /*single_domain=*/false,
-    /*select_domains=*/nullptr,
-};
+    const nixlLibfabricProviderInfo k_efa_provider = {
+        /*name=*/"efa",
+        /*description=*/"EFA",
+        /*extra_caps=*/0,
+        /*mr_mode=*/k_mr_mode_rdma,
+        /*mr_key_size=*/2,
+        /*needs_prov_name_hint=*/false,
+        /*needs_full_topology=*/true,
+        /*needs_all_rail_progress=*/false,
+        /*needs_write_tag=*/false,
+        /*single_domain=*/false,
+        /*select_domains=*/nullptr,
+    };
 
-const nixlLibfabricProviderInfo k_verbs_provider = {
-    /*name=*/"verbs",
-    /*description=*/"verbs",
-    /*extra_caps=*/0,
-    /*mr_mode=*/k_mr_mode_rdma,
-    /*mr_key_size=*/2,
-    /*needs_prov_name_hint=*/true,
-    /*needs_full_topology=*/true,
-    // Layered over a connection-oriented core, so the passive side must poll for the accept.
-    /*needs_all_rail_progress=*/true,
-    // ofi_rxm gives a remote write no usable source address; see providerNeedsWriteTag().
-    /*needs_write_tag=*/true,
-    /*single_domain=*/false,
-    /*select_domains=*/selectVerbsDomains,
-};
+    const nixlLibfabricProviderInfo k_verbs_provider = {
+        /*name=*/"verbs",
+        /*description=*/"verbs",
+        /*extra_caps=*/0,
+        /*mr_mode=*/k_mr_mode_rdma,
+        /*mr_key_size=*/2,
+        /*needs_prov_name_hint=*/true,
+        /*needs_full_topology=*/true,
+        // Layered over a connection-oriented core, so the passive side must poll for the accept.
+        /*needs_all_rail_progress=*/true,
+        // ofi_rxm gives a remote write no usable source address; see providerNeedsWriteTag().
+        /*needs_write_tag=*/true,
+        /*single_domain=*/false,
+        /*select_domains=*/selectVerbsDomains,
+    };
 
-const nixlLibfabricProviderInfo k_tcp_provider = {
-    /*name=*/"tcp",
-    /*description=*/"tcp (TCP fallback)",
-    /*extra_caps=*/0,
-    /*mr_mode=*/k_mr_mode_basic,
-    /*mr_key_size=*/0,
-    /*needs_prov_name_hint=*/false,
-    /*needs_full_topology=*/false,
-    /*needs_all_rail_progress=*/false,
-    /*needs_write_tag=*/false,
-    /*single_domain=*/true,
-    /*select_domains=*/nullptr,
-};
+    const nixlLibfabricProviderInfo k_tcp_provider = {
+        /*name=*/"tcp",
+        /*description=*/"tcp (TCP fallback)",
+        /*extra_caps=*/0,
+        /*mr_mode=*/k_mr_mode_basic,
+        /*mr_key_size=*/0,
+        /*needs_prov_name_hint=*/false,
+        /*needs_full_topology=*/false,
+        /*needs_all_rail_progress=*/false,
+        /*needs_write_tag=*/false,
+        /*single_domain=*/true,
+        /*select_domains=*/nullptr,
+    };
 
-const nixlLibfabricProviderInfo k_sockets_provider = {
-    /*name=*/"sockets",
-    /*description=*/"sockets (TCP fallback)",
-    /*extra_caps=*/0,
-    /*mr_mode=*/k_mr_mode_basic,
-    /*mr_key_size=*/0,
-    /*needs_prov_name_hint=*/false,
-    /*needs_full_topology=*/false,
-    /*needs_all_rail_progress=*/false,
-    /*needs_write_tag=*/false,
-    /*single_domain=*/true,
-    /*select_domains=*/nullptr,
-};
+    const nixlLibfabricProviderInfo k_sockets_provider = {
+        /*name=*/"sockets",
+        /*description=*/"sockets (TCP fallback)",
+        /*extra_caps=*/0,
+        /*mr_mode=*/k_mr_mode_basic,
+        /*mr_key_size=*/0,
+        /*needs_prov_name_hint=*/false,
+        /*needs_full_topology=*/false,
+        /*needs_all_rail_progress=*/false,
+        /*needs_write_tag=*/false,
+        /*single_domain=*/true,
+        /*select_domains=*/nullptr,
+    };
 
 } // namespace
 
@@ -287,7 +288,6 @@ selectDomainsGeneric(const nixlProviderDeviceMap &provider_device_map, const cha
     }
     return domains;
 }
-
 
 /*
  * Preference order, highest first. verbs sits below cxi/efa and above tcp: it is a real RDMA
@@ -406,10 +406,11 @@ getAvailableNetworkDevices() {
 
     /*
      * One walk, two harvests: the prov_name -> domains map that provider selection works on, and a
-     * side table of each domain's bus address and link speed. The side table is keyed by domain name
-     * alone even though several providers can report the same name -- verbs and psm3 both offer
-     * "rocep153s0f0" -- because a domain name identifies a physical device, so the entries agree.
-     * First non-empty address wins, so a provider that reports nothing cannot erase one that did.
+     * side table of each domain's bus address and link speed. The side table is keyed by domain
+     * name alone even though several providers can report the same name -- verbs and psm3 both
+     * offer "rocep153s0f0" -- because a domain name identifies a physical device, so the entries
+     * agree. First non-empty address wins, so a provider that reports nothing cannot erase one that
+     * did.
      */
     std::unordered_map<std::string, nixlLibfabricDeviceInfo> device_info;
 
@@ -480,8 +481,8 @@ getAvailableNetworkDevices() {
             }
             NIXL_TRACE << "Selected " << provider_name << " domain " << devices.back().domain_name
                        << " pcie="
-                       << (devices.back().pcie_address.empty() ? "unknown"
-                                                              : devices.back().pcie_address)
+                       << (devices.back().pcie_address.empty() ? "unknown" :
+                                                                 devices.back().pcie_address)
                        << " link_speed=" << devices.back().link_speed;
         }
         return {provider_name, devices};

@@ -54,7 +54,9 @@ nixlLibfabricEngine::sendHandshakeTo(const nixlLibfabricConnection &conn, bool b
     if (blocking && onProgressThread()) {
         const auto now = std::chrono::steady_clock::now();
         deferred_handshakes_.push_back(
-            {conn.remoteAgent_, now + std::chrono::seconds(NIXL_LIBFABRIC_HANDSHAKE_TIMEOUT_S), now});
+            {conn.remoteAgent_,
+             now + std::chrono::seconds(NIXL_LIBFABRIC_HANDSHAKE_TIMEOUT_S),
+             now});
         // Queued counts as sent: a handshake arriving before the flush must not draw a second one.
         conn.handshake_sent_.store(true, std::memory_order_release);
         NIXL_DEBUG << "Deferring handshake to '" << conn.remoteAgent_
@@ -95,7 +97,8 @@ nixlLibfabricEngine::postHandshakeTo(const nixlLibfabricConnection &conn, bool b
         sd.addStr(NIXL_HANDSHAKE_TAG_CONN, piggybacked_conn_info);
     }
     if (conn.local_write_tag_ != 0) {
-        sd.addBuf(NIXL_HANDSHAKE_TAG_WRITE_TAG, &conn.local_write_tag_, sizeof(conn.local_write_tag_));
+        sd.addBuf(
+            NIXL_HANDSHAKE_TAG_WRITE_TAG, &conn.local_write_tag_, sizeof(conn.local_write_tag_));
         sd.addBuf(
             NIXL_HANDSHAKE_TAG_WRITE_GEN, &conn.local_write_gen_, sizeof(conn.local_write_gen_));
     }
@@ -134,7 +137,8 @@ nixlLibfabricEngine::postHandshakeTo(const nixlLibfabricConnection &conn, bool b
 void
 nixlLibfabricEngine::flushDeferredHandshakes() {
     // Spacing between attempts at a send that would block. Long next to a progress-loop pass, so a
-    // stuck peer costs little; short next to the peer's handshake timeout, so it adds no real delay.
+    // stuck peer costs little; short next to the peer's handshake timeout, so it adds no real
+    // delay.
     constexpr auto kRetryInterval = std::chrono::milliseconds(1);
 
     // Progress thread only, like the deferral itself; see deferred_handshakes_.
@@ -289,8 +293,8 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
     }
 
     NIXL_DEBUG << "Received handshake from peer '" << peer_agent_name
-               << "' proto_ver=" << peer_proto_ver << " write_tag="
-               << static_cast<unsigned>(peer_write_tag)
+               << "' proto_ver=" << peer_proto_ver
+               << " write_tag=" << static_cast<unsigned>(peer_write_tag)
                << " write_gen=" << static_cast<unsigned>(peer_write_gen)
                << " piggybacked_conn_info_len=" << piggybacked_conn_info.size();
 
@@ -357,16 +361,16 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
         //  - our own handshake to it never went out: the send failed, or a deferred one was dropped
         //    at its deadline. Nothing else would ever resend it.
         // Not otherwise: on a normal first handshake ours is already sent or queued, and answering
-        // would only double the handshakes of every symmetric connection setup. The reply carries no
-        // connection info (handshake_received_ is now set), so it does not trigger a reply in turn.
-        // On the progress thread sendHandshakeTo() defers the send rather than posting from this
-        // callback.
+        // would only double the handshakes of every symmetric connection setup. The reply carries
+        // no connection info (handshake_received_ is now set), so it does not trigger a reply in
+        // turn. On the progress thread sendHandshakeTo() defers the send rather than posting from
+        // this callback.
         const bool ours_sent = conn->handshake_sent_.load(std::memory_order_acquire);
         if (has_conn && (had_handshake || !ours_sent)) {
             nixl_status_t hs = sendHandshakeTo(*conn);
             if (hs != NIXL_SUCCESS) {
-                NIXL_ERROR << "Handshake reply to '" << peer_agent_name
-                           << "' failed with status " << hs;
+                NIXL_ERROR << "Handshake reply to '" << peer_agent_name << "' failed with status "
+                           << hs;
             }
         }
     }

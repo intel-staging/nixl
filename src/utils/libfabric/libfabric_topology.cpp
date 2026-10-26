@@ -277,16 +277,16 @@ nixlLibfabricTopology::getNicsForPci(const std::string &pci_bus_id) const {
 
         // GPU query, lookup based on GPU BDF
         if (auto it = pci_to_nic_devices.find(normalized_id); it != pci_to_nic_devices.end()) {
-            NIXL_DEBUG << "Found NICs for PCI " << pci_bus_id << " (normalized to "
-                       << normalized_id << ")";
+            NIXL_DEBUG << "Found NICs for PCI " << pci_bus_id << " (normalized to " << normalized_id
+                       << ")";
             return it->second;
         }
 
         // Neuron query, lookup based on NIC BDF
         if (auto it = pcie_to_libfabric_map.find(normalized_id);
             it != pcie_to_libfabric_map.end()) {
-            NIXL_DEBUG << "Found NICs for PCI " << pci_bus_id << " (normalized to "
-                       << normalized_id << ")";
+            NIXL_DEBUG << "Found NICs for PCI " << pci_bus_id << " (normalized to " << normalized_id
+                       << ")";
             return {it->second};
         }
 
@@ -342,11 +342,11 @@ nixlLibfabricTopology::getPcieDevData(const std::string &nic_device,
         parent_switch_domain = itr->second.parent_switch_domain;
         parent_switch_bus_id = itr->second.parent_switch_bus_id;
         parent_switch_link_speed = itr->second.parent_switch_link_speed;
-        NIXL_DEBUG << "NIC " << nic_device << " has upstream link speed "
-                   << device_link_speed << " Gbps, and is associated with NUMA node "
-                   << numa_node_id << " through PCIe switch on domain/bus-id "
-                   << parent_switch_domain << "/" << parent_switch_bus_id
-                   << " with upstream link speed of " << parent_switch_link_speed << " Gbps";
+        NIXL_DEBUG << "NIC " << nic_device << " has upstream link speed " << device_link_speed
+                   << " Gbps, and is associated with NUMA node " << numa_node_id
+                   << " through PCIe switch on domain/bus-id " << parent_switch_domain << "/"
+                   << parent_switch_bus_id << " with upstream link speed of "
+                   << parent_switch_link_speed << " Gbps";
     }
     return found;
 }
@@ -613,8 +613,8 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
      * the rest of the class looks things up, plus resolve the addresses libfabric declined to give.
      *
      * That the second query is gone matters beyond the saved call. It used different hints from
-     * discovery -- no ep_attr->type -- so it also returned the sibling endpoint variants of the same
-     * NICs ("-xrc" and "-dgram" for verbs, "-dgrm" for efa) and needed filtering against
+     * discovery -- no ep_attr->type -- so it also returned the sibling endpoint variants of the
+     * same NICs ("-xrc" and "-dgram" for verbs, "-dgrm" for efa) and needed filtering against
      * all_devices to stop one of those overwriting the real entry for a BDF in a last-write-wins
      * map. It also needed cxi's mr_mode repeated in its hints or cxi returned nothing at all. Both
      * of those were compensation for the two queries being able to disagree; one query cannot.
@@ -634,8 +634,8 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
              */
             pcie_address = getPcieAddressForOsDev(dev.domain_name);
             if (!pcie_address.empty()) {
-                NIXL_DEBUG << "Resolved PCIe address " << pcie_address << " for "
-                           << dev.domain_name << " via hwloc (libfabric reported none)";
+                NIXL_DEBUG << "Resolved PCIe address " << pcie_address << " for " << dev.domain_name
+                           << " via hwloc (libfabric reported none)";
             }
         }
 
@@ -645,9 +645,9 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
             continue;
         }
 
-        // Only claim PCIe devices once an address was actually resolved: a nic->bus_attr that exists
-        // but reports FI_BUS_UNKNOWN would otherwise set the flag while leaving the maps empty, and
-        // hasPcieDevices() gates NUMA-aware rail selection.
+        // Only claim PCIe devices once an address was actually resolved: a nic->bus_attr that
+        // exists but reports FI_BUS_UNKNOWN would otherwise set the flag while leaving the maps
+        // empty, and hasPcieDevices() gates NUMA-aware rail selection.
         has_pcie_devices_ = true;
         pcie_to_libfabric_map[pcie_address] = dev.domain_name;
         libfabric_to_pcie_map[dev.domain_name] = pcie_address;
@@ -667,8 +667,8 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
      * A provider that does proximity-based rail selection and resolved no addresses at all still
      * "works" -- getNicsForPci() falls back to every NIC for every accelerator -- so the failure is
      * invisible in a transfer and shows up only as lost affinity. Say so loudly, because the most
-     * likely cause is that this provider does not report nic->bus_attr on the FI_EP_RDM entries that
-     * device discovery asks for, which is exactly the kind of thing that differs per provider.
+     * likely cause is that this provider does not report nic->bus_attr on the FI_EP_RDM entries
+     * that device discovery asks for, which is exactly the kind of thing that differs per provider.
      */
     if (pcie_to_libfabric_map.empty() && !discovered_devices.empty() &&
         LibfabricUtils::providerNeedsFullTopology(provider_name)) {
@@ -1081,8 +1081,8 @@ nixlLibfabricTopology::collectNicInfo(NicInfo &nic,
         nic.parent_switch_bus_id = UINT8_MAX;
     }
     nic_info_map.insert(NicInfoMap::value_type(name, nic));
-    NIXL_DEBUG << "NIC " << name << " mapped to NUMA node " << nic.numa_node_id
-               << " (PCIe address " << pcie_addr << ", speed: " << nic.line_speed
+    NIXL_DEBUG << "NIC " << name << " mapped to NUMA node " << nic.numa_node_id << " (PCIe address "
+               << pcie_addr << ", speed: " << nic.line_speed
                << " Gbps, upstream link speed: " << nic.upstream_link_speed
                << " Gbps, parent switch domain/bus-id: " << nic.parent_switch_domain << "/"
                << nic.parent_switch_bus_id << ")";

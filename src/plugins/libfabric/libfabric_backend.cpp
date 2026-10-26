@@ -672,7 +672,8 @@ nixlLibfabricEngine::createAgentConnection(
     /*
      * Control traffic has to land on the peer's rail 0, since that is where the notification and
      * handshake callbacks are installed. Pick the local rail paired with peer rail 0 so the send is
-     * reachable; rail 0 stays the answer whenever pairing is the identity, which is the common case.
+     * reachable; rail 0 stays the answer whenever pairing is the identity, which is the common
+     * case.
      */
     for (size_t rail_id = 0; rail_id < conn->peer_rail_for_local_rail_.size(); ++rail_id) {
         if (conn->peer_rail_for_local_rail_[rail_id] == 0) {
@@ -755,9 +756,8 @@ nixlLibfabricEngine::requireWriteGenFrom(const nixlLibfabricConnection &conn) {
     if (conn.local_write_tag_ == 0) {
         return;
     }
-    rail_manager_.requireWriteGen(conn.local_write_tag_,
-                                  static_cast<uint32_t>(conn.agent_index_),
-                                  conn.local_write_gen_);
+    rail_manager_.requireWriteGen(
+        conn.local_write_tag_, static_cast<uint32_t>(conn.agent_index_), conn.local_write_gen_);
 }
 
 void
@@ -1488,8 +1488,8 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
     /*
      * Where the posting thread binds accelerator contexts itself (see postXferDescriptors), check
      * each device binds before anything is posted, for the same reason as the checks above: failing
-     * mid-loop would leave earlier descriptors queued with FI_MORE and no flushing post, and requests
-     * already submitted against a handle the caller then gives up on.
+     * mid-loop would leave earlier descriptors queued with FI_MORE and no flushing post, and
+     * requests already submitted against a handle the caller then gives up on.
      *
      * Checked once per device per process, not per transfer -- probing every time doubled the
      * driver calls of every post. Done here on the calling thread even when the post thread pool
@@ -1873,7 +1873,8 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
                 total_message_length, expected_completions, metadata.agent_name_length);
         }
 
-        // Send from the rail paired with the peer's rail 0; see nixlLibfabricConnection::control_rail_.
+        // Send from the rail paired with the peer's rail 0; see
+        // nixlLibfabricConnection::control_rail_.
         size_t rail_id = connection->control_rail_;
         size_t max_size = BinaryNotification::MAX_FRAGMENT_SIZE;
         nixlLibfabricReq *control_request =
@@ -1956,9 +1957,10 @@ nixlLibfabricEngine::notifXferErrorPriv(const std::string &remote_agent,
      * fi_senddata() accepted the message. The completion can fire after this function has given up
      * and returned, so it records into a shared flag and touches nothing else.
      */
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S);
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S);
     constexpr auto k_resend_backoff = std::chrono::milliseconds(100);
+
     enum : int { k_send_pending = 0, k_send_ok = 1, k_send_failed = 2 };
 
     for (int attempt = 1;; ++attempt) {
@@ -2018,8 +2020,9 @@ nixlLibfabricEngine::notifXferErrorPriv(const std::string &remote_agent,
                        << " attempt(s) in " << NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S << "s";
             return NIXL_ERR_BACKEND;
         }
-        NIXL_WARN << "Transfer-error message to " << remote_agent << " for XFER_ID="
-                  << notif_xfer_id << " failed on rail " << rail_id << " (attempt " << attempt
+        NIXL_WARN << "Transfer-error message to " << remote_agent
+                  << " for XFER_ID=" << notif_xfer_id << " failed on rail " << rail_id
+                  << " (attempt " << attempt
                   << (status == NIXL_SUCCESS ? ", in its send CQ" : ", at post")
                   << "); resending once the connection is re-established";
         std::this_thread::sleep_for(k_resend_backoff);
@@ -2345,8 +2348,7 @@ nixlLibfabricEngine::checkPendingNotification(uint64_t key) {
          * more than a failed transfer delivers, so it can never be released as complete.
          */
         if (it->second.xfer_failed && writes_complete) {
-            NIXL_ERROR << "Dropping the notification for notif_xfer_id="
-                       << it->second.notif_xfer_id
+            NIXL_ERROR << "Dropping the notification for notif_xfer_id=" << it->second.notif_xfer_id
                        << ": its transfer failed on the initiator after "
                        << it->second.received_completions
                        << " writes arrived, so the data is incomplete"

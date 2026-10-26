@@ -212,11 +212,11 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
     topology = std::make_unique<nixlLibfabricTopology>();
 
     /*
-     * Which runtime to name in the log, and nothing else. Not a claim that this host has exactly one
-     * accelerator vendor, nor the fallback for a VRAM pointer no runtime claims: nfi_hmem_query_ptr()
-     * decides per pointer, accelUnclaimedVramIface() decides the fallback -- the first runtime can be
-     * CUDA, which has already declined the pointer -- and getSupportedMems() asks
-     * nfi_hmem_available().
+     * Which runtime to name in the log, and nothing else. Not a claim that this host has exactly
+     * one accelerator vendor, nor the fallback for a VRAM pointer no runtime claims:
+     * nfi_hmem_query_ptr() decides per pointer, accelUnclaimedVramIface() decides the fallback --
+     * the first runtime can be CUDA, which has already declined the pointer -- and
+     * getSupportedMems() asks nfi_hmem_available().
      *
      * Asks the vendor SDKs rather than the topology's accelerator counts, because those counts are
      * only populated for the providers that do proximity-based rail selection -- see
@@ -520,8 +520,7 @@ nixlLibfabricRailManager::usableRails(const std::vector<size_t> &selected_rails,
         return selected_rails;
     }
     storage.clear();
-    std::copy_if(
-        selected_rails.begin(), selected_rails.end(), std::back_inserter(storage), usable);
+    std::copy_if(selected_rails.begin(), selected_rails.end(), std::back_inserter(storage), usable);
     return storage;
 }
 
@@ -685,8 +684,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
             // Direct post (PT OFF path)
             // The SEQ_ID bits carry the write tag's generation when the target handed us one.
             uint8_t seq_id = write_gen != 0 ? write_gen : LibfabricUtils::getNextSeqId();
-            uint64_t imm_data = NIXL_MAKE_TAGGED_IMM_DATA(
-                NIXL_LIBFABRIC_MSG_TRANSFER, write_tag, xfer_id, seq_id);
+            uint64_t imm_data =
+                NIXL_MAKE_TAGGED_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, write_tag, xfer_id, seq_id);
             status = rails_[rail_id]->postWrite(req->local_addr,
                                                 req->chunk_size,
                                                 fi_mr_desc(req->local_mr),
@@ -836,8 +835,8 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
                                                size_t rail_id,
                                                nixlLibfabricReq *req) {
     uint8_t seq_id = (op_type != nixlLibfabricReq::WRITE) ? 0 :
-        write_gen != 0                                     ? write_gen :
-                                                             LibfabricUtils::getNextSeqId();
+        write_gen != 0                                    ? write_gen :
+                                                            LibfabricUtils::getNextSeqId();
     uint64_t imm_data = (op_type == nixlLibfabricReq::WRITE) ?
         NIXL_MAKE_TAGGED_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, write_tag, xfer_id, seq_id) :
         0;
@@ -1234,9 +1233,9 @@ nixlLibfabricRailManager::computeRailPeering(
     unreachable_out.clear();
 
     /*
-     * Read the peer's fabric identity out of the endpoint names it already sent. Only the local side
-     * of each comparison carries a netmask -- see LibfabricUtils::sameFabric -- so the peer ids are
-     * left with mask 0 on purpose.
+     * Read the peer's fabric identity out of the endpoint names it already sent. Only the local
+     * side of each comparison carries a netmask -- see LibfabricUtils::sameFabric -- so the peer
+     * ids are left with mask 0 on purpose.
      */
     std::vector<LibfabricUtils::nixlLibfabricFabricId> peer_ids;
     peer_ids.reserve(endpoints.size());
@@ -1272,10 +1271,10 @@ nixlLibfabricRailManager::computeRailPeering(
      * prepareAndSubmitTransfer() may need one, so record which pairs are known to be on different
      * segments. Only a definite answer counts. An unreadable identity on either side, or a local
      * rail with no netmask (sameFabric() then compares exact addresses, so "different" means
-     * nothing), leaves the pair allowed. So does a local rail with no peer rail on its segment at all: that
-     * looks like a routed network, where an address outside the netmask is reached through a
-     * gateway, and marking it would refuse transfers that work. Only a rail that does share a
-     * segment with some peer rail -- a segmented fabric -- has the others marked.
+     * nothing), leaves the pair allowed. So does a local rail with no peer rail on its segment at
+     * all: that looks like a routed network, where an address outside the netmask is reached
+     * through a gateway, and marking it would refuse transfers that work. Only a rail that does
+     * share a segment with some peer rail -- a segmented fabric -- has the others marked.
      */
     bool any_unreachable = false;
     unreachable_out.assign(rails_.size(), std::vector<bool>(endpoints.size(), false));
@@ -1468,12 +1467,11 @@ nixlLibfabricRailManager::cleanupConnection(const std::vector<fi_addr_t> &fi_add
 }
 
 nixl_status_t
-nixlLibfabricRailManager::postControlMessage(
-    ControlMessageType msg_type,
-    nixlLibfabricReq *req,
-    fi_addr_t dest_addr,
-    std::function<void(nixl_status_t)> completion_callback,
-    bool blocking) {
+nixlLibfabricRailManager::postControlMessage(ControlMessageType msg_type,
+                                             nixlLibfabricReq *req,
+                                             fi_addr_t dest_addr,
+                                             std::function<void(nixl_status_t)> completion_callback,
+                                             bool blocking) {
     // Validation - use rail 0 for notifications
     if (rails_.empty()) {
         NIXL_ERROR << "No rails available";

@@ -1256,12 +1256,12 @@ xferBenchUtils::getDevToUse() {
 
 /* True when Level Zero (Intel Xe / XPU) should supply VRAM.
  *
- * CUDA and ROCm keep precedence whenever they have a usable device, because a host with an NVIDIA or
- * AMD accelerator very often also exposes an Intel integrated GPU to Level Zero, and benchmarking
- * that instead of the discrete accelerator would silently measure the wrong hardware. The check is
- * for a device rather than for compile-time support, so a binary built with CUDA enabled still
- * reaches Xe VRAM when it runs somewhere CUDA has no device -- against a stub libcudart, or simply
- * on an Intel-GPU host. */
+ * CUDA and ROCm keep precedence whenever they have a usable device, because a host with an NVIDIA
+ * or AMD accelerator very often also exposes an Intel integrated GPU to Level Zero, and
+ * benchmarking that instead of the discrete accelerator would silently measure the wrong hardware.
+ * The check is for a device rather than for compile-time support, so a binary built with CUDA
+ * enabled still reaches Xe VRAM when it runs somewhere CUDA has no device -- against a stub
+ * libcudart, or simply on an Intel-GPU host. */
 bool
 xferBenchUtils::useZeVram() {
     /* Decided once: the devices visible cannot change while the process runs, and every

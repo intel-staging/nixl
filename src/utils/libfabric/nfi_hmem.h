@@ -61,7 +61,8 @@
  *
  * @ref nfi_hmem_query_ptr talks to the vendor runtime and is a slow path -- call it once per
  * registration and keep the result. @ref nfi_hmem_scope_push is a fast path and takes the already
- * known (iface, device), so it never re-probes. Do not reach for query_ptr in a per-descriptor loop.
+ * known (iface, device), so it never re-probes. Do not reach for query_ptr in a per-descriptor
+ * loop.
  */
 
 #ifndef NFI_HMEM_H
@@ -84,10 +85,10 @@ extern "C" {
 
 /** @brief A PCI address, unformatted. Callers render it in whatever notation they key on. */
 struct nfi_hmem_bus_id {
-	uint16_t domain;
-	uint8_t bus;
-	uint8_t slot;
-	uint8_t func;
+    uint16_t domain;
+    uint8_t bus;
+    uint8_t slot;
+    uint8_t func;
 };
 
 /**
@@ -100,49 +101,49 @@ struct nfi_hmem_bus_id {
  * onboard.
  */
 enum nfi_hmem_bus_kind {
-	/** No PCI address available. @ref nfi_hmem_info::bus is zeroed. */
-	NFI_HMEM_BUS_NONE = 0,
-	/** The accelerator's own PCI address. */
-	NFI_HMEM_BUS_ACCELERATOR,
-	/** The PCI address of a NIC attached to the accelerator. */
-	NFI_HMEM_BUS_NIC
+    /** No PCI address available. @ref nfi_hmem_info::bus is zeroed. */
+    NFI_HMEM_BUS_NONE = 0,
+    /** The accelerator's own PCI address. */
+    NFI_HMEM_BUS_ACCELERATOR,
+    /** The PCI address of a NIC attached to the accelerator. */
+    NFI_HMEM_BUS_NIC
 };
 
 /** @brief What the vendor runtimes know about one pointer. */
 struct nfi_hmem_info {
-	/**
-	 * Detected interface. FI_HMEM_SYSTEM means "no vendor claimed it", which for a pointer the
-	 * caller believes to be device memory is informative rather than an error -- see
-	 * @ref nfi_hmem_query_ptr.
-	 */
-	enum fi_hmem_iface iface;
+    /**
+     * Detected interface. FI_HMEM_SYSTEM means "no vendor claimed it", which for a pointer the
+     * caller believes to be device memory is informative rather than an error -- see
+     * @ref nfi_hmem_query_ptr.
+     */
+    enum fi_hmem_iface iface;
 
-	/**
-	 * Interface-specific device ordinal, already encoded for the fi_mr_attr::device arm that
-	 * @p iface selects. Opaque: a CUdevice for CUDA, fi_hmem_ze_device(0, index) for Level Zero,
-	 * the -1 sentinel for Neuron. Never treat this as an index into the caller's own device
-	 * numbering.
-	 */
-	uint64_t device;
+    /**
+     * Interface-specific device ordinal, already encoded for the fi_mr_attr::device arm that
+     * @p iface selects. Opaque: a CUdevice for CUDA, fi_hmem_ze_device(0, index) for Level Zero,
+     * the -1 sentinel for Neuron. Never treat this as an index into the caller's own device
+     * numbering.
+     */
+    uint64_t device;
 
-	/** Which device @ref bus describes. */
-	enum nfi_hmem_bus_kind bus_kind;
+    /** Which device @ref bus describes. */
+    enum nfi_hmem_bus_kind bus_kind;
 
-	/** PCI address, valid only when @ref bus_kind is not NFI_HMEM_BUS_NONE. */
-	struct nfi_hmem_bus_id bus;
+    /** PCI address, valid only when @ref bus_kind is not NFI_HMEM_BUS_NONE. */
+    struct nfi_hmem_bus_id bus;
 
-	/**
-	 * Nonzero when the dma-buf the runtime exports for this pointer is larger than the
-	 * allocation holding it: the allocation is a slice of a pooled buffer object. libfabric
-	 * registers such memory at the wrong offset into that object (it takes the offset from the
-	 * allocation's own base), so the NIC would move another allocation's bytes. The value is the
-	 * dma-buf size, and @ref alloc_size the allocation's. Level Zero only; 0 elsewhere and
-	 * whenever the size could not be determined.
-	 */
-	uint64_t pooled_dmabuf_size;
+    /**
+     * Nonzero when the dma-buf the runtime exports for this pointer is larger than the
+     * allocation holding it: the allocation is a slice of a pooled buffer object. libfabric
+     * registers such memory at the wrong offset into that object (it takes the offset from the
+     * allocation's own base), so the NIC would move another allocation's bytes. The value is the
+     * dma-buf size, and @ref alloc_size the allocation's. Level Zero only; 0 elsewhere and
+     * whenever the size could not be determined.
+     */
+    uint64_t pooled_dmabuf_size;
 
-	/** Size of the allocation holding the pointer; set together with @ref pooled_dmabuf_size. */
-	uint64_t alloc_size;
+    /** Size of the allocation holding the pointer; set together with @ref pooled_dmabuf_size. */
+    uint64_t alloc_size;
 };
 
 /**
@@ -152,17 +153,17 @@ struct nfi_hmem_info {
  * the first push.
  */
 struct nfi_hmem_scope {
-	enum fi_hmem_iface iface;
-	uint64_t saved;
-	int pushed;
+    enum fi_hmem_iface iface;
+    uint64_t saved;
+    int pushed;
 };
 
 /** @brief Diagnostic severity, matching the usual four levels. */
 enum nfi_hmem_log_level {
-	NFI_HMEM_LOG_ERROR = 0,
-	NFI_HMEM_LOG_WARN,
-	NFI_HMEM_LOG_INFO,
-	NFI_HMEM_LOG_DEBUG
+    NFI_HMEM_LOG_ERROR = 0,
+    NFI_HMEM_LOG_WARN,
+    NFI_HMEM_LOG_INFO,
+    NFI_HMEM_LOG_DEBUG
 };
 
 /**
@@ -282,8 +283,8 @@ nfi_hmem_ifaces(size_t *count);
  * @brief Short name of @p iface ("CUDA", "ZE", "NEURON", "SYSTEM", ...). For diagnostics.
  *
  * Derived from libfabric's own fi_tostr(FI_TYPE_HMEM_IFACE) with the redundant "FI_HMEM_" prefix
- * stripped, not from a list maintained here -- so it cannot drift from libfabric, and it names every
- * interface libfabric knows rather than only the ones this file has a vendor entry for.
+ * stripped, not from a list maintained here -- so it cannot drift from libfabric, and it names
+ * every interface libfabric knows rather than only the ones this file has a vendor entry for.
  * FI_HMEM_ROCR and FI_HMEM_SYNAPSEAI therefore come back correctly named, not as "Unknown".
  *
  * @return A borrowed, NUL-terminated string valid for the process lifetime. Never NULL.

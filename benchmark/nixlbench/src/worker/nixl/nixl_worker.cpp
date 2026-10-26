@@ -49,7 +49,9 @@
 
 static nixl_mem_t
 resolveVramSegment() {
-    if (neuronCoreCount() > 0 || xferBenchUtils::useZeVram()) return VRAM_SEG;
+    if (neuronCoreCount() > 0 || xferBenchUtils::useZeVram()) {
+        return VRAM_SEG;
+    }
 #if HAVE_CUDA
     return VRAM_SEG;
 #elif HAVE_ROCM

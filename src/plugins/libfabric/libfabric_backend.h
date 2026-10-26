@@ -270,6 +270,7 @@ private:
         uint8_t gen = 0;
         bool has_gen = false; // the peer sent "wgen", so it stamps the generation we handed it
     };
+
     std::unordered_map<std::string, BufferedWriteTag> pending_inbound_handshakes_;
     // Same, for handshakes rejected for their protocol version: agent name -> peer's version.
     std::unordered_map<std::string, uint16_t> pending_rejected_handshakes_;
@@ -287,6 +288,7 @@ private:
         // re-serialised handshake on every pass of the progress loop.
         std::chrono::steady_clock::time_point next_attempt;
     };
+
     // Owned by the progress thread, so unsynchronised: handshakes are only deferred when
     // sendHandshakeTo() runs there (onProgressThread()), and only flushed from its loop.
     mutable std::vector<DeferredHandshake> deferred_handshakes_;

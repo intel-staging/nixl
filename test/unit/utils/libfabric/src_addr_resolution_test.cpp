@@ -394,7 +394,8 @@ testTaggedWriteCompletionAttribution(nixlLibfabricRailManager &mgr) {
     TEST_ASSERT(seen[2].first == 2 && seen[2].second == 300u,
                 "untagged write still resolved by source address");
 
-    // A released tag is no longer attributable, and unmapping on behalf of another agent is a no-op.
+    // A released tag is no longer attributable, and unmapping on behalf of another agent is a
+    // no-op.
     mgr.unmapWriteTag(NIXL_LIBFABRIC_MAX_WRITE_TAG, 99);
     mgr.unmapWriteTag(7, 90000);
     TEST_ASSERT(rail.resolveWriteTag(NIXL_LIBFABRIC_MAX_WRITE_TAG) == 12u,
@@ -431,8 +432,8 @@ testWriteTagGenerations(nixlLibfabricRailManager &mgr) {
         FakeCompletion fc{};
         fc.entry.flags = FI_REMOTE_WRITE | FI_REMOTE_CQ_DATA | FI_RMA;
         fc.entry.len = 4096;
-        fc.entry.data = NIXL_MAKE_TAGGED_IMM_DATA(
-            NIXL_LIBFABRIC_MSG_TRANSFER, write_tag, xfer_id, write_gen);
+        fc.entry.data =
+            NIXL_MAKE_TAGGED_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, write_tag, xfer_id, write_gen);
         fc.src_addr = FI_ADDR_NOTAVAIL;
         return fc;
     };

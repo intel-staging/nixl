@@ -68,12 +68,12 @@ check(bool cond, const std::string &what) {
 
 /*
  * The shim's implementation is ordinary C++, but its *header* is deliberately C-compatible: POD
- * structs, plain functions, extern "C". That is what keeps donating it to libfabric -- a C project --
- * a contained change, and it is the sort of property that rots silently the first time someone adds a
- * std::string field or a default argument.
+ * structs, plain functions, extern "C". That is what keeps donating it to libfabric -- a C project
+ * -- a contained change, and it is the sort of property that rots silently the first time someone
+ * adds a std::string field or a default argument.
  *
- * A compile-time check is the only kind that can catch that, so these are static_asserts rather than
- * runtime checks. The C99 compile of the header itself is exercised separately by the build.
+ * A compile-time check is the only kind that can catch that, so these are static_asserts rather
+ * than runtime checks. The C99 compile of the header itself is exercised separately by the build.
  */
 static_assert(std::is_standard_layout_v<nfi_hmem_bus_id>,
               "nfi_hmem_bus_id must stay a C-compatible POD");
@@ -291,7 +291,8 @@ testFillMrAttr() {
     check(attr.iface == FI_HMEM_NEURON && attr.device.neuron == -1,
           "the Neuron sentinel survives the round trip to device.neuron");
 
-    // Null arguments must be tolerated rather than dereferenced: this runs on the registration path.
+    // Null arguments must be tolerated rather than dereferenced: this runs on the registration
+    // path.
     nfi_hmem_fill_mr_attr(nullptr, &attr);
     nfi_hmem_fill_mr_attr(&info, nullptr);
     check(true, "null arguments are ignored rather than dereferenced");
@@ -403,9 +404,11 @@ testPolicy() {
     // error too. CUDA is never the answer.
     const enum fi_hmem_iface fallback = accelUnclaimedVramIface();
     if (nfi_hmem_iface_available(FI_HMEM_CUDA)) {
-        check(fallback == FI_HMEM_SYSTEM, "an unclaimed VRAM pointer is an error where CUDA is usable");
+        check(fallback == FI_HMEM_SYSTEM,
+              "an unclaimed VRAM pointer is an error where CUDA is usable");
     } else if (nfi_hmem_iface_available(FI_HMEM_NEURON)) {
-        check(fallback == FI_HMEM_NEURON, "without CUDA, unclaimed VRAM falls back to Neuron first");
+        check(fallback == FI_HMEM_NEURON,
+              "without CUDA, unclaimed VRAM falls back to Neuron first");
     } else if (nfi_hmem_iface_available(FI_HMEM_ZE)) {
         check(fallback == FI_HMEM_ZE, "without CUDA or Neuron, unclaimed VRAM falls back to ZE");
     } else {
@@ -431,8 +434,7 @@ testScope() {
     check(!nfi_hmem_needs_scope(FI_HMEM_ZE), "Level Zero needs no context binding");
 
     struct nfi_hmem_scope scope;
-    check(nfi_hmem_scope_push(FI_HMEM_CUDA, 0, nullptr) == -EINVAL,
-          "a null scope is rejected");
+    check(nfi_hmem_scope_push(FI_HMEM_CUDA, 0, nullptr) == -EINVAL, "a null scope is rejected");
 
     // A no-op runtime must still produce a scope that is safe to pop, and safe to pop twice, since
     // the RAII wrapper pops unconditionally in its destructor.

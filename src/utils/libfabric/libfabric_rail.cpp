@@ -702,9 +702,9 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
 
         /*
          * Remember how this rail is addressed so it can be paired with the right peer rail later.
-         * The peer sends the same bytes for its own rails during connection setup, so comparing them
-         * is what lets a transfer post to a NIC on the same segment instead of trusting that both
-         * hosts enumerated their rails in the same order. See LibfabricUtils::sameFabric.
+         * The peer sends the same bytes for its own rails during connection setup, so comparing
+         * them is what lets a transfer post to a NIC on the same segment instead of trusting that
+         * both hosts enumerated their rails in the same order. See LibfabricUtils::sameFabric.
          */
         this->ep_name_len = ep_name_len;
         this->addr_format = (info != nullptr) ? info->addr_format : FI_FORMAT_UNSPEC;
@@ -1227,8 +1227,8 @@ nixlLibfabricRail::processRemoteWriteCompletion(struct fi_cq_data_entry *comp,
         // A tagged write names its sender itself: its provider reports no usable source address.
         const uint8_t write_tag = static_cast<uint8_t>(NIXL_GET_WRITE_TAG_FROM_IMM(comp->data));
         const uint8_t write_gen = static_cast<uint8_t>(NIXL_GET_WRITE_GEN_FROM_IMM(comp->data));
-        const uint32_t agent_idx = write_tag != 0 ? resolveWriteTag(write_tag, write_gen) :
-                                                    resolveSourceAddress(src_addr);
+        const uint32_t agent_idx =
+            write_tag != 0 ? resolveWriteTag(write_tag, write_gen) : resolveSourceAddress(src_addr);
         if (agent_idx == kUnknownAgentIdx) {
             // A peer we disconnected is not told and may keep writing, so this can repeat for every
             // write it makes: log the 1st, 2nd, 4th, 8th, ... occurrence on this rail.

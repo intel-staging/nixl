@@ -125,9 +125,9 @@ accelIfaceOfHwlocObj(hwloc_obj_t obj);
  * @brief Whether @p iface's devices take part in PCIe-proximity NIC grouping.
  *
  * Distinct from being an accelerator at all. Neuron devices are accelerators for counting purposes
- * but must stay out of grouping: a Trainium card carries its EFA device onboard, so a Neuron pointer
- * reports a NIC address (NFI_HMEM_BUS_NIC) and resolves through the NIC map instead of through an
- * accelerator-to-NIC map.
+ * but must stay out of grouping: a Trainium card carries its EFA device onboard, so a Neuron
+ * pointer reports a NIC address (NFI_HMEM_BUS_NIC) and resolves through the NIC map instead of
+ * through an accelerator-to-NIC map.
  */
 bool
 accelIfaceIsGroupable(enum fi_hmem_iface iface);
@@ -153,12 +153,12 @@ accelUnclaimedVramIface();
 /**
  * @brief RAII wrapper over @ref nfi_hmem_scope_push / @ref nfi_hmem_scope_pop.
  *
- * Bracket the operations that need a current accelerator context. Which those are is not obvious, so
- * to be explicit: **registration needs one, detection does not.** libfabric exports a dmabuf handle
- * from inside fi_mr_regattr() for providers configured that way, and that export requires a context
- * on the buffer's device; attributing a pointer requires nothing, because unified virtual addressing
- * lets the driver identify any allocation in the process. UCX draws the line in exactly the same
- * place, and for the same stated reason.
+ * Bracket the operations that need a current accelerator context. Which those are is not obvious,
+ * so to be explicit: **registration needs one, detection does not.** libfabric exports a dmabuf
+ * handle from inside fi_mr_regattr() for providers configured that way, and that export requires a
+ * context on the buffer's device; attributing a pointer requires nothing, because unified virtual
+ * addressing lets the driver identify any allocation in the process. UCX draws the line in exactly
+ * the same place, and for the same stated reason.
  *
  * Posting is bracketed too, because a provider may take a host-copy path for small transfers.
  *
@@ -171,7 +171,8 @@ public:
     explicit nixlAccelScope(const struct nfi_hmem_info &info)
         : nixlAccelScope(info.iface, info.device) {}
 
-    /** @brief Binds @p device of @p iface, for a caller holding the pair rather than an info block. */
+    /** @brief Binds @p device of @p iface, for a caller holding the pair rather than an info block.
+     */
     nixlAccelScope(enum fi_hmem_iface iface, uint64_t device)
         : scope_{},
           iface_(iface),

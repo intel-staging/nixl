@@ -27,9 +27,9 @@
  *
  * The provider-table assertions look tautological one at a time -- each restates a flag the table
  * sets. What they are worth is collectively: every one of those flags used to be an independent
- * `provider == "..."` comparison in a different file, and the table exists so that adding a provider
- * is one edit rather than seven. These pin the flags to the behaviour each one stands for, so a
- * future edit that drops one fails here rather than on a fabric nobody in CI has.
+ * `provider == "..."` comparison in a different file, and the table exists so that adding a
+ * provider is one edit rather than seven. These pin the flags to the behaviour each one stands for,
+ * so a future edit that drops one fails here rather than on a fabric nobody in CI has.
  */
 
 #include "libfabric/libfabric_common.h"
@@ -137,8 +137,9 @@ testSelectVerbsDomains() {
 
     check(LibfabricUtils::selectVerbsDomains({{"verbs;ofi_rxd", {"mlx5_0-dgram"}}}).empty(),
           "a host offering verbs only through ofi_rxd selects nothing");
-    check(LibfabricUtils::selectVerbsDomains({{"efa", {"rdmap16s27-rdm"}}, {"tcp", {"lo"}}}).empty(),
-          "no verbs entry selects nothing, and efa's own -rdm domain is left alone");
+    check(
+        LibfabricUtils::selectVerbsDomains({{"efa", {"rdmap16s27-rdm"}}, {"tcp", {"lo"}}}).empty(),
+        "no verbs entry selects nothing, and efa's own -rdm domain is left alone");
     check(LibfabricUtils::selectVerbsDomains({}).empty(), "an empty map selects nothing");
 
     // Sort order is what makes rail indices stable: provider_device_map is unordered, so without
@@ -213,7 +214,8 @@ testProviderTable() {
         const bool is_host_stack =
             (std::string(provider->name) == "tcp" || std::string(provider->name) == "sockets");
         check(provider->single_domain == is_host_stack,
-              std::string(provider->name) + (is_host_stack ? " uses a single rail" : " uses one rail per NIC"));
+              std::string(provider->name) +
+                  (is_host_stack ? " uses a single rail" : " uses one rail per NIC"));
         check(provider->needs_full_topology == !is_host_stack,
               std::string(provider->name) +
                   (is_host_stack ? " skips hwloc grouping" : " does PCIe-proximity grouping"));
@@ -270,8 +272,9 @@ testProviderSelection() {
         {"tcp", {"lo"}},
     });
     check(efa.first == "efa", "efa outranks verbs");
-    check(efa.second == std::vector<std::string>({"rdmap16s27-rdm", "rdmap32s27-rdm"}),
-          "the generic rule preserves fi_getinfo order, so existing efa rail numbering is unchanged");
+    check(
+        efa.second == std::vector<std::string>({"rdmap16s27-rdm", "rdmap32s27-rdm"}),
+        "the generic rule preserves fi_getinfo order, so existing efa rail numbering is unchanged");
 
     check(select({{"cxi", {"cxi0"}}, {"efa", {"rdmap16s27-rdm"}}}).first == "cxi",
           "cxi outranks efa");
@@ -325,8 +328,8 @@ testLiveVerbsTopology() {
         live.emplace();
     }
     catch (const std::exception &e) {
-        check(false, std::string("topology discovery succeeds when a provider is available: ") +
-                  e.what());
+        check(false,
+              std::string("topology discovery succeeds when a provider is available: ") + e.what());
         return;
     }
     nixlLibfabricTopology &topology = *live;
@@ -396,8 +399,9 @@ testFallbackPeerRails() {
             selected, registered, peering, unreachable);
     };
 
-    // No fabric information: same id wins, even when it is not the rank pairing. On a rail-optimised
-    // fabric local rail 2 only reaches peer rail 2, so rank pairing (2->0, 3->1) would hang.
+    // No fabric information: same id wins, even when it is not the rank pairing. On a
+    // rail-optimised fabric local rail 2 only reaches peer rail 2, so rank pairing (2->0, 3->1)
+    // would hang.
     check(assign({2, 3}, {0, 1, 2, 3}, {}) == V({2, 3}),
           "without fabric ids, a registered same-id peer rail is preferred");
 
@@ -441,8 +445,7 @@ testFallbackPeerRails() {
 
     // Sharing (step 4) also skips unreachable peer rails: three local rails, peer rails 0 and 1
     // registered, local rail 2 reaching only peer rail 1.
-    const nixlLibfabricRailUnreachable partial = {
-        {false, false}, {false, false}, {true, false}};
+    const nixlLibfabricRailUnreachable partial = {{false, false}, {false, false}, {true, false}};
     check(assign({0, 1, 2}, {0, 1}, {}, partial) == V({0, 1, 1}),
           "sharing picks among the peer rails a rail can reach");
 

@@ -141,7 +141,7 @@ constexpr const char *NIXL_HANDSHAKE_TAG_WRITE_GEN = "wgen";
 
 // Same, with the target-assigned write tag (0 = none) in the WRITE TAG field.
 #define NIXL_MAKE_TAGGED_IMM_DATA(msg_type, write_tag, xfer_id, seq_id) \
-    (NIXL_MAKE_IMM_DATA(msg_type, xfer_id, seq_id) |                   \
+    (NIXL_MAKE_IMM_DATA(msg_type, xfer_id, seq_id) |                    \
      (((uint64_t)(write_tag) & NIXL_IMM_RESERVED_MASK) << NIXL_IMM_RESERVED_SHIFT))
 
 // Largest write tag: tags are 1-based, so they cover agent indices 0..254.
@@ -497,22 +497,25 @@ defaultProviderInfo();
 /**
  * @brief A rail's position on the fabric, for pairing local rails with a peer's rails.
  *
- * Rails are addressed by index, and a transfer pairs local rail *k* with the peer's rail *k*. That is
- * only correct if both agents enumerate rails onto the same fabrics in the same order, which nothing
- * guarantees: libfabric domain names are host-local (one host calls a NIC `mlx5_0`, another calls the
- * same model `rocep153s0f0`), and the cabling need not follow the naming. When the assumption breaks,
- * rail *k* posts to a peer NIC on a different segment; the address is unreachable rather than
- * invalid, so the write retries -FI_EAGAIN forever instead of failing.
+ * Rails are addressed by index, and a transfer pairs local rail *k* with the peer's rail *k*. That
+ * is only correct if both agents enumerate rails onto the same fabrics in the same order, which
+ * nothing guarantees: libfabric domain names are host-local (one host calls a NIC `mlx5_0`, another
+ * calls the same model `rocep153s0f0`), and the cabling need not follow the naming. When the
+ * assumption breaks, rail *k* posts to a peer NIC on a different segment; the address is
+ * unreachable rather than invalid, so the write retries -FI_EAGAIN forever instead of failing.
  *
- * This is the identity used to pair rails by where they actually are instead. It is derived from the
- * endpoint name the peer already sends during connection setup, so nothing new goes on the wire.
+ * This is the identity used to pair rails by where they actually are instead. It is derived from
+ * the endpoint name the peer already sends during connection setup, so nothing new goes on the
+ * wire.
  */
 struct nixlLibfabricFabricId {
-    /** @brief Whether @ref addr holds a usable identity. False for address formats we cannot read. */
+    /** @brief Whether @ref addr holds a usable identity. False for address formats we cannot read.
+     */
     bool valid = false;
     /** @brief IPv4 address of the rail's NIC, network byte order. */
     uint32_t addr = 0;
-    /** @brief Netmask of the local interface owning @ref addr, or 0 if unknown (peer identities). */
+    /** @brief Netmask of the local interface owning @ref addr, or 0 if unknown (peer identities).
+     */
     uint32_t mask = 0;
 };
 
@@ -533,8 +536,8 @@ fabricIdFromEpName(uint32_t addr_format, const void *ep_name, size_t len);
  * @brief Fills in @ref nixlLibfabricFabricId::mask by looking @p id's address up in getifaddrs().
  *
  * Only meaningful for a *local* rail: the netmask is what decides which peer addresses share this
- * rail's segment, and only the owning host knows it. Leaves mask at 0 when the address is not on any
- * local interface, which makes @ref sameFabric fall back to an exact-address comparison.
+ * rail's segment, and only the owning host knows it. Leaves mask at 0 when the address is not on
+ * any local interface, which makes @ref sameFabric fall back to an exact-address comparison.
  */
 void
 resolveLocalFabricMask(nixlLibfabricFabricId &id);
@@ -565,10 +568,10 @@ providerNeedsAllRailProgress(const std::string &prov_name);
  *
  * The receiver matches each write to its peer's pending notification by the completion's source
  * address. ofi_rxm (verbs) does not set one for a write: libfabric up to at least 1.22 leaves
- * whatever an earlier completion put in that CQ slot, later versions report FI_ADDR_NOTAVAIL. Either
- * way the write is credited to the wrong peer or dropped and the notification never completes. A
- * receiver on such a provider gives each peer a tag in its handshake, and the peer puts it in the
- * write's imm_data instead.
+ * whatever an earlier completion put in that CQ slot, later versions report FI_ADDR_NOTAVAIL.
+ * Either way the write is credited to the wrong peer or dropped and the notification never
+ * completes. A receiver on such a provider gives each peer a tag in its handshake, and the peer
+ * puts it in the write's imm_data instead.
  */
 bool
 providerNeedsWriteTag(const std::string &prov_name);
@@ -606,8 +609,9 @@ selectVerbsDomains(const nixlProviderDeviceMap &provider_device_map);
  *
  * The generic @ref nixlLibfabricProviderInfo::select_domains rule. Deliberately not sorted, unlike
  * selectVerbsDomains(): a rail's index has to be stable across runs and across peers, and for a
- * provider whose domains all arrive under one prov_name key the fi_getinfo order already is. Sorting
- * would be equally stable but would renumber the rails of every existing efa and cxi deployment.
+ * provider whose domains all arrive under one prov_name key the fi_getinfo order already is.
+ * Sorting would be equally stable but would renumber the rails of every existing efa and cxi
+ * deployment.
  *
  * Exactly @p name, not every key with that base name, as before the provider table existed: a
  * layered variant such as "efa;ofi_rxd" reaches the same NICs through slower emulation, so merging

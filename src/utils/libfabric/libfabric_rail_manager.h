@@ -250,7 +250,8 @@ public:
      * @param unreachable_out Set to which local/peer rail pairs are known to be on different
      *        segments; see @ref nixlLibfabricRailUnreachable. Empty whenever the result is.
      * @return One entry per local rail: an index into @p endpoints, or @ref NIXL_LF_NO_PEER_RAIL.
-     *         Empty if no local rail has a readable fabric identity, which leaves pairing as it was.
+     *         Empty if no local rail has a readable fabric identity, which leaves pairing as it
+     * was.
      */
     std::vector<size_t>
     computeRailPeering(const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,

@@ -93,7 +93,9 @@ public:
 
     ze_result_t
     alloc(void **addr, size_t size, int devid) {
-        if (!validDevice(devid)) return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        if (!validDevice(devid)) {
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
 
         /* Allocate as dma-buf exportable. The NIC reaches this memory through the dma-buf libfabric
            exports, and without this the driver may compress the allocation (it does when the
@@ -112,7 +114,9 @@ public:
 
         ze_result_t r =
             fn_mem_alloc_device_(context_, &desc, size, kAlignment, devices_[devid], addr);
-        if (r != ZE_RESULT_SUCCESS) return r;
+        if (r != ZE_RESULT_SUCCESS) {
+            return r;
+        }
 
         /* Remember the device so free() and memset() do not need the caller to repeat it -- the
            Neuron and CUDA wrappers this sits alongside take the pointer alone too. */
@@ -123,7 +127,9 @@ public:
 
     ze_result_t
     free(void *addr) {
-        if (!ready()) return ZE_RESULT_ERROR_UNINITIALIZED;
+        if (!ready()) {
+            return ZE_RESULT_ERROR_UNINITIALIZED;
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ptr_device_.erase(addr);
@@ -139,16 +145,22 @@ public:
      */
     ze_result_t
     memcpyDtoH(void *host_addr, const void *device_addr, size_t len) {
-        if (!ready()) return ZE_RESULT_ERROR_UNINITIALIZED;
+        if (!ready()) {
+            return ZE_RESULT_ERROR_UNINITIALIZED;
+        }
 
         /* The copy has to be queued on the owning device's command list. */
         int devid = 0;
         ze_result_t r = ownerDevice(device_addr, devid);
-        if (r != ZE_RESULT_SUCCESS) return r;
+        if (r != ZE_RESULT_SUCCESS) {
+            return r;
+        }
 
         ze_command_list_handle_t cmdlist = nullptr;
         r = fillList(devid, cmdlist);
-        if (r != ZE_RESULT_SUCCESS) return r;
+        if (r != ZE_RESULT_SUCCESS) {
+            return r;
+        }
 
         /* Synchronous command list, so this returns only once the copy has completed. */
         return fn_append_memory_copy_(cmdlist, host_addr, device_addr, len, nullptr, 0, nullptr);
@@ -156,15 +168,21 @@ public:
 
     ze_result_t
     memset(void *addr, int val, size_t count) {
-        if (!ready()) return ZE_RESULT_ERROR_UNINITIALIZED;
+        if (!ready()) {
+            return ZE_RESULT_ERROR_UNINITIALIZED;
+        }
 
         int devid = 0;
         ze_result_t r = ownerDevice(addr, devid);
-        if (r != ZE_RESULT_SUCCESS) return r;
+        if (r != ZE_RESULT_SUCCESS) {
+            return r;
+        }
 
         ze_command_list_handle_t cmdlist = nullptr;
         r = fillList(devid, cmdlist);
-        if (r != ZE_RESULT_SUCCESS) return r;
+        if (r != ZE_RESULT_SUCCESS) {
+            return r;
+        }
 
         const uint8_t pattern = static_cast<uint8_t>(val);
         /* The command list is ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS, so this returns only once the
@@ -207,8 +225,12 @@ private:
         props.stype = ZE_STRUCTURE_TYPE_MEMORY_ALLOCATION_PROPERTIES;
         ze_device_handle_t device = nullptr;
         ze_result_t r = fn_mem_get_alloc_properties_(context_, addr, &props, &device);
-        if (r != ZE_RESULT_SUCCESS) return r;
-        if (props.type == ZE_MEMORY_TYPE_UNKNOWN) return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        if (r != ZE_RESULT_SUCCESS) {
+            return r;
+        }
+        if (props.type == ZE_MEMORY_TYPE_UNKNOWN) {
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
 
         if (device == nullptr) {
             /* A host allocation belongs to no device, and any device's list can reach it. */
@@ -240,7 +262,9 @@ private:
     void
     init() {
         void *handle = dlopenLibze();
-        if (handle == nullptr) return;
+        if (handle == nullptr) {
+            return;
+        }
 
         if (!loadSymbol(handle, "zeInit", fn_init_) ||
             !loadSymbol(handle, "zeDriverGet", fn_driver_get_) ||
@@ -249,10 +273,10 @@ private:
             !loadSymbol(handle, "zeMemAllocDevice", fn_mem_alloc_device_) ||
             !loadSymbol(handle, "zeMemFree", fn_mem_free_) ||
             !loadSymbol(handle, "zeMemGetAllocProperties", fn_mem_get_alloc_properties_) ||
-            !loadSymbol(handle,
-                        "zeDeviceGetCommandQueueGroupProperties",
-                        fn_queue_group_properties_) ||
-            !loadSymbol(handle, "zeCommandListCreateImmediate", fn_command_list_create_immediate_) ||
+            !loadSymbol(
+                handle, "zeDeviceGetCommandQueueGroupProperties", fn_queue_group_properties_) ||
+            !loadSymbol(
+                handle, "zeCommandListCreateImmediate", fn_command_list_create_immediate_) ||
             !loadSymbol(handle, "zeCommandListAppendMemoryFill", fn_append_memory_fill_) ||
             !loadSymbol(handle, "zeCommandListAppendMemoryCopy", fn_append_memory_copy_)) {
             return;
@@ -260,14 +284,18 @@ private:
 
         /* ZE_INIT_FLAG_GPU_ONLY matches what libfabric's hmem_ze.c asks for, so both agree on
            which devices exist and on the device ordinals used to name them. */
-        if (fn_init_(ZE_INIT_FLAG_GPU_ONLY) != ZE_RESULT_SUCCESS) return;
+        if (fn_init_(ZE_INIT_FLAG_GPU_ONLY) != ZE_RESULT_SUCCESS) {
+            return;
+        }
 
         uint32_t driver_count = 0;
         if (fn_driver_get_(&driver_count, nullptr) != ZE_RESULT_SUCCESS || driver_count == 0) {
             return;
         }
         std::vector<ze_driver_handle_t> drivers(driver_count);
-        if (fn_driver_get_(&driver_count, drivers.data()) != ZE_RESULT_SUCCESS) return;
+        if (fn_driver_get_(&driver_count, drivers.data()) != ZE_RESULT_SUCCESS) {
+            return;
+        }
 
         /* Driver 0 only: libfabric's ZE support is single-driver and asserts the driver index is 0,
            so a device on any other driver could not be registered anyway. */
@@ -279,11 +307,15 @@ private:
             return;
         }
         std::vector<ze_device_handle_t> devices(device_count);
-        if (fn_device_get_(driver_, &device_count, devices.data()) != ZE_RESULT_SUCCESS) return;
+        if (fn_device_get_(driver_, &device_count, devices.data()) != ZE_RESULT_SUCCESS) {
+            return;
+        }
 
         ze_context_desc_t context_desc = {};
         context_desc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
-        if (fn_context_create_(driver_, &context_desc, &context_) != ZE_RESULT_SUCCESS) return;
+        if (fn_context_create_(driver_, &context_desc, &context_) != ZE_RESULT_SUCCESS) {
+            return;
+        }
 
         devices_ = std::move(devices);
     }
@@ -310,7 +342,9 @@ private:
             g.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_GROUP_PROPERTIES;
         }
         r = fn_queue_group_properties_(devices_[devid], &group_count, groups.data());
-        if (r != ZE_RESULT_SUCCESS) return r;
+        if (r != ZE_RESULT_SUCCESS) {
+            return r;
+        }
 
         uint32_t ordinal = group_count;
         for (uint32_t i = 0; i < group_count; ++i) {
@@ -327,7 +361,9 @@ private:
                 }
             }
         }
-        if (ordinal == group_count) return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+        if (ordinal == group_count) {
+            return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+        }
 
         ze_command_queue_desc_t queue_desc = {};
         queue_desc.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
@@ -337,7 +373,9 @@ private:
 
         ze_command_list_handle_t cmdlist = nullptr;
         r = fn_command_list_create_immediate_(context_, devices_[devid], &queue_desc, &cmdlist);
-        if (r != ZE_RESULT_SUCCESS) return r;
+        if (r != ZE_RESULT_SUCCESS) {
+            return r;
+        }
 
         cmdlists_[devid] = cmdlist;
         out = cmdlist;
