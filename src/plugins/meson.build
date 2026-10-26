@@ -41,6 +41,14 @@ if enabled_plugins.get('LIBFABRIC')
     endif
 endif
 
+if enabled_plugins.get('OFI')
+    if not libfabric_dep.found() and is_explicit_enable
+        error('OFI plugin requested but libfabric dependency not found')
+    elif libfabric_dep.found()
+        subdir('ofi')
+    endif
+endif
+
 # The "GDS" and "GDS_MT" backends are produced by a single plugin directory.
 # GDS exposes both batch and MT modes, while GDS_MT remains as a compatibility
 # entry point for MT mode.

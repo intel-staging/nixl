@@ -826,6 +826,10 @@ void nixlPluginManager::registerBuiltinPlugins() {
     NIXL_REGISTER_STATIC_PLUGIN(Backend, UCX)
 #endif
 
+#ifdef STATIC_PLUGIN_OFI
+    NIXL_REGISTER_STATIC_PLUGIN(Backend, OFI)
+#endif
+
 #ifdef STATIC_PLUGIN_GDS
 #ifndef DISABLE_GDS_BACKEND
     NIXL_REGISTER_STATIC_PLUGIN(Backend, GDS)

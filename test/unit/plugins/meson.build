@@ -25,6 +25,10 @@ if enabled_plugins.get('POSIX')
     subdir('posix')
 endif
 
+if enabled_plugins.get('OFI') and is_variable('ofi_backend_interface')
+    subdir('ofi')
+endif
+
 if enabled_plugins.get('GPUNETIO')
     if (not cuda_dep.found() or not doca_gpunetio_dep.found()) and is_explicit_enable
         if not cuda_dep.found()
