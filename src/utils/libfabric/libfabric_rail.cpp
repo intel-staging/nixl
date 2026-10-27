@@ -423,7 +423,8 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
                                      uint16_t id,
-                                     enum fi_hmem_iface runtime)
+                                     enum fi_hmem_iface runtime,
+                                     bool auto_progress)
     : rail_id(id),
       device_name(device),
       provider_name(provider),
@@ -469,8 +470,18 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
     hints->caps |= prov_info->extra_caps;
     hints->domain_attr->mr_mode = prov_info->mr_mode;
     hints->domain_attr->mr_key_size = prov_info->mr_key_size;
+    if (prov_info->needs_prov_name_hint) {
+        hints->fabric_attr->prov_name = strdup(prov_info->name);
+    }
     hints->domain_attr->name = strdup(device_name.c_str());
     hints->domain_attr->threading = FI_THREAD_COMPLETION;
+    if (auto_progress) {
+        // The provider accepts connections on its own thread. rxm requires FI_THREAD_SAFE for
+        // FI_PROGRESS_AUTO, since that thread shares the endpoint with ours.
+        hints->domain_attr->threading = FI_THREAD_SAFE;
+        hints->domain_attr->control_progress = FI_PROGRESS_AUTO;
+        hints->domain_attr->data_progress = FI_PROGRESS_AUTO;
+    }
 
     // The EFA provider accepts FI_MR_DMABUF from libfabric API 1.20 on, so request 1.20
     // where the library provides it and 1.18 elsewhere. The fabric carries the requested
@@ -529,6 +540,20 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             // Provider found with FI_HMEM
             provider_supports_hmem_ = true;
             NIXL_INFO << "Using provider with FI_HMEM support for rail " << rail_id;
+        }
+
+        if (auto_progress && info->domain_attr->data_progress != FI_PROGRESS_AUTO) {
+            NIXL_ERROR << "Provider " << provider << " did not grant FI_PROGRESS_AUTO on rail "
+                       << rail_id << "; without it or a progress thread, connection setup would "
+                       << "stall. Enable the progress thread (nixlAgentConfig::useProgThread, or "
+                       << "--enable_pt=1 under nixlbench), or select another provider with "
+                       << "FI_PROVIDER";
+            throw std::runtime_error("FI_PROGRESS_AUTO not granted for rail " +
+                                     std::to_string(rail_id));
+        }
+        if (auto_progress) {
+            NIXL_INFO << "Rail " << rail_id << ": no progress thread, so " << provider
+                      << " progresses connection setup on its own thread (FI_PROGRESS_AUTO)";
         }
 
         // Create fabric for this rail

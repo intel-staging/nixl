@@ -606,7 +606,17 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
 
     // Uses the bus address and link speed device discovery recorded for each selected domain.
     for (const auto &dev : discovered_devices) {
-        const std::string &pcie_address = dev.pcie_address;
+        std::string pcie_address = dev.pcie_address;
+
+        if (pcie_address.empty()) {
+            // verbs leaves bus_attr at FI_BUS_UNKNOWN. Its domain name is the InfiniBand device
+            // name, which hwloc reports as an OS device under the NIC's PCI device.
+            pcie_address = getPcieAddressForOsDev(dev.domain_name);
+            if (!pcie_address.empty()) {
+                NIXL_DEBUG << "Resolved PCIe address " << pcie_address << " for " << dev.domain_name
+                           << " via hwloc (libfabric reported none)";
+            }
+        }
 
         if (pcie_address.empty()) {
             NIXL_DEBUG << "No PCIe address for " << dev.domain_name
@@ -635,13 +645,39 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
     if (pcie_to_libfabric_map.empty() && !discovered_devices.empty() &&
         LibfabricUtils::providerNeedsFullTopology(provider_name)) {
         NIXL_WARN << "Provider " << provider_name << " reported " << discovered_devices.size()
-                  << " device(s) but no PCIe addresses. PCIe-proximity rail selection is "
-                     "disabled: every accelerator will use every rail.";
+                  << " device(s) but no PCIe addresses, and hwloc could not resolve their domain "
+                     "names either. PCIe-proximity rail selection is disabled: every accelerator "
+                     "will use every rail.";
     }
 
     NIXL_TRACE << "Built PCIe to Libfabric mapping for " << pcie_to_libfabric_map.size()
                << " devices using provider " << provider_name;
     return NIXL_SUCCESS;
+}
+
+std::string
+nixlLibfabricTopology::getPcieAddressForOsDev(const std::string &osdev_name) const {
+    if (!hwloc_topology || osdev_name.empty()) {
+        return "";
+    }
+
+    hwloc_obj_t osdev = nullptr;
+    while ((osdev = hwloc_get_next_osdev(hwloc_topology, osdev)) != nullptr) {
+        if (!osdev->name || osdev_name != osdev->name) {
+            continue;
+        }
+        // hwloc may put bridge levels between an OS device and its PCI device.
+        for (hwloc_obj_t parent = osdev->parent; parent != nullptr; parent = parent->parent) {
+            if (parent->type == HWLOC_OBJ_PCI_DEVICE) {
+                return getPcieAddressFromHwlocObj(parent);
+            }
+        }
+        NIXL_DEBUG << "hwloc OS device " << osdev_name << " has no PCI device ancestor";
+        return "";
+    }
+
+    NIXL_DEBUG << "No hwloc OS device named " << osdev_name;
+    return "";
 }
 
 nixl_status_t

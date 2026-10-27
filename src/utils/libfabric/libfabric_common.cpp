@@ -19,6 +19,7 @@
 #include "libfabric_common.h"
 #include "common/nixl_log.h"
 
+#include <algorithm>
 #include <array>
 #include <iomanip>
 #include <sstream>
@@ -32,10 +33,63 @@
 
 namespace LibfabricUtils {
 
+namespace {
+
+    /**
+     * @brief Domain-name suffixes verbs uses for its XRC and DGRAM variants, which nixl rails
+     * cannot use. Matched as suffixes so hyphenated device names are kept.
+     */
+    constexpr const char *k_verbs_unusable_domain_suffixes[] = {"-xrc", "-dgram"};
+
+    bool
+    hasUnusableVerbsSuffix(const std::string &domain) {
+        for (const char *suffix : k_verbs_unusable_domain_suffixes) {
+            const size_t suffix_len = strlen(suffix);
+            if (domain.size() > suffix_len &&
+                domain.compare(domain.size() - suffix_len, suffix_len, suffix) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+} // namespace
+
 std::string
 baseProviderName(const std::string &prov_name) {
     const size_t layered = prov_name.find(';');
     return (layered == std::string::npos) ? prov_name : prov_name.substr(0, layered);
+}
+
+std::vector<std::string>
+selectVerbsDomains(const nixlProviderDeviceMap &provider_device_map) {
+    std::vector<std::string> domains;
+    std::unordered_set<std::string> seen;
+
+    for (const auto &entry : provider_device_map) {
+        if (baseProviderName(entry.first) != "verbs") {
+            continue;
+        }
+        // Rails need the ofi_rxm (RDM over MSG) stack; ofi_rxd reaches the same NICs over DGRAM.
+        if (entry.first.find("ofi_rxm") == std::string::npos) {
+            NIXL_DEBUG << "Ignoring verbs variant " << entry.first
+                       << ": nixl rails need the ofi_rxm-layered endpoint";
+            continue;
+        }
+        for (const auto &domain : entry.second) {
+            if (hasUnusableVerbsSuffix(domain)) {
+                NIXL_DEBUG << "Ignoring verbs domain " << domain << ": not an RDM-capable domain";
+                continue;
+            }
+            if (seen.insert(domain).second) {
+                domains.push_back(domain);
+            }
+        }
+    }
+
+    // Sorted so rail indices do not depend on the unordered map's iteration order.
+    std::sort(domains.begin(), domains.end());
+    return domains;
 }
 
 /****************************************
@@ -56,9 +110,12 @@ namespace {
         /*mr_mode=*/k_mr_mode_rdma | FI_MR_ENDPOINT,
         // Left to the provider: a key size here changes which fi_info entries cxi returns.
         /*mr_key_size=*/0,
+        /*needs_prov_name_hint=*/false,
         /*needs_full_topology=*/true,
+        /*needs_all_rail_progress=*/false,
         /*needs_write_tag=*/false,
         /*single_domain=*/false,
+        /*select_domains=*/nullptr,
     };
 
     const nixlLibfabricProviderInfo k_efa_provider = {
@@ -67,9 +124,28 @@ namespace {
         /*extra_caps=*/0,
         /*mr_mode=*/k_mr_mode_rdma,
         /*mr_key_size=*/2,
+        /*needs_prov_name_hint=*/false,
         /*needs_full_topology=*/true,
+        /*needs_all_rail_progress=*/false,
         /*needs_write_tag=*/false,
         /*single_domain=*/false,
+        /*select_domains=*/nullptr,
+    };
+
+    const nixlLibfabricProviderInfo k_verbs_provider = {
+        /*name=*/"verbs",
+        /*description=*/"verbs",
+        /*extra_caps=*/0,
+        /*mr_mode=*/k_mr_mode_rdma,
+        /*mr_key_size=*/2,
+        /*needs_prov_name_hint=*/true,
+        /*needs_full_topology=*/true,
+        // Layered over a connection-oriented core, so the passive side must poll for the accept.
+        /*needs_all_rail_progress=*/true,
+        // ofi_rxm gives a remote write no usable source address; see providerNeedsWriteTag().
+        /*needs_write_tag=*/true,
+        /*single_domain=*/false,
+        /*select_domains=*/selectVerbsDomains,
     };
 
     const nixlLibfabricProviderInfo k_tcp_provider = {
@@ -78,9 +154,12 @@ namespace {
         /*extra_caps=*/0,
         /*mr_mode=*/k_mr_mode_basic,
         /*mr_key_size=*/0,
+        /*needs_prov_name_hint=*/false,
         /*needs_full_topology=*/false,
+        /*needs_all_rail_progress=*/false,
         /*needs_write_tag=*/false,
         /*single_domain=*/true,
+        /*select_domains=*/nullptr,
     };
 
     const nixlLibfabricProviderInfo k_sockets_provider = {
@@ -89,9 +168,12 @@ namespace {
         /*extra_caps=*/0,
         /*mr_mode=*/k_mr_mode_basic,
         /*mr_key_size=*/0,
+        /*needs_prov_name_hint=*/false,
         /*needs_full_topology=*/false,
+        /*needs_all_rail_progress=*/false,
         /*needs_write_tag=*/false,
         /*single_domain=*/true,
+        /*select_domains=*/nullptr,
     };
 
 } // namespace
@@ -118,9 +200,10 @@ selectDomainsGeneric(const nixlProviderDeviceMap &provider_device_map, const cha
  *
  * constexpr so it has no destructor: the progress thread may still read it while exit() runs.
  */
-constexpr std::array<const nixlLibfabricProviderInfo *, 4> k_known_providers = {
+constexpr std::array<const nixlLibfabricProviderInfo *, 5> k_known_providers = {
     &k_cxi_provider,
     &k_efa_provider,
+    &k_verbs_provider,
     &k_tcp_provider,
     &k_sockets_provider,
 };
@@ -147,6 +230,12 @@ defaultProviderInfo() {
 }
 
 bool
+providerNeedsAllRailProgress(const std::string &prov_name) {
+    const nixlLibfabricProviderInfo *provider = findProviderInfo(prov_name);
+    return (provider != nullptr) && provider->needs_all_rail_progress;
+}
+
+bool
 providerNeedsWriteTag(const std::string &prov_name) {
     const nixlLibfabricProviderInfo *provider = findProviderInfo(prov_name);
     return (provider != nullptr) && provider->needs_write_tag;
@@ -162,7 +251,8 @@ std::pair<std::string, std::vector<std::string>>
 selectProvider(const nixlProviderDeviceMap &provider_device_map) {
     // First table entry with usable domains wins.
     for (const nixlLibfabricProviderInfo *provider : knownProviders()) {
-        std::vector<std::string> domains =
+        std::vector<std::string> domains = (provider->select_domains != nullptr) ?
+            provider->select_domains(provider_device_map) :
             selectDomainsGeneric(provider_device_map, provider->name);
         if (domains.empty()) {
             continue;

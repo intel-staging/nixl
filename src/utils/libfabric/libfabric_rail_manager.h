@@ -76,9 +76,12 @@ public:
     /** Initialize rail manager with topology discovery and create rails based on available
      * network devices
      * @param striping_threshold Size threshold for enabling multi-rail striping
+     * @param progress_thread_enabled Whether the backend runs a progress thread. Without one,
+     *        lazily connecting providers get FI_PROGRESS_AUTO rails
      * @throws std::runtime_error if initialization fails
      */
-    nixlLibfabricRailManager(size_t striping_threshold);
+    explicit nixlLibfabricRailManager(size_t striping_threshold,
+                                      bool progress_thread_enabled = true);
     /** Destroy rail manager and cleanup all resources */
     ~nixlLibfabricRailManager();
 
@@ -196,6 +199,10 @@ public:
     /** Whether peers must stamp their writes with a write tag. See providerNeedsWriteTag(). */
     bool
     needsWriteTag() const;
+
+    /** Whether every rail must be progressed. See providerNeedsAllRailProgress(). */
+    bool
+    needsAllRailProgress() const;
 
     /** Map @p write_tag to @p agent_idx on every rail. */
     void
@@ -418,6 +425,9 @@ private:
 
     // System runtime type (determined once at initialization)
     fi_hmem_iface runtime_;
+
+    // Whether the backend runs a progress thread
+    bool progress_thread_enabled_;
 
     // Rail allocation
     std::vector<std::unique_ptr<nixlLibfabricRail>> rails_;

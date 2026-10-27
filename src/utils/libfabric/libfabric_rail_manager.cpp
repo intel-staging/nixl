@@ -193,9 +193,11 @@ private:
     buildNumaDistanceMap();
 };
 
-nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
+nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
+                                                   bool progress_thread_enabled)
     : striping_threshold_(striping_threshold),
-      runtime_(FI_HMEM_CUDA) {
+      runtime_(FI_HMEM_CUDA),
+      progress_thread_enabled_(progress_thread_enabled) {
     NIXL_DEBUG << "Creating rail manager with striping threshold: " << striping_threshold_
                << " bytes";
 
@@ -374,13 +376,17 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
     efa_device_to_rail_map.reserve(num_rails_);
     clearActiveRails();
 
+    // Without a progress thread, lazily connecting providers progress connections themselves.
+    const bool auto_progress =
+        !progress_thread_enabled_ && LibfabricUtils::providerNeedsAllRailProgress(provider_name);
+
     try {
         rails_.clear();
         rails_.reserve(num_rails_);
 
         for (size_t i = 0; i < num_rails_; ++i) {
             rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i), runtime_));
+                efa_devices[i], provider_name, static_cast<uint16_t>(i), runtime_, auto_progress));
 
             // Initialize EFA device mapping
             efa_device_to_rail_map[efa_devices[i]] = i;
@@ -1154,8 +1160,14 @@ nixl_status_t
 nixlLibfabricRailManager::progressActiveRails() {
     std::unordered_set<size_t> rails_to_process;
 
-    // Copy active rails under lock to avoid iterator invalidation
-    {
+    // Lazily connecting providers accept a peer's connection only on a progressed rail, so
+    // progress every rail, not just the active ones.
+    if (needsAllRailProgress()) {
+        for (size_t rail_id = 0; rail_id < rails_.size(); ++rail_id) {
+            rails_to_process.insert(rail_id);
+        }
+    } else {
+        // Copy active rails under lock to avoid iterator invalidation
         std::lock_guard<std::mutex> lock(active_rails_mutex_);
         // Always progress rail 0 for notifications (SEND/RECV)
         rails_to_process.insert(0);
@@ -1198,6 +1210,11 @@ nixlLibfabricRailManager::progressActiveRails() {
 bool
 nixlLibfabricRailManager::needsWriteTag() const {
     return topology && LibfabricUtils::providerNeedsWriteTag(topology->getProviderName());
+}
+
+bool
+nixlLibfabricRailManager::needsAllRailProgress() const {
+    return topology && LibfabricUtils::providerNeedsAllRailProgress(topology->getProviderName());
 }
 
 void

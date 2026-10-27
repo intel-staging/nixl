@@ -337,8 +337,10 @@ namespace LibfabricUtils {
 struct nixlLibfabricDeviceInfo {
     /** @brief libfabric domain name, the name a rail is created on. */
     std::string domain_name;
-    /** @brief PCIe address in hwloc's "%x:%02x:%02x.%x" format, or empty if libfabric reported
-     * none. */
+    /**
+     * @brief PCIe address in hwloc's "%x:%02x:%02x.%x" format, or empty if libfabric reported none
+     * (verbs leaves bus_attr at FI_BUS_UNKNOWN; the topology layer resolves it through hwloc).
+     */
     std::string pcie_address;
     /** @brief Link speed in bits/s, or 0 if libfabric reported none. */
     size_t link_speed = 0;
@@ -374,12 +376,21 @@ struct nixlLibfabricProviderInfo {
     uint64_t mr_mode;
     /** @brief hints->domain_attr->mr_key_size for a rail; 0 lets the provider choose. */
     size_t mr_key_size;
+    /**
+     * @brief Whether a rail names this provider in hints->fabric_attr->prov_name. Needed for verbs,
+     * whose domains psm3 also offers under the same names.
+     */
+    bool needs_prov_name_hint;
     /** @brief Whether to do hwloc topology discovery and accelerator-to-NIC grouping. */
     bool needs_full_topology;
+    /** @brief See @ref providerNeedsAllRailProgress. */
+    bool needs_all_rail_progress;
     /** @brief See @ref providerNeedsWriteTag. */
     bool needs_write_tag;
     /** @brief Use only the first domain: every domain reaches every peer (tcp, sockets). */
     bool single_domain;
+    /** @brief Provider-specific domain selection, or nullptr for @ref selectDomainsGeneric. */
+    std::vector<std::string> (*select_domains)(const nixlProviderDeviceMap &);
 };
 
 /** @brief The provider table, in preference order (highest first). */
@@ -395,6 +406,15 @@ const nixlLibfabricProviderInfo &
 defaultProviderInfo();
 
 /**
+ * @brief True when every rail must be progressed, not just the rails this agent posted on.
+ *
+ * A provider layered over a connection-oriented core (verbs via ofi_rxm) connects lazily, and the
+ * passive side must poll a rail's CQ for the peer's connection on that rail to be accepted.
+ */
+bool
+providerNeedsAllRailProgress(const std::string &prov_name);
+
+/**
  * @brief True when a remote-write completion does not identify its sender by source address.
  *
  * ofi_rxm leaves src_addr stale or FI_ADDR_NOTAVAIL for remote writes, so peers carry a
@@ -406,6 +426,17 @@ providerNeedsWriteTag(const std::string &prov_name);
 /** @brief See @ref nixlLibfabricProviderInfo::needs_full_topology. */
 bool
 providerNeedsFullTopology(const std::string &prov_name);
+
+/**
+ * @brief The verbs domains usable as rails.
+ *
+ * Keeps only "verbs;ofi_rxm" entries (verbs has no native RDM endpoint), drops the "-xrc" and
+ * "-dgram" domain variants, and de-duplicates the per-capability repeats of each domain.
+ *
+ * @return Unique domain names, sorted.
+ */
+std::vector<std::string>
+selectVerbsDomains(const nixlProviderDeviceMap &provider_device_map);
 
 /**
  * @brief Domains listed under exactly the prov_name @p name, de-duplicated, in fi_getinfo order.

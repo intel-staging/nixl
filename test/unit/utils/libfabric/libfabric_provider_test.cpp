@@ -17,14 +17,19 @@
  */
 
 /*
- * Tests for libfabric provider handling: baseProviderName(), the provider table and
- * selectProvider(), using synthetic prov_name -> domain maps.
+ * Tests for libfabric provider handling: baseProviderName(), selectVerbsDomains(), the provider
+ * table and selectProvider(), using synthetic prov_name -> domain maps, plus a live check that a
+ * verbs host resolves PCIe addresses for its NICs.
  */
 
 #include "libfabric/libfabric_common.h"
+#include "libfabric/libfabric_topology.h"
+#include "libfabric/libfabric_rail_manager.h"
 #include "common/nixl_log.h"
 
 #include <algorithm>
+#include <exception>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -80,12 +85,64 @@ testBaseProviderName() {
 }
 
 /****************************************
- * 2. The provider table
+ * 2. selectVerbsDomains
+ *****************************************/
+
+void
+testSelectVerbsDomains() {
+    NIXL_INFO << "2. Testing selectVerbsDomains()";
+
+    // FI_EP_RDM as libfabric reports it: several ofi_rxm entries per NIC, plus the ofi_rxd
+    // DGRAM domains.
+    const ProviderMap real_shape = {
+        {"verbs;ofi_rxm",
+         {"rocep153s0f0",
+          "rocep153s0f0",
+          "rocep153s0f0",
+          "rocep153s0f0",
+          "rocep153s0f1",
+          "rocep153s0f1",
+          "rocep153s0f1",
+          "rocep153s0f1"}},
+        {"verbs;ofi_rxd", {"rocep153s0f0-dgram", "rocep153s0f1-dgram"}},
+        {"tcp", {"ens1f0np0", "lo"}},
+        {"psm3", {"rocep153s0f0", "rocep153s0f1"}},
+    };
+    const std::vector<std::string> selected = LibfabricUtils::selectVerbsDomains(real_shape);
+    NIXL_INFO << "   selected: [" << join(selected) << "]";
+    check(selected == std::vector<std::string>({"rocep153s0f0", "rocep153s0f1"}),
+          "one rail per NIC, deduplicated, sorted, with the ofi_rxd DGRAM domains dropped");
+
+    // A hyphen in the device name is not an endpoint-variant suffix.
+    const ProviderMap hyphenated = {
+        {"verbs;ofi_rxm", {"roce-nic0", "roce-nic0-dgram", "roce-nic0-xrc"}},
+    };
+    const std::vector<std::string> hyphen_selected = LibfabricUtils::selectVerbsDomains(hyphenated);
+    NIXL_INFO << "   selected: [" << join(hyphen_selected) << "]";
+    check(hyphen_selected == std::vector<std::string>({"roce-nic0"}),
+          "a hyphenated device name survives while its -dgram and -xrc variants are dropped");
+
+    check(LibfabricUtils::selectVerbsDomains({{"verbs;ofi_rxd", {"mlx5_0-dgram"}}}).empty(),
+          "a host offering verbs only through ofi_rxd selects nothing");
+    check(
+        LibfabricUtils::selectVerbsDomains({{"efa", {"rdmap16s27-rdm"}}, {"tcp", {"lo"}}}).empty(),
+        "no verbs entry selects nothing, and efa's own -rdm domain is left alone");
+    check(LibfabricUtils::selectVerbsDomains({}).empty(), "an empty map selects nothing");
+
+    // Domains are sorted, so rail indices do not depend on map order.
+    const ProviderMap reversed = {{"verbs;ofi_rxm", {"mlx5_3", "mlx5_1", "mlx5_2", "mlx5_0"}}};
+    check(LibfabricUtils::selectVerbsDomains(reversed) ==
+              std::vector<std::string>({"mlx5_0", "mlx5_1", "mlx5_2", "mlx5_3"}),
+          "domains come back in a deterministic order regardless of discovery order");
+}
+
+/****************************************
+ * 3. The provider table
  *****************************************/
 
 void
 testProviderTable() {
-    NIXL_INFO << "2. Testing the provider table";
+    NIXL_INFO << "3. Testing the provider table";
 
     const auto &providers = LibfabricUtils::knownProviders();
 
@@ -95,14 +152,14 @@ testProviderTable() {
         order.push_back(provider->name);
     }
     NIXL_INFO << "   preference order: [" << join(order) << "]";
-    check(order == std::vector<std::string>({"cxi", "efa", "tcp", "sockets"}),
+    check(order == std::vector<std::string>({"cxi", "efa", "verbs", "tcp", "sockets"}),
           "providers are in the documented preference order, RDMA before host-stack");
 
     // Lookup accepts a layered prov_name.
-    check(LibfabricUtils::findProviderInfo("efa;ofi_rxd") != nullptr,
+    check(LibfabricUtils::findProviderInfo("verbs;ofi_rxm") != nullptr,
           "findProviderInfo() resolves a layered prov_name");
-    check(LibfabricUtils::findProviderInfo("efa;ofi_rxd") ==
-              LibfabricUtils::findProviderInfo("efa"),
+    check(LibfabricUtils::findProviderInfo("verbs;ofi_rxm") ==
+              LibfabricUtils::findProviderInfo("verbs"),
           "the layered and core names resolve to the same entry");
     check(LibfabricUtils::findProviderInfo("psm3") == nullptr,
           "an unlisted provider has no table entry");
@@ -113,11 +170,20 @@ testProviderTable() {
     check((fallback.mr_mode & FI_MR_HMEM) != 0,
           "the fallback entry requests FI_MR_HMEM, so device memory still works on an unlisted "
           "provider");
+    check(!fallback.needs_prov_name_hint,
+          "the fallback entry does not pin hints to one provider name");
 
+    const auto *verbs = LibfabricUtils::findProviderInfo("verbs");
     const auto *cxi = LibfabricUtils::findProviderInfo("cxi");
     const auto *tcp = LibfabricUtils::findProviderInfo("tcp");
 
     // Per-provider flags.
+    check(verbs != nullptr && verbs->needs_prov_name_hint,
+          "verbs names itself in rail hints, so psm3 cannot claim the same domain");
+    check(verbs != nullptr && verbs->needs_all_rail_progress,
+          "verbs progresses every rail, so the passive side accepts lazy connections");
+    check(cxi != nullptr && !cxi->needs_all_rail_progress,
+          "a connectionless RDM provider keeps the cheaper active-rails-only progress");
     check(cxi != nullptr && (cxi->extra_caps & FI_RMA_EVENT) != 0, "cxi requests FI_RMA_EVENT");
     check(cxi != nullptr && (cxi->mr_mode & FI_MR_ENDPOINT) != 0,
           "cxi requests FI_MR_ENDPOINT in its mr_mode");
@@ -137,8 +203,15 @@ testProviderTable() {
     }
 
     // The flag helpers used by the rest of the plugin.
+    check(LibfabricUtils::providerNeedsAllRailProgress("verbs;ofi_rxm"),
+          "providerNeedsAllRailProgress() accepts the layered name it will really be given");
+    check(!LibfabricUtils::providerNeedsAllRailProgress("efa"),
+          "providerNeedsAllRailProgress() is false for efa");
+    check(!LibfabricUtils::providerNeedsAllRailProgress("psm3"),
+          "an unlisted provider does not get all-rail progress");
     check(LibfabricUtils::providerNeedsFullTopology("efa") &&
-              LibfabricUtils::providerNeedsFullTopology("cxi"),
+              LibfabricUtils::providerNeedsFullTopology("cxi") &&
+              LibfabricUtils::providerNeedsFullTopology("verbs"),
           "providerNeedsFullTopology() is true for every RDMA provider");
     check(!LibfabricUtils::providerNeedsFullTopology("tcp") &&
               !LibfabricUtils::providerNeedsFullTopology("sockets"),
@@ -148,21 +221,33 @@ testProviderTable() {
 }
 
 /****************************************
- * 3. Provider selection over synthetic maps
+ * 4. Provider selection over synthetic maps
  *****************************************/
 
 void
 testProviderSelection() {
-    NIXL_INFO << "3. Testing getAvailableNetworkDevices()'s selection rule";
+    NIXL_INFO << "4. Testing getAvailableNetworkDevices()'s selection rule";
 
     auto select = [](const ProviderMap &map) { return LibfabricUtils::selectProvider(map); };
 
-    // efa is preferred over tcp and uses the generic rule.
+    // verbs is preferred over tcp.
+    const auto roce = select({
+        {"verbs;ofi_rxm", {"rocep153s0f0", "rocep153s0f1"}},
+        {"verbs;ofi_rxd", {"rocep153s0f0-dgram"}},
+        {"tcp", {"ens1f0np0", "lo"}},
+        {"psm3", {"rocep153s0f0"}},
+    });
+    check(roce.first == "verbs", "verbs is preferred over tcp on a RoCE host");
+    check(roce.second == std::vector<std::string>({"rocep153s0f0", "rocep153s0f1"}),
+          "the verbs hook's filtered domain list is the one used");
+
+    // efa is preferred over verbs and uses the generic rule.
     const auto efa = select({
         {"efa", {"rdmap16s27-rdm", "rdmap32s27-rdm"}},
+        {"verbs;ofi_rxm", {"mlx5_0"}},
         {"tcp", {"lo"}},
     });
-    check(efa.first == "efa", "efa outranks tcp");
+    check(efa.first == "efa", "efa outranks verbs");
     check(
         efa.second == std::vector<std::string>({"rdmap16s27-rdm", "rdmap32s27-rdm"}),
         "the generic rule preserves fi_getinfo order, so existing efa rail numbering is unchanged");
@@ -195,15 +280,70 @@ testProviderSelection() {
           "a host offering only an unlisted provider selects nothing rather than mis-claiming it");
 }
 
+/****************************************
+ * 5. Live topology on a verbs host
+ *****************************************/
+
+void
+testLiveVerbsTopology() {
+    NIXL_INFO << "5. Testing live topology";
+
+    // Skip only when no provider is usable; a topology failure with one found is a failure.
+    if (LibfabricUtils::getAvailableNetworkDevices().first == "none") {
+        NIXL_INFO << "   no usable libfabric provider on this host, skipping the live checks";
+        return;
+    }
+
+    std::optional<nixlLibfabricTopology> live;
+    try {
+        live.emplace();
+    }
+    catch (const std::exception &e) {
+        check(false,
+              std::string("topology discovery succeeds when a provider is available: ") + e.what());
+        return;
+    }
+    nixlLibfabricTopology &topology = *live;
+    const std::string provider = topology.getProviderName();
+    NIXL_INFO << "   provider: " << provider << ", " << topology.getAllDevices().size()
+              << " device(s), " << topology.getTotalNicCount() << " NIC(s) with PCIe info";
+
+    if (provider != "verbs") {
+        NIXL_INFO << "   not a verbs host, skipping the verbs-specific assertions";
+        return;
+    }
+
+    // verbs reports FI_BUS_UNKNOWN, so PCIe addresses come from the hwloc fallback.
+    check(topology.getTotalNicCount() == topology.getAllDevices().size(),
+          "every selected verbs device resolved to a PCIe address");
+    check(topology.hasPcieDevices(), "hasPcieDevices() reflects the resolved addresses");
+
+    // Every selected device has a PCIe address.
+    for (const auto &device : topology.getAllDevices()) {
+        check(!topology.getPcieAddress(device).empty(),
+              "selected device " + device + " has a PCIe address");
+    }
+
+    for (const auto &device : topology.getAllDevices()) {
+        check(device.find("-dgram") == std::string::npos &&
+                  device.find("-xrc") == std::string::npos,
+              "selected device " + device + " is an RDM-capable domain");
+        check(topology.getDeviceNumaNode(device) != nixlLibfabricTopology::INVALID_NUMA_NODE_ID,
+              "selected device " + device + " resolved to a NUMA node");
+    }
+}
+
 } // namespace
 
 int
 main() {
-    NIXL_INFO << "=== Testing Libfabric provider selection ===";
+    NIXL_INFO << "=== Testing Libfabric verbs provider selection ===";
 
     testBaseProviderName();
+    testSelectVerbsDomains();
     testProviderTable();
     testProviderSelection();
+    testLiveVerbsTopology();
 
     if (failures != 0) {
         NIXL_ERROR << "=== " << failures << " check(s) FAILED ===";
