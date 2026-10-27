@@ -20,6 +20,7 @@
 
 #include <vector>
 #include <array>
+#include <bitset>
 #include <memory>
 #include <thread>
 #include <mutex>
@@ -211,6 +212,15 @@ private:
     mutable std::unordered_map<std::string, std::shared_ptr<nixlLibfabricConnection>> connections_;
     mutable std::vector<std::string> agent_names_; // List of agent names for easy access
 
+    // Write tags handed to peers, when the provider needs them. Guarded by
+    // connection_state_mutex_.
+    bool assign_write_tags_ = false;
+    std::bitset<NIXL_LIBFABRIC_MAX_WRITE_TAG + 1> write_tags_in_use_;
+    // Next tag to try, so a released tag is reused as late as possible.
+    uint8_t next_write_tag_ = 1;
+    // Last generation handed out per tag.
+    std::array<uint8_t, NIXL_LIBFABRIC_MAX_WRITE_TAG + 1> write_tag_gen_{};
+
     // Threading infrastructure - remaining members
     // Connection Management (CM) thread: sends re-establishment replies queued by the
     // progress thread (handleHandshake), which must not post from its own completion context
@@ -277,8 +287,15 @@ private:
     std::unordered_map<uint64_t, PendingNotification> pending_notifications_;
 
     // Agents whose handshake arrived before the local createAgentConnection had registered
-    // them in connections_. Drained inside createAgentConnection.
-    std::unordered_set<std::string> pending_inbound_handshakes_;
+    // them in connections_, with the write tag and generation it carried. Drained inside
+    // createAgentConnection.
+    struct BufferedWriteTag {
+        uint8_t tag = 0;
+        uint8_t gen = 0;
+        bool has_gen = false; // peer sent "wgen"
+    };
+
+    std::unordered_map<std::string, BufferedWriteTag> pending_inbound_handshakes_;
     // Same, for handshakes rejected for their protocol version: agent name -> peer's version.
     std::unordered_map<std::string, uint16_t> pending_rejected_handshakes_;
     std::mutex pending_handshake_mutex_;
@@ -291,6 +308,18 @@ private:
     nixl_status_t
     createAgentConnection(const std::string &agent_name,
                           const std::vector<std::array<char, 56>> &data_rail_endpoints);
+
+    // Free write tag, or 0 when all are taken. Caller holds connection_state_mutex_.
+    uint8_t
+    allocateWriteTag();
+
+    // Release conn's write tag and its rail mappings. Caller holds connection_state_mutex_.
+    void
+    releaseWriteTag(const nixlLibfabricConnection &conn);
+
+    // Drop writes under conn's write tag that carry another generation.
+    void
+    requireWriteGenFrom(const nixlLibfabricConnection &conn);
 
     // Private notification implementation with unified binary notification system
     nixl_status_t

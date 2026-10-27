@@ -414,6 +414,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     const std::vector<size_t> &remote_selected_endpoints,
     const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
     uint16_t xfer_id,
+    uint8_t write_tag,
+    uint8_t write_gen,
     std::function<void(nixl_status_t)> completion_callback,
     size_t &submitted_count_out,
     int desc_idx,
@@ -479,6 +481,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
             // PT-owns-endpoint: enqueue for progress thread to post
             deferTransferRequest(op_type,
                                  xfer_id,
+                                 write_tag,
+                                 write_gen,
                                  fi_flags,
                                  dest_addrs.at(rail_id)[remote_ep_id],
                                  device_id,
@@ -488,9 +492,10 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
             status = NIXL_SUCCESS;
         } else if (op_type == nixlLibfabricReq::WRITE) {
             // Direct post (PT OFF path)
-            // Generate next SEQ_ID for this specific write operation
-            uint8_t seq_id = LibfabricUtils::getNextSeqId();
-            uint64_t imm_data = NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, seq_id);
+            // SEQ_ID carries the write tag's generation, if any
+            uint8_t seq_id = write_gen != 0 ? write_gen : LibfabricUtils::getNextSeqId();
+            uint64_t imm_data =
+                NIXL_MAKE_TAGGED_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, write_tag, xfer_id, seq_id);
             status = rails_[rail_id]->postWrite(req->local_addr,
                                                 req->chunk_size,
                                                 fi_mr_desc(req->local_mr),
@@ -574,6 +579,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                 // PT-owns-endpoint: enqueue for progress thread to post
                 deferTransferRequest(op_type,
                                      xfer_id,
+                                     write_tag,
+                                     write_gen,
                                      fi_flags,
                                      dest_addrs.at(rail_id)[remote_ep_id],
                                      device_id,
@@ -582,10 +589,10 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                      req);
                 status = NIXL_SUCCESS;
             } else if (op_type == nixlLibfabricReq::WRITE) {
-                // Generate next SEQ_ID for this specific transfer operation
-                uint8_t seq_id = LibfabricUtils::getNextSeqId();
-                uint64_t imm_data =
-                    NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, seq_id);
+                // SEQ_ID carries the write tag's generation, if any
+                uint8_t seq_id = write_gen != 0 ? write_gen : LibfabricUtils::getNextSeqId();
+                uint64_t imm_data = NIXL_MAKE_TAGGED_IMM_DATA(
+                    NIXL_LIBFABRIC_MSG_TRANSFER, write_tag, xfer_id, seq_id);
                 status = rails_[rail_id]->postWrite(req->local_addr,
                                                     req->chunk_size,
                                                     fi_mr_desc(req->local_mr),
@@ -628,15 +635,19 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
 void
 nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
                                                uint16_t xfer_id,
+                                               uint8_t write_tag,
+                                               uint8_t write_gen,
                                                uint64_t fi_flags,
                                                fi_addr_t dest_addr,
                                                int device_id,
                                                bool is_cuda_vram,
                                                size_t rail_id,
                                                nixlLibfabricReq *req) {
-    uint8_t seq_id = (op_type == nixlLibfabricReq::WRITE) ? LibfabricUtils::getNextSeqId() : 0;
+    uint8_t seq_id = (op_type != nixlLibfabricReq::WRITE) ? 0 :
+        write_gen != 0                                    ? write_gen :
+                                                            LibfabricUtils::getNextSeqId();
     uint64_t imm_data = (op_type == nixlLibfabricReq::WRITE) ?
-        NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, seq_id) :
+        NIXL_MAKE_TAGGED_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, write_tag, xfer_id, seq_id) :
         0;
     nixlLibfabricPostRequest pr{};
     pr.type = (op_type == nixlLibfabricReq::WRITE) ? nixlLibfabricPostRequest::WRITE :
@@ -1182,6 +1193,34 @@ nixlLibfabricRailManager::progressActiveRails() {
         return first_error;
     }
     return any_completions ? NIXL_SUCCESS : NIXL_IN_PROG;
+}
+
+bool
+nixlLibfabricRailManager::needsWriteTag() const {
+    return topology && LibfabricUtils::providerNeedsWriteTag(topology->getProviderName());
+}
+
+void
+nixlLibfabricRailManager::mapWriteTag(uint8_t write_tag, uint32_t agent_idx) {
+    for (auto &rail : rails_) {
+        rail->mapWriteTag(write_tag, agent_idx);
+    }
+}
+
+void
+nixlLibfabricRailManager::unmapWriteTag(uint8_t write_tag, uint32_t agent_idx) {
+    for (auto &rail : rails_) {
+        rail->unmapWriteTag(write_tag, agent_idx);
+    }
+}
+
+void
+nixlLibfabricRailManager::requireWriteGen(uint8_t write_tag,
+                                          uint32_t agent_idx,
+                                          uint8_t write_gen) {
+    for (auto &rail : rails_) {
+        rail->requireWriteGen(write_tag, agent_idx, write_gen);
+    }
 }
 
 nixl_status_t

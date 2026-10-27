@@ -55,6 +55,21 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
     uint16_t rejected_peer_proto_ver_ = 0;
     std::mutex handshake_mutex_;
     std::condition_variable handshake_cv_;
+
+    /**
+     * @brief Write tags, for providers that report no source address for remote writes
+     * (see providerNeedsWriteTag()).
+     *
+     * local_write_tag_ is the tag we handed this peer in our handshake, mapped on our rails to its
+     * agent index. peer_write_tag_ is the tag it handed us, stamped in the imm_data of our writes
+     * to it. 0 means no tag. Each tag has a generation, bumped on reuse and stamped in the SEQ_ID
+     * bits, so writes from the tag's previous holder are dropped; peer_write_gen_ is 0 when the
+     * peer sent none, and then no generation is stamped.
+     */
+    uint8_t local_write_tag_ = 0;
+    uint8_t local_write_gen_ = 0;
+    std::atomic<uint8_t> peer_write_tag_{0};
+    std::atomic<uint8_t> peer_write_gen_{0};
 };
 
 #endif // NIXL_SRC_PLUGINS_LIBFABRIC_LIBFABRIC_CONNECTION_H

@@ -177,6 +177,8 @@ Provider-specific settings are confined to the table returned by `knownProviders
 - `extra_caps`, `mr_mode`, `mr_key_size` -- what a rail asks `fi_getinfo` for.
 - `needs_full_topology` -- set for an RDMA provider that should get hwloc discovery and
   accelerator-to-NIC proximity grouping; clear for a host-stack provider.
+- `needs_write_tag` -- set when a remote-write completion carries no usable source address, so
+  peers must name themselves in the write's immediate data.
 - `single_domain` -- set when one rail reaches every peer, so extra rails would only add host copies.
 
 Table order is the preference order. A provider with no entry still works: it gets

@@ -18,6 +18,7 @@
 #ifndef NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_H
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_H
 
+#include <array>
 #include <vector>
 #include <deque>
 #include <limits>
@@ -470,6 +471,28 @@ public:
     [[nodiscard]] uint32_t
     resolveSourceAddress(fi_addr_t src_addr) const;
 
+    /** Map a write tag this agent handed a peer to that peer's agent index. */
+    void
+    mapWriteTag(uint8_t write_tag, uint32_t agent_idx) const;
+
+    /** Drop a write tag's mapping if it still names agent_idx. */
+    void
+    unmapWriteTag(uint8_t write_tag, uint32_t agent_idx) const;
+
+    /** Resolve a write tag to a local agent index, or kUnknownAgentIdx if unmapped. */
+    [[nodiscard]] uint32_t
+    resolveWriteTag(uint8_t write_tag) const;
+
+    /** Accept @p write_tag only with generation @p write_gen, if the tag still names
+     *  @p agent_idx. Until called, the generation is not checked. */
+    void
+    requireWriteGen(uint8_t write_tag, uint32_t agent_idx, uint8_t write_gen) const;
+
+    /** resolveWriteTag(), returning kUnknownAgentIdx when @p write_gen is not the tag's required
+     *  generation. */
+    [[nodiscard]] uint32_t
+    resolveWriteTag(uint8_t write_tag, uint8_t write_gen) const;
+
     // Memory descriptor helper methods
     /** Get libfabric memory descriptor for MR */
     void *
@@ -638,6 +661,13 @@ private:
     // FI_AV_TABLE). Written at connection setup, read on the completion path.
     mutable std::vector<uint32_t> src_addr_to_agent_;
     mutable std::shared_mutex src_addr_mutex_;
+
+    // Write tag -> local agent index. Slot 0 means no tag. Guarded by src_addr_mutex_.
+    mutable std::array<uint32_t, NIXL_LIBFABRIC_MAX_WRITE_TAG + 1> write_tag_to_agent_;
+    // Generation each write tag must carry, 0 = not checked. Guarded by src_addr_mutex_.
+    mutable std::array<uint8_t, NIXL_LIBFABRIC_MAX_WRITE_TAG + 1> write_tag_gen_{};
+    // Remote writes dropped as unattributable, for log rate limiting.
+    mutable std::atomic<uint64_t> dropped_remote_writes_{0};
 
     // Separate request pools for optimal performance
     ControlRequestPool control_request_pool_;

@@ -66,6 +66,10 @@ constexpr const char *NIXL_HANDSHAKE_TAG_V1_IDX = "idx";
 constexpr const char *NIXL_HANDSHAKE_TAG_NAME = "name";
 constexpr const char *NIXL_HANDSHAKE_TAG_HAS_CONN = "has_conn";
 constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
+// Optional: the write tag the receiver puts in imm_data of its writes to us.
+constexpr const char *NIXL_HANDSHAKE_TAG_WRITE_TAG = "wtag";
+// Optional, after "wtag": that tag's generation, carried in the SEQ_ID bits.
+constexpr const char *NIXL_HANDSHAKE_TAG_WRITE_GEN = "wgen";
 
 // Wire-protocol version of the libfabric plugin, exchanged in the handshake. Bump it on any
 // incompatible imm_data or control-message change. 1: 8-bit agent index in imm_data (sends
@@ -73,8 +77,11 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 #define NIXL_LIBFABRIC_PROTO_VERSION 2u
 
 // The immediate data associated with an RDMA operation is 32 bits and is divided as follows:
-// | 4-bit MSG TYPE flag | 8-bit RESERVED | 16-bit XFER_ID | 4-bit SEQ_ID |
-// RESERVED held the 8-bit peer agent index in protocol version 1; it must now be zero.
+// | 4-bit MSG TYPE flag | 8-bit WRITE TAG | 16-bit XFER_ID | 4-bit SEQ_ID |
+// WRITE TAG is the tag the target assigned us in its handshake ("wtag"), or 0 to have the target
+// resolve the sender from the source address. Targets assign tags only when their provider reports
+// no source address for remote writes (verbs;ofi_rxm). When the target also sent a generation
+// ("wgen"), SEQ_ID carries it, so the target can drop writes from a previous holder of the tag.
 
 // Optimized bit field constants (compile-time computed)
 #define NIXL_MSG_TYPE_BITS 4
@@ -106,14 +113,26 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 // Single-operation immediate data extraction (no intermediate shifts)
 #define NIXL_GET_MSG_TYPE_FROM_IMM(data) ((data) & NIXL_MSG_TYPE_MASK)
 #define NIXL_GET_IMM_RESERVED(data) (((data) >> NIXL_IMM_RESERVED_SHIFT) & NIXL_IMM_RESERVED_MASK)
+#define NIXL_GET_WRITE_TAG_FROM_IMM(data) NIXL_GET_IMM_RESERVED(data)
 #define NIXL_GET_XFER_ID_FROM_IMM(data) (((data) >> NIXL_XFER_ID_SHIFT) & NIXL_XFER_ID_MASK)
 #define NIXL_GET_SEQ_ID_FROM_IMM(data) (((data) >> NIXL_SEQ_ID_SHIFT) & NIXL_SEQ_ID_MASK)
+#define NIXL_GET_WRITE_GEN_FROM_IMM(data) NIXL_GET_SEQ_ID_FROM_IMM(data)
 
 // Single-operation immediate data creation (minimal bit operations)
 #define NIXL_MAKE_IMM_DATA(msg_type, xfer_id, seq_id)                    \
     (((uint64_t)(msg_type) & NIXL_MSG_TYPE_MASK) |                       \
      (((uint64_t)(xfer_id) & NIXL_XFER_ID_MASK) << NIXL_XFER_ID_SHIFT) | \
      (((uint64_t)(seq_id) & NIXL_SEQ_ID_MASK) << NIXL_SEQ_ID_SHIFT))
+
+// Same, with the target-assigned write tag (0 = none) in the WRITE TAG field.
+#define NIXL_MAKE_TAGGED_IMM_DATA(msg_type, write_tag, xfer_id, seq_id) \
+    (NIXL_MAKE_IMM_DATA(msg_type, xfer_id, seq_id) |                    \
+     (((uint64_t)(write_tag) & NIXL_IMM_RESERVED_MASK) << NIXL_IMM_RESERVED_SHIFT))
+
+// Largest write tag; tags are 1-based, 0 means "no tag".
+#define NIXL_LIBFABRIC_MAX_WRITE_TAG NIXL_IMM_RESERVED_MASK
+// Largest write-tag generation; generations are 1-based, 0 means "not stamped".
+#define NIXL_LIBFABRIC_MAX_WRITE_GEN NIXL_SEQ_ID_MASK
 
 #define NIXL_LIBFABRIC_CQ_BATCH_SIZE 16
 
@@ -357,6 +376,8 @@ struct nixlLibfabricProviderInfo {
     size_t mr_key_size;
     /** @brief Whether to do hwloc topology discovery and accelerator-to-NIC grouping. */
     bool needs_full_topology;
+    /** @brief See @ref providerNeedsWriteTag. */
+    bool needs_write_tag;
     /** @brief Use only the first domain: every domain reaches every peer (tcp, sockets). */
     bool single_domain;
 };
@@ -372,6 +393,15 @@ findProviderInfo(const std::string &prov_name);
 /** @brief Settings used for a provider with no table entry (the plain-RDMA defaults of efa). */
 const nixlLibfabricProviderInfo &
 defaultProviderInfo();
+
+/**
+ * @brief True when a remote-write completion does not identify its sender by source address.
+ *
+ * ofi_rxm leaves src_addr stale or FI_ADDR_NOTAVAIL for remote writes, so peers carry a
+ * target-assigned tag in imm_data instead.
+ */
+bool
+providerNeedsWriteTag(const std::string &prov_name);
 
 /** @brief See @ref nixlLibfabricProviderInfo::needs_full_topology. */
 bool

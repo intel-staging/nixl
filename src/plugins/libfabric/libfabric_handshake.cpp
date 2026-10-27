@@ -34,6 +34,12 @@
 //   "conn"     : string = serialized connection info (only if has_conn == 1).
 //                 Included when the peer hasn't sent us a handshake yet,
 //                 meaning they likely don't have our endpoint addresses.
+//   "wtag"     : uint8  = optional. Write tag the receiver puts in the imm_data of its writes to
+//                 us. Sent only when our provider cannot attribute a remote write by source
+//                 address; absent means no tag.
+//   "wgen"     : uint8  = optional, sent with "wtag". The tag's generation, which the receiver
+//                 puts in the SEQ_ID bits. Its presence also means we stamp the generation the
+//                 receiver handed us, so the receiver may drop writes with another one.
 //
 // Protocol version 1 sent "idx" (the agent index for imm_data) instead of "ver". It is not
 // interoperable with version 2, so the version check rejects it at connection setup.
@@ -64,6 +70,12 @@ nixlLibfabricEngine::sendHandshakeTo(const nixlLibfabricConnection &conn) const 
     sd.addBuf(NIXL_HANDSHAKE_TAG_HAS_CONN, &has_conn, sizeof(has_conn));
     if (has_conn) {
         sd.addStr(NIXL_HANDSHAKE_TAG_CONN, piggybacked_conn_info);
+    }
+    if (conn.local_write_tag_ != 0) {
+        sd.addBuf(
+            NIXL_HANDSHAKE_TAG_WRITE_TAG, &conn.local_write_tag_, sizeof(conn.local_write_tag_));
+        sd.addBuf(
+            NIXL_HANDSHAKE_TAG_WRITE_GEN, &conn.local_write_gen_, sizeof(conn.local_write_gen_));
     }
     std::string payload = sd.exportStr();
 
@@ -175,9 +187,30 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
             return;
         }
     }
+    // Optional fields; see the wire format above.
+    uint8_t peer_write_tag = 0;
+    if (sd.peekBufLen(NIXL_HANDSHAKE_TAG_WRITE_TAG) == sizeof(peer_write_tag) &&
+        sd.getBuf(NIXL_HANDSHAKE_TAG_WRITE_TAG, &peer_write_tag, sizeof(peer_write_tag)) !=
+            NIXL_SUCCESS) {
+        NIXL_ERROR << "Handshake from '" << peer_agent_name << "' has an unreadable '"
+                   << NIXL_HANDSHAKE_TAG_WRITE_TAG << "' field";
+        return;
+    }
+    uint8_t peer_write_gen = 0;
+    const bool has_write_gen =
+        sd.peekBufLen(NIXL_HANDSHAKE_TAG_WRITE_GEN) == sizeof(peer_write_gen);
+    if (has_write_gen &&
+        sd.getBuf(NIXL_HANDSHAKE_TAG_WRITE_GEN, &peer_write_gen, sizeof(peer_write_gen)) !=
+            NIXL_SUCCESS) {
+        NIXL_ERROR << "Handshake from '" << peer_agent_name << "' has an unreadable '"
+                   << NIXL_HANDSHAKE_TAG_WRITE_GEN << "' field";
+        return;
+    }
 
     NIXL_DEBUG << "Received handshake from peer '" << peer_agent_name
                << "' proto_ver=" << peer_proto_ver
+               << " write_tag=" << static_cast<unsigned>(peer_write_tag)
+               << " write_gen=" << static_cast<unsigned>(peer_write_gen)
                << " piggybacked_conn_info_len=" << piggybacked_conn_info.size();
 
     // Process the decoded handshake.
@@ -193,7 +226,8 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
     if (!conn) {
         {
             std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
-            pending_inbound_handshakes_.insert(peer_agent_name);
+            pending_inbound_handshakes_[peer_agent_name] = {
+                peer_write_tag, peer_write_gen, has_write_gen};
             NIXL_DEBUG << "Buffered handshake from not-yet-known peer '" << peer_agent_name
                        << "'; will apply on createAgentConnection";
         }
@@ -219,7 +253,13 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
     } else {
         {
             std::lock_guard<std::mutex> hlk(conn->handshake_mutex_);
+            // Set before handshake_received_, which allows writes to the peer.
+            conn->peer_write_tag_.store(peer_write_tag, std::memory_order_release);
+            conn->peer_write_gen_.store(peer_write_gen, std::memory_order_release);
             conn->handshake_received_.store(true, std::memory_order_release);
+        }
+        if (has_write_gen) {
+            requireWriteGenFrom(*conn);
         }
         conn->handshake_cv_.notify_all();
         NIXL_INFO << "Handshake stored: peer='" << peer_agent_name
