@@ -19,6 +19,7 @@
 #include "libfabric_common.h"
 #include "common/nixl_log.h"
 
+#include <array>
 #include <iomanip>
 #include <sstream>
 #include <atomic>
@@ -31,11 +32,141 @@
 
 namespace LibfabricUtils {
 
+std::string
+baseProviderName(const std::string &prov_name) {
+    const size_t layered = prov_name.find(';');
+    return (layered == std::string::npos) ? prov_name : prov_name.substr(0, layered);
+}
+
+/****************************************
+ * Provider table
+ *****************************************/
+
+namespace {
+
+    // tcp and sockets support neither FI_MR_PROV_KEY nor FI_MR_VIRT_ADDR.
+    constexpr uint64_t k_mr_mode_rdma =
+        FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+    constexpr uint64_t k_mr_mode_basic = FI_MR_LOCAL | FI_MR_ALLOCATED;
+
+    const nixlLibfabricProviderInfo k_cxi_provider = {
+        /*name=*/"cxi",
+        /*description=*/"CXI",
+        /*extra_caps=*/FI_RMA_EVENT,
+        /*mr_mode=*/k_mr_mode_rdma | FI_MR_ENDPOINT,
+        // Left to the provider: a key size here changes which fi_info entries cxi returns.
+        /*mr_key_size=*/0,
+        /*needs_full_topology=*/true,
+        /*single_domain=*/false,
+    };
+
+    const nixlLibfabricProviderInfo k_efa_provider = {
+        /*name=*/"efa",
+        /*description=*/"EFA",
+        /*extra_caps=*/0,
+        /*mr_mode=*/k_mr_mode_rdma,
+        /*mr_key_size=*/2,
+        /*needs_full_topology=*/true,
+        /*single_domain=*/false,
+    };
+
+    const nixlLibfabricProviderInfo k_tcp_provider = {
+        /*name=*/"tcp",
+        /*description=*/"tcp (TCP fallback)",
+        /*extra_caps=*/0,
+        /*mr_mode=*/k_mr_mode_basic,
+        /*mr_key_size=*/0,
+        /*needs_full_topology=*/false,
+        /*single_domain=*/true,
+    };
+
+    const nixlLibfabricProviderInfo k_sockets_provider = {
+        /*name=*/"sockets",
+        /*description=*/"sockets (TCP fallback)",
+        /*extra_caps=*/0,
+        /*mr_mode=*/k_mr_mode_basic,
+        /*mr_key_size=*/0,
+        /*needs_full_topology=*/false,
+        /*single_domain=*/true,
+    };
+
+} // namespace
+
+std::vector<std::string>
+selectDomainsGeneric(const nixlProviderDeviceMap &provider_device_map, const char *name) {
+    std::vector<std::string> domains;
+    std::unordered_set<std::string> seen;
+
+    const auto it = provider_device_map.find(name);
+    if (it == provider_device_map.end()) {
+        return domains;
+    }
+    for (const auto &domain : it->second) {
+        if (seen.insert(domain).second) {
+            domains.push_back(domain);
+        }
+    }
+    return domains;
+}
+
+/*
+ * Preference order, highest first. Use FI_PROVIDER to restrict the choice.
+ *
+ * constexpr so it has no destructor: the progress thread may still read it while exit() runs.
+ */
+constexpr std::array<const nixlLibfabricProviderInfo *, 4> k_known_providers = {
+    &k_cxi_provider,
+    &k_efa_provider,
+    &k_tcp_provider,
+    &k_sockets_provider,
+};
+
+std::span<const nixlLibfabricProviderInfo *const>
+knownProviders() {
+    return k_known_providers;
+}
+
+const nixlLibfabricProviderInfo *
+findProviderInfo(const std::string &prov_name) {
+    const std::string core = baseProviderName(prov_name);
+    for (const nixlLibfabricProviderInfo *provider : knownProviders()) {
+        if (core == provider->name) {
+            return provider;
+        }
+    }
+    return nullptr;
+}
+
+const nixlLibfabricProviderInfo &
+defaultProviderInfo() {
+    return k_efa_provider;
+}
+
+bool
+providerNeedsFullTopology(const std::string &prov_name) {
+    const nixlLibfabricProviderInfo *provider = findProviderInfo(prov_name);
+    return (provider != nullptr) && provider->needs_full_topology;
+}
 
 std::pair<std::string, std::vector<std::string>>
+selectProvider(const nixlProviderDeviceMap &provider_device_map) {
+    // First table entry with usable domains wins.
+    for (const nixlLibfabricProviderInfo *provider : knownProviders()) {
+        std::vector<std::string> domains =
+            selectDomainsGeneric(provider_device_map, provider->name);
+        if (domains.empty()) {
+            continue;
+        }
+        if (provider->single_domain && domains.size() > 1) {
+            domains.resize(1);
+        }
+        return {provider->name, domains};
+    }
+    return {"none", {}};
+}
+
+std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
 getAvailableNetworkDevices() {
-    std::vector<std::string> all_devices;
-    std::string provider_name;
 
     std::unordered_map<std::string, std::vector<std::string>> provider_device_map;
     struct fi_info *hints, *info;
@@ -70,7 +201,10 @@ getAvailableNetworkDevices() {
         return {"none", {}};
     }
 
-    // Process devices for this provider
+    // Bus address and link speed per domain name. Several providers can report the same domain
+    // (verbs and psm3); the first non-empty value is kept.
+    std::unordered_map<std::string, nixlLibfabricDeviceInfo> device_info;
+
     for (struct fi_info *cur = info; cur; cur = cur->next) {
         if (cur->domain_attr && cur->domain_attr->name && cur->fabric_attr &&
             cur->fabric_attr->name) {
@@ -86,6 +220,29 @@ getAvailableNetworkDevices() {
                 provider_device_map[provider_name] = {};
             }
             provider_device_map[provider_name].push_back(device_name);
+
+            nixlLibfabricDeviceInfo &dev = device_info[device_name];
+            dev.domain_name = device_name;
+
+            if (cur->nic == nullptr) {
+                continue;
+            }
+            if (dev.pcie_address.empty() && cur->nic->bus_attr != nullptr &&
+                cur->nic->bus_attr->bus_type == FI_BUS_PCI &&
+                cur->nic->bus_attr->attr.pci.domain_id != FI_ADDR_UNSPEC) {
+                char pcie_addr[32];
+                snprintf(pcie_addr,
+                         sizeof(pcie_addr),
+                         "%x:%02x:%02x.%x",
+                         cur->nic->bus_attr->attr.pci.domain_id,
+                         cur->nic->bus_attr->attr.pci.bus_id,
+                         cur->nic->bus_attr->attr.pci.device_id,
+                         cur->nic->bus_attr->attr.pci.function_id);
+                dev.pcie_address = pcie_addr;
+            }
+            if (dev.link_speed == 0 && cur->nic->link_attr != nullptr) {
+                dev.link_speed = cur->nic->link_attr->speed;
+            }
         }
     }
 
@@ -98,14 +255,26 @@ getAvailableNetworkDevices() {
         }
     }
 
-    if (provider_device_map.find("cxi") != provider_device_map.end()) {
-        return {"cxi", provider_device_map["cxi"]};
-    } else if (provider_device_map.find("efa") != provider_device_map.end()) {
-        return {"efa", provider_device_map["efa"]};
-    } else if (provider_device_map.find("tcp") != provider_device_map.end()) {
-        return {"tcp", {provider_device_map["tcp"][0]}};
-    } else if (provider_device_map.find("sockets") != provider_device_map.end()) {
-        return {"sockets", {provider_device_map["sockets"][0]}};
+    const auto [provider_name, domains] = selectProvider(provider_device_map);
+    if (provider_name != "none") {
+        std::vector<nixlLibfabricDeviceInfo> devices;
+        devices.reserve(domains.size());
+        for (const auto &domain : domains) {
+            const auto it = device_info.find(domain);
+            if (it != device_info.end()) {
+                devices.push_back(it->second);
+            } else {
+                nixlLibfabricDeviceInfo dev;
+                dev.domain_name = domain;
+                devices.push_back(dev);
+            }
+            NIXL_TRACE << "Selected " << provider_name << " domain " << devices.back().domain_name
+                       << " pcie="
+                       << (devices.back().pcie_address.empty() ? "unknown" :
+                                                                 devices.back().pcie_address)
+                       << " link_speed=" << devices.back().link_speed;
+        }
+        return {provider_name, devices};
     }
 
     NIXL_ERROR << "No network devices found with any provider";
