@@ -1272,8 +1272,14 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
 
     // Without a progress thread this thread progresses the CQ for the post (here and in
     // checkXfer()); pick the device that progress binds while validating, before any worker runs.
+    // The posting threads then bind each buffer's device themselves, so also check here that
+    // every binding the post needs can be made: a bind that failed partway through posting would
+    // leave the descriptors already posted with FI_MORE batched and never flushed. Checked on
+    // every transfer, since a binding that worked before can fail now; a run of descriptors with
+    // the same binding is checked once.
     backend_handle->progress_accel_ = nixlAccelBinding();
     bool need_progress_accel = !progress_thread_enabled_;
+    nixlAccelBinding last_checked;
 
     // Validate metadata before posting. The parallel path may post descriptors out of order, so
     // simple input errors should be caught before any worker submits RDMA operations.
@@ -1291,10 +1297,27 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
             return NIXL_ERR_MISMATCH;
         }
 
-        if (need_progress_accel && nfi_hmem_needs_scope(local_md->hmem_info_.iface)) {
-            backend_handle->progress_accel_ = nixlAccelBinding(local_md->hmem_info_);
+        if (progress_thread_enabled_ || !nfi_hmem_needs_scope(local_md->hmem_info_.iface)) {
+            continue;
+        }
+        const nixlAccelBinding binding(local_md->hmem_info_);
+        if (need_progress_accel) {
+            backend_handle->progress_accel_ = binding;
             need_progress_accel = false;
         }
+        if (binding == last_checked) {
+            continue;
+        }
+        {
+            const nixlAccelScope probe(binding);
+            if (!probe.ok()) {
+                NIXL_ERROR << "Failed to bind accelerator device " << binding.device << " ("
+                           << nfi_hmem_iface_name(binding.iface) << ") for descriptor " << desc_idx
+                           << "; nothing posted";
+                return NIXL_ERR_BACKEND;
+            }
+        }
+        last_checked = binding;
     }
 
     // Reserve base_offset once per transfer so all descriptors see a stable rail assignment.
