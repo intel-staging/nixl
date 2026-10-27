@@ -378,9 +378,9 @@ nixlLibfabricRailManager::init(const nixl_b_params_t &custom_params) {
 }
 
 nixl_status_t
-nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_devices,
+nixlLibfabricRailManager::createRails(const std::vector<std::string> &nic_devices,
                                       const std::string &provider_name) {
-    num_rails_ = efa_devices.size();
+    num_rails_ = nic_devices.size();
     if (num_rails_ == 0) {
         NIXL_ERROR << "No network devices discovered; cannot create rails";
         return NIXL_ERR_BACKEND;
@@ -388,9 +388,9 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
     // Pre-allocate to ensure contiguous memory allocation
     rails_.reserve(num_rails_);
 
-    // Build EFA device to rail index mapping for O(1) lookup
-    efa_device_to_rail_map.clear();
-    efa_device_to_rail_map.reserve(num_rails_);
+    // Build NIC to rail index mapping for O(1) lookup
+    nic_device_to_rail_map.clear();
+    nic_device_to_rail_map.reserve(num_rails_);
     clearActiveRails();
 
     // Without a progress thread, lazily connecting providers progress connections themselves.
@@ -403,12 +403,12 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
 
         for (size_t i = 0; i < num_rails_; ++i) {
             rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i), runtime_, auto_progress));
+                nic_devices[i], provider_name, static_cast<uint16_t>(i), runtime_, auto_progress));
 
-            // Initialize EFA device mapping
-            efa_device_to_rail_map[efa_devices[i]] = i;
+            // Initialize NIC mapping
+            nic_device_to_rail_map[nic_devices[i]] = i;
 
-            NIXL_DEBUG << "Created rail " << i << " (device=" << efa_devices[i]
+            NIXL_DEBUG << "Created rail " << i << " (device=" << nic_devices[i]
                        << ", provider=" << provider_name << ")";
         }
     }
@@ -801,36 +801,35 @@ nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr,
             return {}; // Return empty vector to indicate failure
         }
 
-        // Get EFA devices for this PCI bus ID
-        std::vector<std::string> device_efa_devices =
-            topology->getEfaDevicesForPci(device_pci_bus_id);
-        if (device_efa_devices.empty()) {
-            NIXL_ERROR << "No EFA devices found for PCI " << device_pci_bus_id;
+        // Get NICs for this PCI bus ID
+        std::vector<std::string> device_nics = topology->getNicsForPci(device_pci_bus_id);
+        if (device_nics.empty()) {
+            NIXL_ERROR << "No NICs found for PCI " << device_pci_bus_id;
             return {}; // Return empty vector to indicate failure
         }
         std::vector<size_t> device_rails;
-        for (const std::string &efa_device : device_efa_devices) {
-            auto it = efa_device_to_rail_map.find(efa_device);
-            if (it != efa_device_to_rail_map.end()) {
+        for (const std::string &nic_device : device_nics) {
+            auto it = nic_device_to_rail_map.find(nic_device);
+            if (it != nic_device_to_rail_map.end()) {
                 // Bounds check: ensure rail index is valid
                 if (it->second < rails_.size()) {
                     device_rails.push_back(it->second);
                     NIXL_DEBUG << "VRAM memory " << mem_addr << " on device PCI "
                                << device_pci_bus_id << " mapped to rail " << it->second
-                               << " (EFA device=" << efa_device << ")";
+                               << " (NIC=" << nic_device << ")";
                 } else {
-                    NIXL_WARN << "EFA device " << efa_device << " maps to rail " << it->second
+                    NIXL_WARN << "NIC " << nic_device << " maps to rail " << it->second
                               << " but only " << rails_.size() << " rails available";
                 }
             } else {
-                NIXL_WARN << "EFA device " << efa_device
-                          << " not found in rail mapping for device PCI " << device_pci_bus_id;
+                NIXL_WARN << "NIC " << nic_device << " not found in rail mapping for device PCI "
+                          << device_pci_bus_id;
             }
         }
 
         if (device_rails.empty()) {
             NIXL_ERROR << "No valid rail mapping found for device PCI " << device_pci_bus_id
-                       << " (checked " << device_efa_devices.size() << " EFA devices)";
+                       << " (checked " << device_nics.size() << " NICs)";
             return {};
         }
 
