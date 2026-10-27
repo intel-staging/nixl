@@ -689,6 +689,11 @@ public:
      */
     void
     checkPendingNotification(uint64_t key);
+
+    // Drop the pending notifications of a disconnected sender. Agent indices are not reused, so
+    // nothing else would complete or remove them.
+    void
+    dropPendingNotificationsFrom(uint32_t sender_peer_idx);
 };
 
 #endif

@@ -1198,6 +1198,20 @@ nixlLibfabricRailManager::progressActiveRails() {
     return any_completions ? NIXL_SUCCESS : NIXL_IN_PROG;
 }
 
+void
+nixlLibfabricRailManager::unmapAgentAddresses(
+    const std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs,
+    uint32_t agent_idx) {
+    for (const auto &[rail_id, addrs] : fi_addrs) {
+        if (rail_id >= rails_.size()) {
+            continue;
+        }
+        for (const fi_addr_t fi_addr : addrs) {
+            rails_[rail_id]->unmapSourceAddress(fi_addr, agent_idx);
+        }
+    }
+}
+
 bool
 nixlLibfabricRailManager::needsWriteTag() const {
     return topology && LibfabricUtils::providerNeedsWriteTag(topology->getProviderName());

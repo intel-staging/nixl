@@ -479,6 +479,11 @@ public:
     nixl_status_t
     removeAddress(fi_addr_t fi_addr) const;
 
+    /** Drop fi_addr's source-address mapping if it still names agent_idx, keeping the address
+     *  vector entry, so a reconnect under a new agent index maps cleanly. */
+    void
+    unmapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx) const;
+
     /** Resolve a fi_cq_readfrom() source address to a local agent index. Returns
      *  kUnknownAgentIdx if it is FI_ADDR_NOTAVAIL or unmapped; callers must then drop it. */
     [[nodiscard]] uint32_t

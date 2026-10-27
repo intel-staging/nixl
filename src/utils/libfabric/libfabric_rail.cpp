@@ -1942,6 +1942,14 @@ nixlLibfabricRail::removeAddress(fi_addr_t fi_addr) const {
 }
 
 void
+nixlLibfabricRail::unmapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx) const {
+    std::unique_lock<std::shared_mutex> lk(src_addr_mutex_);
+    if (fi_addr < src_addr_to_agent_.size() && src_addr_to_agent_[fi_addr] == agent_idx) {
+        src_addr_to_agent_[fi_addr] = kUnknownAgentIdx;
+    }
+}
+
+void
 nixlLibfabricRail::mapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx) const {
     if (fi_addr == FI_ADDR_NOTAVAIL) {
         NIXL_ERROR << "Refusing to map invalid fi_addr " << fi_addr << " on rail " << rail_id;

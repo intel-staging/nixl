@@ -289,6 +289,56 @@ testInsertAllAddressesCrossProduct(nixlLibfabricRailManager &mgr) {
     return 0;
 }
 
+// getNextXferId() wraps the 16-bit counter without ever returning NIXL_UNTRACKED_XFER_ID.
+static int
+testXferIdSkipsUntracked() {
+    NIXL_INFO << "  testXferIdSkipsUntracked";
+    for (uint32_t i = 0; i < 2 * (NIXL_XFER_ID_MASK + 1u); ++i) {
+        TEST_ASSERT(LibfabricUtils::getNextXferId() != NIXL_UNTRACKED_XFER_ID,
+                    "getNextXferId() never returns the untracked XFER_ID");
+    }
+    return 0;
+}
+
+// Disconnect unmaps a peer's addresses on every rail, so its reconnect under a new agent index
+// maps cleanly, and leaves another agent's mapping of the same address alone.
+static int
+testUnmapAgentAddresses(nixlLibfabricRailManager &mgr) {
+    NIXL_INFO << "  testUnmapAgentAddresses";
+    mock_av_reset();
+
+    const size_t num_rails = mgr.getNumRails();
+    const auto eps = makeEndpoints("peerY", num_rails);
+
+    std::unordered_map<size_t, std::vector<fi_addr_t>> fi_addrs;
+    std::vector<char *> ep_names;
+    TEST_ASSERT(mgr.insertAllAddresses(eps, 77, fi_addrs, ep_names) == NIXL_SUCCESS,
+                "insertAllAddresses succeeded");
+
+    mgr.unmapAgentAddresses(fi_addrs, 78);
+    TEST_ASSERT(mgr.getRail(0).resolveSourceAddress(fi_addrs.at(0)[0]) == 77u,
+                "unmapping for another agent leaves the mapping");
+
+    mgr.unmapAgentAddresses(fi_addrs, 77);
+    for (size_t rail_id = 0; rail_id < num_rails; ++rail_id) {
+        for (fi_addr_t a : fi_addrs.at(rail_id)) {
+            TEST_ASSERT(mgr.getRail(rail_id).resolveSourceAddress(a) ==
+                            nixlLibfabricRail::kUnknownAgentIdx,
+                        "every address of the agent is unmapped on every rail");
+        }
+    }
+
+    // The reconnect inserts the same endpoints under a new index
+    std::unordered_map<size_t, std::vector<fi_addr_t>> fi_addrs2;
+    std::vector<char *> ep_names2;
+    TEST_ASSERT(mgr.insertAllAddresses(eps, 79, fi_addrs2, ep_names2) == NIXL_SUCCESS,
+                "reconnect insertAllAddresses succeeded");
+    TEST_ASSERT(mgr.getRail(0).resolveSourceAddress(fi_addrs2.at(0)[0]) == 79u,
+                "the reconnect maps the new agent index");
+
+    return 0;
+}
+
 static int
 testRemoteWriteCompletionAttribution(nixlLibfabricRailManager &mgr) {
     NIXL_INFO << "  testRemoteWriteCompletionAttribution";
@@ -621,6 +671,12 @@ main() {
         return res;
     }
     if ((res = testInsertAllAddressesCrossProduct(mgr)) != 0) {
+        return res;
+    }
+    if ((res = testXferIdSkipsUntracked()) != 0) {
+        return res;
+    }
+    if ((res = testUnmapAgentAddresses(mgr)) != 0) {
         return res;
     }
     if ((res = testRemoteWriteCompletionAttribution(mgr)) != 0) {

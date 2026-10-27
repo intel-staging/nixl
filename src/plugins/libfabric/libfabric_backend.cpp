@@ -300,6 +300,10 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
             rail_manager_.getRail(rail_id).setXferIdCallback(
                 [this](uint64_t imm_data, uint32_t sender_peer_idx) {
                     uint16_t xfer_id = NIXL_GET_XFER_ID_FROM_IMM(imm_data);
+                    // A write of a transfer without a notification: nothing waits for it
+                    if (xfer_id == NIXL_UNTRACKED_XFER_ID) {
+                        return;
+                    }
                     addReceivedXferId(xfer_id, sender_peer_idx);
                 });
             NIXL_DEBUG << "Set XFER_ID callback for rail " << rail_id;
@@ -553,7 +557,12 @@ nixlLibfabricEngine::disconnect(const std::string &remote_agent) {
     }
 
     nixl_status_t status = it->second->disconnect();
+    // The address vector keeps the peer's endpoints, so a reconnect gets the same fi_addrs under a
+    // new agent index; unmap them so that maps cleanly.
+    const uint32_t agent_idx = static_cast<uint32_t>(it->second->agent_index_);
+    rail_manager_.unmapAgentAddresses(it->second->rail_remote_addr_list_, agent_idx);
     releaseWriteTag(*it->second);
+    dropPendingNotificationsFrom(agent_idx);
     connections_.erase(it);
     // Drop queued replies for this peer so teardown never posts toward it from the CM thread.
     {
@@ -1237,7 +1246,10 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
             remote_md->rail_remote_key_list_,
             remote_md->remote_selected_endpoints_,
             conn->rail_remote_addr_list_,
-            backend_handle->post_xfer_id,
+            // Only a notified WRITE's writes are matched by the target; see NIXL_UNTRACKED_XFER_ID
+            (backend_handle->has_notif && op_type == nixlLibfabricReq::WRITE) ?
+                backend_handle->post_xfer_id :
+                static_cast<uint16_t>(NIXL_UNTRACKED_XFER_ID),
             conn->peer_write_tag_.load(std::memory_order_acquire),
             conn->peer_write_gen_.load(std::memory_order_acquire),
             [backend_handle](nixl_status_t status) {
@@ -2100,6 +2112,24 @@ nixlLibfabricEngine::addReceivedXferId(uint16_t xfer_id, uint32_t sender_peer_id
 /****************************************
  * Notification Queuing Helper Methods
  *****************************************/
+
+void
+nixlLibfabricEngine::dropPendingNotificationsFrom(uint32_t sender_peer_idx) {
+    std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
+    size_t dropped = 0;
+    for (auto it = pending_notifications_.begin(); it != pending_notifications_.end();) {
+        if ((it->first >> 16) == sender_peer_idx) {
+            it = pending_notifications_.erase(it);
+            ++dropped;
+        } else {
+            ++it;
+        }
+    }
+    if (dropped != 0) {
+        NIXL_WARN << "Dropped " << dropped << " incomplete notification(s) from disconnected agent "
+                  << "index " << sender_peer_idx;
+    }
+}
 
 void
 nixlLibfabricEngine::checkPendingNotification(uint64_t key) {

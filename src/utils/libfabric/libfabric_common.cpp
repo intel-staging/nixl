@@ -445,23 +445,11 @@ static std::atomic<uint8_t> g_seq_id_counter{0}; // 4-bit SEQ_ID counter, start 
 
 uint16_t
 getNextXferId() {
-    uint16_t xfer_id = g_xfer_id_counter.fetch_add(1);
-
-    // Handle wraparound: 16-bit field can hold 0 to 65,535
-    if (xfer_id > NIXL_XFER_ID_MASK) {
-        // Reset counter atomically and get a fresh ID
-        uint16_t expected = xfer_id;
-        while (expected > NIXL_XFER_ID_MASK &&
-               !g_xfer_id_counter.compare_exchange_weak(expected, 1)) {
-            expected = g_xfer_id_counter.load();
-        }
+    // The 16-bit counter wraps by itself; only NIXL_UNTRACKED_XFER_ID (0) is skipped.
+    uint16_t xfer_id;
+    do {
         xfer_id = g_xfer_id_counter.fetch_add(1);
-        // Ensure we don't exceed the mask after reset
-        if (xfer_id > NIXL_XFER_ID_MASK) {
-            xfer_id = 1;
-        }
-    }
-
+    } while (xfer_id == NIXL_UNTRACKED_XFER_ID);
     return xfer_id;
 }
 

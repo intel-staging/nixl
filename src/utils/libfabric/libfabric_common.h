@@ -82,6 +82,10 @@ constexpr const char *NIXL_HANDSHAKE_TAG_WRITE_GEN = "wgen";
 // resolve the sender from the source address. Targets assign tags only when their provider reports
 // no source address for remote writes (verbs;ofi_rxm). When the target also sent a generation
 // ("wgen"), SEQ_ID carries it, so the target can drop writes from a previous holder of the tag.
+//
+// XFER_ID NIXL_UNTRACKED_XFER_ID marks the writes of a transfer without a notification, which the
+// target does not track. getNextXferId() never returns it.
+#define NIXL_UNTRACKED_XFER_ID 0
 
 // Optimized bit field constants (compile-time computed)
 #define NIXL_MSG_TYPE_BITS 4
