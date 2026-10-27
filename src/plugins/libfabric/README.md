@@ -7,7 +7,7 @@ This plugin provides a high-performance RDMA backend for NIXL using the OpenFabr
 The Libfabric plugin provides a high-performance RDMA communication backend with the following key capabilities:
 
 - **Multi-Rail RDMA**: Automatic discovery and utilization of multiple network devices for increased bandwidth
-- **GPU Direct Support**: Zero-copy transfers between GPU memory (VRAM) and remote systems with CUDA integration. GDR (GPU Direct RDMA) support is currently required.
+- **Accelerator Memory Support**: Zero-copy transfers between accelerator memory (VRAM) and remote systems. Peer-direct RDMA (e.g. GPU Direct RDMA) support is currently required. NVIDIA (CUDA), AMD (ROCm), Intel (Level Zero) and AWS Neuron accelerators are supported.
 - **Scalable Connection Management**: Efficient multi-agent connectivity with robust state tracking and automatic reconnection
 - **Asynchronous Processing**: Non-blocking RDMA operations with pre-allocated request pools and completion processing
 - **Thread-Safe Concurrency**: Background progress threads with lock-free data structures and configurable threading patterns
@@ -27,12 +27,55 @@ The Libfabric plugin provides a high-performance RDMA communication backend with
 - **numa**
   - numa (libnuma-dev on Debian/Ubuntu or libnuma-devel on RPM-based systems) is required for supporting DRAM_SEG memory type NUMA-aware rail selection (for imposing NUMA-aware bandwidth limitation). Suggested version: 2.0.18 or newer.
 
+### Optional Accelerator Dependencies
+
+| Accelerator | Build dependency | Runtime library | HMEM interface |
+|---|---|---|---|
+| NVIDIA GPU | CUDA toolkit | `libcuda.so.1` | `FI_HMEM_CUDA` |
+| AMD GPU | ROCm (`-Drocm_path=...`) | `libamdhip64.so` | `FI_HMEM_ROCR` |
+| Intel GPU (Xe / Arc / Data Center GPU) | `level_zero/ze_api.h` (`libze-dev`, or oneAPI) | `libze_loader.so.1` | `FI_HMEM_ZE` |
+| AWS Trainium / Inferentia | none | `libnrt.so.1` | `FI_HMEM_NEURON` |
+
+Level Zero and Neuron are needed only at build time as headers (Neuron not even that): their runtime
+libraries are `dlopen`'d, so one binary works on hosts with and without the driver. Meson reports
+what it found -- look for `Found Level Zero headers, libfabric backend will build with FI_HMEM_ZE
+support` in the configure output. At startup the plugin logs the accelerators it found per vendor
+(`Topology: ... 3 Intel GPUs ...`) and the runtime it selected (`System runtime: ZE`).
+
+Notes specific to Intel GPUs:
+
+- Intel GPUs are matched against the Level Zero driver's own device list, and only **discrete** GPUs
+  are used for PCIe-proximity rail selection. Integrated graphics are filtered out using the
+  driver's `ZE_DEVICE_PROPERTY_FLAG_INTEGRATED` flag rather than a PCI class check, which cannot
+  separate the two (a discrete GPU and an iGPU both report class `0x0300`) and which would wrongly
+  exclude compute-only parts that carry no display class at all. Memory on an integrated GPU is
+  still registered correctly; it just does not form a proximity group.
+- Each buffer's Level Zero device ordinal is taken from the driver
+  (`zeMemGetAllocProperties()`), not from the NIXL device ID, and passed to libfabric as
+  `fi_mr_attr::device.ze`.
+- One runtime is selected per process. A build with CUDA or ROCm on a host that also has Intel GPUs
+  selects CUDA or ROCm; a build without them ignores NVIDIA and AMD GPUs when choosing.
+- Device memory needs a provider that can carry `FI_HMEM_ZE`, such as `verbs` (see
+  [Provider Selection](#provider-selection)) or `cxi`. `efa` has no Level Zero support, and on
+  `tcp`/`sockets` without `FI_HMEM` the plugin does not offer `VRAM_SEG` at all.
+- **Allocate VRAM for NIXL as exportable.** Chain a `ze_external_memory_export_desc_t` with
+  `ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF` into `zeMemAllocDevice()`. Without it, in a context that
+  holds a single device (for example under `ZE_AFFINITY_MASK`), the driver may
+  - **pool** allocations up to 2 MiB into shared buffer objects. libfabric would then register
+    them at the wrong offset and the NIC would move another allocation's bytes. The plugin detects
+    this and refuses the registration (`registerMem()` fails, and the log says why).
+  - **compress** the allocation. The NIC sees raw compressed bytes, so the destination receives
+    garbage. Level Zero offers no way to query compression, so this cannot be detected at
+    registration.
+
+  With all GPUs visible, or with the export descriptor, neither happens.
+
 ### Network Hardware Requirements
 
 Validated compatibility with:
 
 - **AWS EFA** (Elastic Fabric Adapter)
-- **InfiniBand / RoCE through `verbs`** (NVIDIA ConnectX)
+- **InfiniBand / RoCE through `verbs`** (NVIDIA ConnectX), including Intel GPU memory
 
 Any other Libfabric providers should also work but have not been validated in production environments. Community validation and feedback are highly appreciated!
 
@@ -199,12 +242,14 @@ The following table summarizes briefly the plugin's runtime configuration:
 
 ### Core Classes
 
-- **`nixlLibfabricEngine`** - Main backend engine providing multi-rail RDMA operations with GPU Direct support
+- **`nixlLibfabricEngine`** - Main backend engine providing multi-rail RDMA operations with peer-direct RDMA support
 - **`nixlLibfabricRailManager`** - Manages multiple network rails with topology-aware selection and striping strategies
 - **`nixlLibfabricRail`** - Individual network rail handling libfabric resources and completion processing
-- **`nixlLibfabricTopology`** - Hardware topology discovery for optimal GPU-to-EFA and NUMA-to-EFA mapping
+- **`nixlLibfabricTopology`** - Hardware topology discovery for optimal accelerator-to-NIC and NUMA-to-NIC mapping
 - **`nixlLibfabricBackendH`** - Request handle for tracking multi-request transfer completion with atomic counters
 - **`nixlLibfabricConnection`** - Multi-rail connection metadata for remote agents with state management
+- **`nfi_hmem.{h,cpp}`** - Heterogeneous-memory helpers libfabric has internally but does not export: which runtime owns a pointer, which `fi_mr_attr::device` arm to fill, which devices a runtime enumerated. A C-compatible interface with no nixl dependencies. Level Zero is its only vendor so far
+- **`libfabric_accel.{h,cpp}`** - nixl's side of that boundary: matching the runtime's devices against the hwloc topology, and routing the shim's diagnostics into the NIXL log
 - **`nixlLibfabricProviderInfo`** - Table entry describing one core libfabric provider (in `src/utils/libfabric/libfabric_common.cpp`); the single place provider-specific settings live
 
 ### Adding a provider
@@ -285,5 +330,11 @@ enable the progress thread (`nixlAgentConfig::useProgThread`, or `--enable_pt=1`
 or pick another provider with `FI_PROVIDER`.
 
 Connectionless RDM providers (`efa`, `cxi`, `tcp`) need no accept and are unaffected.
+
+**`VRAM_SEG` is not offered on `tcp` or `sockets`:**
+
+These providers move data with CPU copies through the kernel. Unless the libfabric build gives them
+`FI_HMEM`, a device pointer would register as host memory and the first transfer would fail with
+`EFAULT` or hang, so the plugin does not advertise `VRAM_SEG` for them.
 
 For additional support, check the NIXL documentation and Libfabric provider-specific guides.

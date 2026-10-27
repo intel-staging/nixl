@@ -1728,6 +1728,11 @@ nixlLibfabricRail::canRegisterWithDmabuf(nixl_mem_t mem_type, enum fi_hmem_iface
 #endif
 }
 
+bool
+nixlLibfabricRail::canCarryDeviceMemory() const {
+    return provider_supports_hmem_ || (provider_name != "tcp" && provider_name != "sockets");
+}
+
 nixl_status_t
 nixlLibfabricRail::registerMemory(void *buffer,
                                   size_t length,
@@ -1818,11 +1823,21 @@ nixlLibfabricRail::registerMemory(void *buffer,
                 mr_attr.device.neuron = -1;
                 NIXL_DEBUG << "NEURON memory registration - iface: FI_HMEM_NEURON, device_id: "
                            << device_id;
+            } else if (iface == FI_HMEM_ZE) {
+                // device_id is encoded as fi_hmem_ze_device(0, ordinal) by nfi_hmem_query_ptr().
+                mr_attr.device.ze = device_id;
+                NIXL_DEBUG << "ZE memory registration - iface: FI_HMEM_ZE, device.ze: "
+                           << device_id;
             }
-        } else {
+        } else if (canCarryDeviceMemory()) {
             NIXL_WARN << "VRAM memory requested but provider does not support FI_HMEM - falling "
                          "back to system memory registration";
             mr_attr.iface = FI_HMEM_SYSTEM;
+        } else {
+            // getSupportedMems() does not offer VRAM_SEG for such a rail.
+            NIXL_ERROR << "Provider " << provider_name << " on rail " << rail_id
+                       << " has no FI_HMEM support and cannot carry device memory";
+            return NIXL_ERR_NOT_SUPPORTED;
         }
     } else {
         mr_attr.iface = FI_HMEM_SYSTEM;
