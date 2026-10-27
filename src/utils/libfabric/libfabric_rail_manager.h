@@ -188,6 +188,13 @@ public:
                        std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs_out,
                        std::vector<char *> &ep_names_out);
 
+    /** Drop the source-address mappings insertAllAddresses() made for @p agent_idx, keeping the
+     *  address vector entries. See nixlLibfabricRail::unmapSourceAddress().
+     * @param fi_addrs The addresses insertAllAddresses() returned, keyed by rail id */
+    void
+    unmapAgentAddresses(const std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs,
+                        uint32_t agent_idx);
+
     /** Whether the rails can carry device memory. All rails share one provider. */
     bool
     canCarryDeviceMemory() const {

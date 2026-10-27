@@ -75,6 +75,10 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 // The immediate data associated with an RDMA operation is 32 bits and is divided as follows:
 // | 4-bit MSG TYPE flag | 8-bit RESERVED | 16-bit XFER_ID | 4-bit SEQ_ID |
 // RESERVED held the 8-bit peer agent index in protocol version 1; it must now be zero.
+//
+// XFER_ID NIXL_UNTRACKED_XFER_ID marks the writes of a transfer without a notification, which the
+// target does not track. getNextXferId() never returns it.
+#define NIXL_UNTRACKED_XFER_ID 0
 
 // Optimized bit field constants (compile-time computed)
 #define NIXL_MSG_TYPE_BITS 4
