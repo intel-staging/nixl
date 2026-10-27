@@ -43,3 +43,15 @@ libfabric_notif_test = executable('libfabric_notif_test',
         install: true)
 
 test('libfabric_notif_test', libfabric_notif_test, timeout: 180)
+
+libfabric_pending_notif_test = executable('libfabric_pending_notif_test',
+        'libfabric_pending_notif_test.cpp',
+        dependencies: libfabric_backend_test_dep,
+        include_directories: libfabric_test_include_directories,
+        cpp_args: ['-DHAVE_LIBFABRIC'],
+        install: true)
+
+test('libfabric_pending_notif_test', libfabric_pending_notif_test, timeout: 180)
+# tcp's target counts writes, so only there can a WRITE without a notification leave an entry
+test('libfabric_pending_notif_test_tcp', libfabric_pending_notif_test, env: ['FI_PROVIDER=tcp'],
+     timeout: 180)

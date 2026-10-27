@@ -113,10 +113,10 @@ public:
      *  context even when the application thread has none current. */
     nixlAccelBinding progress_accel_;
 
-    uint16_t post_xfer_id;
+    uint16_t post_xfer_id = NIXL_UNTRACKED_XFER_ID; // a real one only with a notification
     const nixl_xfer_op_t operation_;
     const std::string remote_agent_;
-    bool has_notif;
+    bool has_notif = false; // prepXfer()/postXfer() set it only when given opt_args
     uint32_t total_notif_msg_len; // Total length of notification message across all fragments
 
     std::vector<BinaryNotification> binary_notifs; // Vector of BinaryNotification for fragmentation
@@ -273,6 +273,8 @@ private:
         uint32_t total_message_length; // Total length of complete message (all fragments)
         uint16_t agent_name_length; // Length of agent_name in combined payload
         bool xfer_failed; // Initiator reported the transfer failed; stop waiting for its writes
+        // Last write completion, fragment or failure report; see reapStalePendingNotifications()
+        std::chrono::steady_clock::time_point last_activity{};
 
         PendingNotification(uint16_t xfer_id)
             : notif_xfer_id(xfer_id),
@@ -293,7 +295,44 @@ private:
         return (static_cast<uint64_t>(sender_peer_idx) << 16) | notif_xfer_id;
     }
 
+    // The sender_peer_idx half of a makePendingKey() key
+    static inline uint32_t
+    pendingKeySender(uint64_t key) {
+        return static_cast<uint32_t>(key >> 16);
+    }
+
     std::unordered_map<uint64_t, PendingNotification> pending_notifications_;
+
+    // Each disconnected agent's last index, for its reconnect to take over (see
+    // nixlLibfabricRail::insertAddress()). Guarded by connection_state_mutex_.
+    std::unordered_map<std::string, uint32_t> disconnected_agent_idx_;
+
+    // Indices of connected senders. Any other index's entries come from a peer that is gone or
+    // never connected, and age out with stale_pending_age_. Guarded by receiver_tracking_mutex_.
+    std::unordered_set<uint32_t> live_senders_;
+
+    // When reapStalePendingNotifications() last ran, in steady_clock nanoseconds
+    std::atomic<int64_t> last_stale_reap_ns_{0};
+
+    // Ages without progress after which an entry is dropped (0 never): stale_pending_age_ for a
+    // sender that is not live, or a notification that is incomplete, stale_writes_age_ for a
+    // live sender's complete notification still waiting for its writes
+    std::chrono::seconds stale_pending_age_{kStalePendingAge};
+    std::chrono::seconds stale_writes_age_{kStaleWritesAge};
+    static constexpr std::chrono::seconds kStaleReapInterval{5};
+    static constexpr std::chrono::seconds kMaxStaleAge{7 * 24 * 3600};
+
+    // Drop stale entries; returns the number dropped
+    size_t
+    reapStalePendingNotifications(std::chrono::steady_clock::time_point now);
+
+    // Run reapStalePendingNotifications() every kStaleReapInterval (or stale_pending_age_, if
+    // shorter) after a progress pass that found no completions (@p drained), so no queued
+    // completion makes an entry look stale; without one, after four intervals.
+    void
+    maybeReapStalePendingNotifications(bool drained);
+
+    friend class nixlLibfabricEngineTestAccess;
 
     // Agents whose handshake arrived before the local createAgentConnection had registered
     // them in connections_. Drained inside createAgentConnection.
@@ -734,6 +773,10 @@ public:
      */
     void
     checkPendingNotification(uint64_t key);
+
+    // Defaults for NIXL_LIBFABRIC_PENDING_NOTIF_TIMEOUT and NIXL_LIBFABRIC_PENDING_WRITES_TIMEOUT
+    static constexpr std::chrono::seconds kStalePendingAge{60};
+    static constexpr std::chrono::seconds kStaleWritesAge{600};
 };
 
 #endif
