@@ -40,7 +40,7 @@ The Level Zero, ROCm and Neuron runtime libraries are `dlopen`'d, so one binary 
 with and without each driver; CUDA is linked. Meson reports
 what it found -- look for `Found Level Zero headers, libfabric backend will build with FI_HMEM_ZE
 support` in the configure output. At startup the plugin logs the accelerators it found per vendor
-(`Topology: ... CUDA=0 ROCR=0 ZE=3 NEURON=0`) and the runtime it selected (`System runtime: ZE`).
+(`Topology: ... CUDA=0 ROCR=0 ZE=3 NEURON=0`) and the first usable runtime (`System runtime: ZE`).
 
 Notes specific to Intel GPUs:
 
@@ -53,8 +53,8 @@ Notes specific to Intel GPUs:
 - Each buffer's Level Zero device ordinal is taken from the driver
   (`zeMemGetAllocProperties()`), not from the NIXL device ID, and passed to libfabric as
   `fi_mr_attr::device.ze`.
-- One runtime is selected per process. A build with CUDA or ROCm on a host that also has Intel GPUs
-  selects CUDA or ROCm; a build without them ignores NVIDIA and AMD GPUs when choosing.
+- Each buffer's runtime is identified from its pointer, so a process can register memory from GPUs
+  of more than one vendor.
 - Device memory needs a provider that can carry `FI_HMEM_ZE`, such as `verbs` (see
   [Provider Selection](#provider-selection)) or `cxi`. `efa` has no Level Zero support, and on
   `tcp`/`sockets` without `FI_HMEM` the plugin does not offer `VRAM_SEG` at all.
@@ -276,6 +276,9 @@ Backend, rail manager and topology code ask vendor questions only through `nfi_h
 4. A branch in `accelIfaceOfHwlocObj()` and a decision in `accelIfaceIsGroupable()` in
    `libfabric_accel.cpp`, plus a line in `accelUnclaimedVramIface()` if its pointer query can miss
    its own memory.
+
+Registration and posting run inside an `nixlAccelScope` for the buffer's device; pointer
+detection needs no context.
 
 ### Adding a provider
 
