@@ -454,6 +454,12 @@ public:
     bool
     canRegisterWithDmabuf(nixl_mem_t mem_type, enum fi_hmem_iface iface) const;
 
+    /** Whether this rail can carry device memory: with FI_HMEM, or without it on an RDMA provider
+     *  (registered as host memory, relying on NIC peer-memory support). Never tcp or sockets
+     *  without FI_HMEM, which copy through the kernel and fail on device pointers. */
+    bool
+    canCarryDeviceMemory() const;
+
     /** Deregister memory from libfabric */
     nixl_status_t
     deregisterMemory(struct fid_mr *mr) const;
