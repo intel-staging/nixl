@@ -198,6 +198,17 @@ private:
     // Mutex for connection state tracking
     mutable std::mutex connection_state_mutex_;
 
+    // Accelerator devices that have bound successfully, so postXfer() checks each once per process.
+    // Each slot holds (iface + 1) << 56 | device, 0 = empty; a full table only means checking
+    // again.
+    static constexpr size_t kAccelBindCacheSlots = 64;
+    mutable std::array<std::atomic<uint64_t>, kAccelBindCacheSlots> accel_bind_ok_{};
+
+    bool
+    accelBindKnownOk(const struct nfi_hmem_info &info) const;
+    void
+    accelBindRecordOk(const struct nfi_hmem_info &info) const;
+
     void
     cleanup();
 

@@ -1129,6 +1129,41 @@ nixlLibfabricEngine::useFiMore(int desc_idx,
     return true;
 }
 
+namespace {
+uint64_t
+accelBindKey(const struct nfi_hmem_info &info) {
+    return (static_cast<uint64_t>(info.iface) + 1) << 56 | (info.device & ((1ULL << 56) - 1));
+}
+} // namespace
+
+bool
+nixlLibfabricEngine::accelBindKnownOk(const struct nfi_hmem_info &info) const {
+    const uint64_t key = accelBindKey(info);
+    for (const auto &slot : accel_bind_ok_) {
+        const uint64_t v = slot.load(std::memory_order_acquire);
+        if (v == key) {
+            return true;
+        }
+        if (v == 0) {
+            return false; // slots fill in order
+        }
+    }
+    return false;
+}
+
+void
+nixlLibfabricEngine::accelBindRecordOk(const struct nfi_hmem_info &info) const {
+    const uint64_t key = accelBindKey(info);
+    for (auto &slot : accel_bind_ok_) {
+        uint64_t expected = 0;
+        if (slot.compare_exchange_strong(expected, key, std::memory_order_acq_rel) ||
+            expected == key) {
+            return;
+        }
+    }
+    // Table full: the device is checked again next time
+}
+
 nixl_status_t
 nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
                                          const nixl_meta_dlist_t &local,
@@ -1311,6 +1346,32 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
         if (remote_md->conn_ != conn) {
             NIXL_ERROR << "Connection mismatch for descriptor " << desc_idx;
             return NIXL_ERR_MISMATCH;
+        }
+    }
+
+    // Without a progress thread the posting thread binds each buffer's device. Check every device
+    // binds before anything is posted, so a failure cannot leave earlier descriptors batched with
+    // FI_MORE and never flushed. A device that has bound once is not checked again.
+    if (local.getType() == VRAM_SEG && !progress_thread_enabled_) {
+        const struct nfi_hmem_info *last = nullptr;
+        for (int desc_idx = 0; desc_idx < desc_count; ++desc_idx) {
+            const auto &info =
+                static_cast<nixlLibfabricPrivateMetadata *>(local[desc_idx].metadataP)->hmem_info_;
+            if (last && last->iface == info.iface && last->device == info.device) {
+                continue;
+            }
+            last = &info;
+            if (!nfi_hmem_needs_scope(info.iface) || accelBindKnownOk(info)) {
+                continue;
+            }
+            const nixlAccelScope probe(info);
+            if (!probe.ok()) {
+                NIXL_ERROR << "Failed to bind accelerator device " << info.device << " ("
+                           << nfi_hmem_iface_name(info.iface) << ") for descriptor " << desc_idx
+                           << "; nothing posted";
+                return NIXL_ERR_BACKEND;
+            }
+            accelBindRecordOk(info);
         }
     }
 
