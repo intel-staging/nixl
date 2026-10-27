@@ -29,14 +29,6 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
 
-#ifdef HAVE_CUDA
-#ifdef __HIP_PLATFORM_AMD__
-#include <hip/hip_runtime.h>
-#else
-#include <cuda_runtime.h>
-#endif
-#endif
-
 nixlLibfabricTopology::nixlLibfabricTopology()
     : num_numa_nodes(0),
       num_devices(0),

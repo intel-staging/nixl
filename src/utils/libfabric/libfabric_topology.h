@@ -315,17 +315,6 @@ public:
     bool
     isValidDevice(const std::string &nic_device) const;
 
-    enum fi_hmem_iface
-    getMrAttrIface(int device_id) const {
-        if (device_id < getNumNvidiaAccel()) {
-            return FI_HMEM_CUDA;
-        } else if (device_id < getNumNvidiaAccel() + getNumAmdAccel()) {
-            return FI_HMEM_ROCR;
-        } else {
-            return FI_HMEM_NEURON;
-        }
-    }
-
     /** @brief Invalid NUMA node id constant. */
     static const uint16_t INVALID_NUMA_NODE_ID = UINT16_MAX;
 

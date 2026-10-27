@@ -26,15 +26,7 @@
 #include <mutex>
 #include <atomic>
 #include "libfabric_rail.h"
-
-#ifdef HAVE_CUDA
-#ifdef __HIP_PLATFORM_AMD__
-#include <hip/hip_runtime.h>
-#else
-#include <cuda.h>
-#include <cuda_runtime.h>
-#endif
-#endif
+#include "libfabric_accel.h"
 
 // Forward declarations
 class nixlLibfabricTopology;
@@ -156,8 +148,8 @@ public:
      * @param length Buffer size in bytes
      * @param mem_type Memory type (DRAM_SEG or VRAM_SEG)
      * @param device_id Device ID (used for VRAM_SEG, ignored for DRAM_SEG)
-     * @param device_pci_bus_id PCI bus ID for VRAM device (queried in backend layer), empty for
-     * DRAM
+     * @param hmem_info Runtime, device ordinal and PCI address of @p buffer as resolved by the
+     *        backend; registered as given
      * @param mr_list_out Memory registration handles, indexed by rail ID
      * @param key_list_out Remote access keys, indexed by rail ID
      * @param selected_rails_out List of rail IDs where memory was registered
@@ -168,7 +160,7 @@ public:
                    size_t length,
                    nixl_mem_t mem_type,
                    int device_id,
-                   const std::string &device_pci_bus_id,
+                   const struct nfi_hmem_info &hmem_info,
                    std::vector<struct fid_mr *> &mr_list_out,
                    std::vector<uint64_t> &key_list_out,
                    std::vector<size_t> &selected_rails_out);
@@ -251,8 +243,8 @@ public:
      *        (posted with FI_MORE); false flushes the rail's batch. The caller passes false for
      *        a rail's last post and when a batch reaches NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE.
      *        Defaults to false so an unmarked descriptor flushes safely.
-     * @param device_id Device id when multi-GPU is enabled.
-     * @param is_cuda_device Specifies whether this is CUDA-VRAM transfer.
+     * @param hmem_info Local buffer as resolved at registration, so a deferred post can bind its
+     *        device.
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
@@ -274,8 +266,7 @@ public:
                              int desc_idx,
                              size_t base_offset,
                              bool apply_fi_more = false,
-                             int device_id = -1,
-                             bool is_cuda_vram = false);
+                             const struct nfi_hmem_info &hmem_info = {});
 
     void
     deferTransferRequest(nixlLibfabricReq::OpType op_type,
@@ -284,8 +275,7 @@ public:
                          uint8_t write_gen,
                          uint64_t fi_flags,
                          fi_addr_t dest_addr,
-                         int device_id,
-                         bool is_cuda_vram,
+                         const struct nfi_hmem_info &hmem_info,
                          size_t rail_id,
                          nixlLibfabricReq *req);
 
@@ -412,12 +402,6 @@ public:
     getDramRailSelectionPolicy() const {
         return dram_rail_selection_policy_;
     }
-
-    /** Get the system's runtime type.
-     * @return fi_hmem_iface runtime type (CUDA, NEURON, or SYSTEM)
-     */
-    fi_hmem_iface
-    getRuntime() const;
 
 private:
     size_t striping_threshold_;

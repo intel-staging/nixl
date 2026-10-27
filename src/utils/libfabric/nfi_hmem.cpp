@@ -35,8 +35,16 @@
 #include <string>
 #include <vector>
 
+#ifdef NIXL_HAVE_CUDA_DRIVER_API
+#include <cuda.h>
+#endif
+
 #ifdef HAVE_ZE
 #include <level_zero/ze_api.h>
+#endif
+
+#ifdef NIXL_HAVE_ROCM
+#include <hip/hip_runtime_api.h>
 #endif
 
 /****************************************
@@ -82,7 +90,59 @@ struct nfi_vendor {
 
     /* Enumerates accelerator PCI addresses; nullptr for a vendor that cannot. */
     size_t (*device_bdfs)(struct nfi_hmem_bus_id *out, size_t max);
+
+    /* Thread-current context management; nullptr for a runtime without such state. */
+    int (*scope_push)(uint64_t device, uint64_t *saved);
+    void (*scope_pop)(uint64_t saved);
 };
+
+/****************************************
+ * Neuron
+ *****************************************/
+
+static int (*nfi_nrt_get_attached_efa_bdf)(const void *va, char *efa_bdf, size_t *len);
+
+static bool
+nfi_neuron_init(void) {
+    void *handle = dlopen("libnrt.so.1", RTLD_NOW);
+    if (!handle) {
+        nfi_log(NFI_HMEM_LOG_DEBUG, "libnrt.so.1 not available, Neuron detection disabled");
+        return false;
+    }
+
+    nfi_nrt_get_attached_efa_bdf =
+        (int (*)(const void *, char *, size_t *))dlsym(handle, "nrt_get_attached_efa_bdf");
+    if (!nfi_nrt_get_attached_efa_bdf) {
+        nfi_log(NFI_HMEM_LOG_WARN, "could not resolve libnrt symbol nrt_get_attached_efa_bdf");
+        return false;
+    }
+    return true;
+}
+
+static bool
+nfi_neuron_query(const void *addr, struct nfi_hmem_info *info) {
+    char buf[] = "0000:00:00.0";
+    size_t buflen = sizeof(buf);
+    unsigned domain, bus, slot, func;
+
+    if (nfi_nrt_get_attached_efa_bdf(addr, buf, &buflen) != 0) {
+        return false;
+    }
+
+    info->iface = FI_HMEM_NEURON;
+    /* libfabric requires device.neuron to be set but the EFA provider does not read it. */
+    info->device = static_cast<uint64_t>(-1);
+
+    /* libnrt reports the address of the EFA NIC attached to the accelerator. */
+    if (sscanf(buf, "%x:%x:%x.%x", &domain, &bus, &slot, &func) == 4) {
+        info->bus_kind = NFI_HMEM_BUS_NIC;
+        info->bus.domain = static_cast<uint16_t>(domain);
+        info->bus.bus = static_cast<uint8_t>(bus);
+        info->bus.slot = static_cast<uint8_t>(slot);
+        info->bus.func = static_cast<uint8_t>(func);
+    }
+    return true;
+}
 
 /****************************************
  * Level Zero
@@ -413,6 +473,304 @@ nfi_ze_device_bdfs(struct nfi_hmem_bus_id *out, size_t max) {
 #endif /* HAVE_ZE */
 
 /****************************************
+ * CUDA
+ *****************************************/
+
+#ifdef NIXL_HAVE_CUDA_DRIVER_API
+
+static bool
+nfi_cuda_init(void) {
+    if (cuInit(0) != CUDA_SUCCESS) {
+        nfi_log(NFI_HMEM_LOG_DEBUG, "cuInit failed, CUDA detection disabled");
+        return false;
+    }
+    return true;
+}
+
+static void
+nfi_cuda_fill_bus(struct nfi_hmem_info *info, CUdevice dev) {
+    int domain = 0, bus = 0, slot = 0;
+
+    if (cuDeviceGetAttribute(&domain, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID, dev) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&bus, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, dev) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&slot, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, dev) != CUDA_SUCCESS) {
+        return;
+    }
+
+    info->bus_kind = NFI_HMEM_BUS_ACCELERATOR;
+    info->bus.domain = static_cast<uint16_t>(domain);
+    info->bus.bus = static_cast<uint8_t>(bus);
+    info->bus.slot = static_cast<uint8_t>(slot);
+    /* CUDA exposes no function number; a GPU is function 0. */
+    info->bus.func = 0;
+}
+
+static bool
+nfi_cuda_query(const void *addr, struct nfi_hmem_info *info) {
+    CUmemorytype mem_type = CU_MEMORYTYPE_HOST;
+    CUdevice dev = 0;
+    CUpointer_attribute attrs[2] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                    CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL};
+    void *data[2] = {&mem_type, &dev};
+
+    /* Works without a current context: UVA lets the driver attribute any allocation. */
+    if (cuPointerGetAttributes(2, attrs, data, (CUdeviceptr)addr) != CUDA_SUCCESS ||
+        mem_type != CU_MEMORYTYPE_DEVICE) {
+        return false;
+    }
+
+    info->iface = FI_HMEM_CUDA;
+    info->device = static_cast<uint64_t>(dev);
+    nfi_cuda_fill_bus(info, dev);
+    return true;
+}
+
+static size_t
+nfi_cuda_device_bdfs(struct nfi_hmem_bus_id *out, size_t max) {
+    int count = 0;
+    size_t found = 0;
+
+    if (cuDeviceGetCount(&count) != CUDA_SUCCESS) {
+        return 0;
+    }
+    for (int i = 0; i < count; i++) {
+        CUdevice dev;
+        if (cuDeviceGet(&dev, i) != CUDA_SUCCESS) {
+            continue;
+        }
+        struct nfi_hmem_info info = {};
+        nfi_cuda_fill_bus(&info, dev);
+        if (info.bus_kind == NFI_HMEM_BUS_NONE) {
+            continue;
+        }
+        if (out && found < max) {
+            out[found] = info.bus;
+        }
+        found++;
+    }
+    return found;
+}
+
+/*
+ * Primary context per CUDA device ordinal, retained on first use and kept for the process so a
+ * scope push is a single cuCtxPushCurrent. Ordinals past the table are retained and released per
+ * scope. If a push fails because the application reset the device, the context is retained again
+ * and the push retried once.
+ */
+#define NFI_CUDA_MAX_CACHED_DEVICES 64
+static std::atomic<CUcontext> nfi_cuda_primary[NFI_CUDA_MAX_CACHED_DEVICES];
+
+/*
+ * Retained primary context for @p dev, or nullptr on failure. *@p cached says whether the retain
+ * belongs to the cache. @p stale, when not nullptr, is a cached context to replace.
+ */
+static CUcontext
+nfi_cuda_primary_ctx(CUdevice dev, bool *cached, CUcontext stale) {
+    const bool cacheable = dev >= 0 && dev < NFI_CUDA_MAX_CACHED_DEVICES;
+    *cached = cacheable;
+
+    if (cacheable && !stale) {
+        CUcontext ctx = nfi_cuda_primary[dev].load(std::memory_order_acquire);
+        if (ctx) {
+            return ctx;
+        }
+    }
+
+    CUcontext primary = nullptr;
+    if (cuDevicePrimaryCtxRetain(&primary, dev) != CUDA_SUCCESS) {
+        nfi_log(NFI_HMEM_LOG_ERROR,
+                "cuDevicePrimaryCtxRetain failed for CUDA device %d",
+                static_cast<int>(dev));
+        return nullptr;
+    }
+    if (!cacheable) {
+        return primary;
+    }
+
+    /* A thread that loses the race drops its retain and uses the winner's, the same context. */
+    CUcontext expected = stale;
+    if (!nfi_cuda_primary[dev].compare_exchange_strong(
+            expected, primary, std::memory_order_acq_rel)) {
+        (void)cuDevicePrimaryCtxRelease(dev);
+        return expected;
+    }
+    return primary;
+}
+
+/* True only when the driver reports @p dev's primary context inactive. */
+static bool
+nfi_cuda_primary_ctx_inactive(CUdevice dev) {
+    unsigned int flags = 0;
+    int active = 0;
+    return cuDevicePrimaryCtxGetState(dev, &flags, &active) == CUDA_SUCCESS && !active;
+}
+
+/* *saved holds the device, with the top bit set when its retain belongs to the cache. */
+#define NFI_CUDA_SAVED_CACHED (1ULL << 63)
+
+static int
+nfi_cuda_scope_push(uint64_t device, uint64_t *saved) {
+    CUdevice dev = (CUdevice)device;
+    bool cached = false;
+    CUcontext primary = nfi_cuda_primary_ctx(dev, &cached, nullptr);
+    if (!primary) {
+        return -EIO;
+    }
+
+    CUresult ret = cuCtxPushCurrent(primary);
+    if (ret != CUDA_SUCCESS && cached && nfi_cuda_primary_ctx_inactive(dev)) {
+        nfi_log(NFI_HMEM_LOG_INFO,
+                "primary context of CUDA device %d is no longer active, retaining it again",
+                static_cast<int>(dev));
+        primary = nfi_cuda_primary_ctx(dev, &cached, primary);
+        ret = primary ? cuCtxPushCurrent(primary) : CUDA_ERROR_INVALID_CONTEXT;
+    }
+    if (ret != CUDA_SUCCESS) {
+        if (primary && !cached) {
+            (void)cuDevicePrimaryCtxRelease(dev);
+        }
+        nfi_log(NFI_HMEM_LOG_ERROR,
+                "cuCtxPushCurrent failed for CUDA device %d",
+                static_cast<int>(dev));
+        return -EIO;
+    }
+
+    *saved = device | (cached ? NFI_CUDA_SAVED_CACHED : 0);
+    return 0;
+}
+
+static void
+nfi_cuda_scope_pop(uint64_t saved) {
+    CUcontext popped = nullptr;
+
+    if (cuCtxPopCurrent(&popped) != CUDA_SUCCESS) {
+        nfi_log(NFI_HMEM_LOG_WARN, "cuCtxPopCurrent failed");
+    }
+    if (saved & NFI_CUDA_SAVED_CACHED) {
+        return;
+    }
+    if (cuDevicePrimaryCtxRelease(static_cast<CUdevice>(saved)) != CUDA_SUCCESS) {
+        nfi_log(NFI_HMEM_LOG_WARN,
+                "cuDevicePrimaryCtxRelease failed for CUDA device %d",
+                static_cast<int>(saved));
+    }
+}
+
+#endif /* NIXL_HAVE_CUDA_DRIVER_API */
+
+/****************************************
+ * AMD ROCr (HIP)
+ *****************************************/
+
+#ifdef NIXL_HAVE_ROCM
+
+/* dlopen'd entry points of libamdhip64. ROCr keeps no thread-current state, so no scope hooks. */
+struct nfi_rocr_ops {
+    hipError_t (*get_device_count)(int *);
+    hipError_t (*pointer_get_attributes)(hipPointerAttribute_t *, const void *);
+    hipError_t (*device_get_pci_bus_id)(char *, int, int);
+};
+
+static struct nfi_rocr_ops nfi_rocr;
+
+static bool
+nfi_rocr_init(void) {
+    void *handle = dlopen("libamdhip64.so", RTLD_NOW);
+    if (handle == nullptr) {
+        nfi_log(NFI_HMEM_LOG_DEBUG, "libamdhip64.so not available, ROCr detection disabled");
+        return false;
+    }
+
+    struct {
+        const char *name;
+        void **slot;
+    } syms[] = {
+        {"hipGetDeviceCount", (void **)&nfi_rocr.get_device_count},
+        {"hipPointerGetAttributes", (void **)&nfi_rocr.pointer_get_attributes},
+        {"hipDeviceGetPCIBusId", (void **)&nfi_rocr.device_get_pci_bus_id},
+    };
+
+    for (const auto &sym : syms) {
+        *sym.slot = dlsym(handle, sym.name);
+        if (*sym.slot == nullptr) {
+            nfi_log(NFI_HMEM_LOG_WARN, "could not resolve HIP symbol %s", sym.name);
+            return false;
+        }
+    }
+
+    int count = 0;
+    if (nfi_rocr.get_device_count(&count) != hipSuccess || count <= 0) {
+        nfi_log(NFI_HMEM_LOG_DEBUG, "no HIP devices found, ROCr detection disabled");
+        return false;
+    }
+    nfi_log(NFI_HMEM_LOG_INFO, "ROCr detection enabled with %d device(s)", count);
+    return true;
+}
+
+static void
+nfi_rocr_fill_bus(struct nfi_hmem_info *info, int dev) {
+    char buf[32];
+    unsigned domain, bus, slot, func;
+
+    if (nfi_rocr.device_get_pci_bus_id(buf, sizeof(buf), dev) != hipSuccess) {
+        return;
+    }
+    if (sscanf(buf, "%x:%x:%x.%x", &domain, &bus, &slot, &func) == 4) {
+        info->bus_kind = NFI_HMEM_BUS_ACCELERATOR;
+        info->bus.domain = static_cast<uint16_t>(domain);
+        info->bus.bus = static_cast<uint8_t>(bus);
+        info->bus.slot = static_cast<uint8_t>(slot);
+        info->bus.func = static_cast<uint8_t>(func);
+    }
+}
+
+static bool
+nfi_rocr_query(const void *addr, struct nfi_hmem_info *info) {
+    hipPointerAttribute_t attr = {};
+
+    if (nfi_rocr.pointer_get_attributes(&attr, addr) != hipSuccess) {
+        return false;
+    }
+#if HIP_VERSION_MAJOR >= 6
+    const hipMemoryType mem_type = attr.type;
+#else
+    const hipMemoryType mem_type = attr.memoryType;
+#endif
+    if (mem_type != hipMemoryTypeDevice) {
+        return false;
+    }
+
+    info->iface = FI_HMEM_ROCR;
+    info->device = static_cast<uint64_t>(attr.device);
+    nfi_rocr_fill_bus(info, attr.device);
+    return true;
+}
+
+static size_t
+nfi_rocr_device_bdfs(struct nfi_hmem_bus_id *out, size_t max) {
+    int count = 0;
+    size_t found = 0;
+
+    if (nfi_rocr.get_device_count(&count) != hipSuccess) {
+        return 0;
+    }
+    for (int i = 0; i < count; i++) {
+        struct nfi_hmem_info info = {};
+        nfi_rocr_fill_bus(&info, i);
+        if (info.bus_kind == NFI_HMEM_BUS_NONE) {
+            continue;
+        }
+        if (out && found < max) {
+            out[found] = info.bus;
+        }
+        found++;
+    }
+    return found;
+}
+
+#endif /* NIXL_HAVE_ROCM */
+
+/****************************************
  * Table
  *****************************************/
 
@@ -421,15 +779,26 @@ nfi_ze_device_bdfs(struct nfi_hmem_bus_id *out, size_t max) {
  * and providers that call it (cxi, rxm, opx) attribute a pointer to the same runtime.
  */
 static const struct nfi_vendor nfi_vendors[] = {
+    {FI_HMEM_NEURON, nfi_neuron_init, nfi_neuron_query, nullptr, nullptr, nullptr},
 #ifdef HAVE_ZE
-    {
-        FI_HMEM_ZE,
-        nfi_ze_init,
-        nfi_ze_query,
-        nfi_ze_device_bdfs,
-    },
+    {FI_HMEM_ZE, nfi_ze_init, nfi_ze_query, nfi_ze_device_bdfs, nullptr, nullptr},
 #else
-    {FI_HMEM_ZE, nullptr, nullptr, nullptr},
+    {FI_HMEM_ZE, nullptr, nullptr, nullptr, nullptr, nullptr},
+#endif
+#ifdef NIXL_HAVE_ROCM
+    {FI_HMEM_ROCR, nfi_rocr_init, nfi_rocr_query, nfi_rocr_device_bdfs, nullptr, nullptr},
+#else
+    {FI_HMEM_ROCR, nullptr, nullptr, nullptr, nullptr, nullptr},
+#endif
+#ifdef NIXL_HAVE_CUDA_DRIVER_API
+    {FI_HMEM_CUDA,
+     nfi_cuda_init,
+     nfi_cuda_query,
+     nfi_cuda_device_bdfs,
+     nfi_cuda_scope_push,
+     nfi_cuda_scope_pop},
+#else
+    {FI_HMEM_CUDA, nullptr, nullptr, nullptr, nullptr, nullptr},
 #endif
 };
 
@@ -641,4 +1010,53 @@ nfi_hmem_device_bdfs(enum fi_hmem_iface iface, struct nfi_hmem_bus_id *out, size
     }
 
     return nfi_vendors[index].device_bdfs(out, out ? max : 0);
+}
+
+bool
+nfi_hmem_needs_scope(enum fi_hmem_iface iface) {
+    size_t index = nfi_vendor_index(iface);
+
+    if (index >= NFI_NUM_VENDORS || !nfi_vendors[index].scope_push) {
+        return false;
+    }
+    return nfi_vendor_available(index);
+}
+
+int
+nfi_hmem_scope_push(enum fi_hmem_iface iface, uint64_t device, struct nfi_hmem_scope *scope) {
+    if (!scope) {
+        return -EINVAL;
+    }
+
+    scope->iface = FI_HMEM_SYSTEM;
+    scope->saved = 0;
+    scope->pushed = 0;
+
+    size_t index = nfi_vendor_index(iface);
+    if (index >= NFI_NUM_VENDORS || !nfi_vendors[index].scope_push ||
+        !nfi_vendor_available(index)) {
+        return 0;
+    }
+
+    int ret = nfi_vendors[index].scope_push(device, &scope->saved);
+    if (ret) {
+        return ret;
+    }
+
+    scope->iface = iface;
+    scope->pushed = 1;
+    return 0;
+}
+
+void
+nfi_hmem_scope_pop(struct nfi_hmem_scope *scope) {
+    if (!scope || !scope->pushed) {
+        return;
+    }
+
+    size_t index = nfi_vendor_index(scope->iface);
+    if (index < NFI_NUM_VENDORS && nfi_vendors[index].scope_pop) {
+        nfi_vendors[index].scope_pop(scope->saved);
+    }
+    scope->pushed = 0;
 }

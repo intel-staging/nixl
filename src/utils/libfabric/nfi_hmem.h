@@ -21,9 +21,10 @@
  * @brief Heterogeneous-memory helpers that libfabric uses internally but does not export.
  *
  * Identifies which accelerator runtime owns a pointer and fills fi_mr_attr::iface and
- * fi_mr_attr::device for fi_mr_regattr(). The interface is C-compatible and depends only on
- * libfabric's public headers; vendor runtimes are loaded with dlopen. All functions are
- * thread-safe, and each vendor is initialised once, on first use.
+ * fi_mr_attr::device for fi_mr_regattr(), and binds a thread to a device for runtimes that keep
+ * thread-current state. The interface is C-compatible and depends only on libfabric's public
+ * headers. The Level Zero, ROCr and Neuron runtimes are loaded with dlopen; CUDA is linked. All
+ * functions are thread-safe, and each vendor is initialised once, on first use.
  */
 
 #ifndef NFI_HMEM_H
@@ -84,6 +85,13 @@ struct nfi_hmem_info {
 
     /** Size of the allocation; set together with @ref pooled_dmabuf_size. */
     uint64_t alloc_size;
+};
+
+/** @brief A pushed accelerator context, popped on the same thread. Zero-initialise it. */
+struct nfi_hmem_scope {
+    enum fi_hmem_iface iface;
+    uint64_t saved;
+    int pushed;
 };
 
 /** @brief Diagnostic severity. */
@@ -175,6 +183,32 @@ nfi_hmem_iface_name(enum fi_hmem_iface iface);
  */
 size_t
 nfi_hmem_device_bdfs(enum fi_hmem_iface iface, struct nfi_hmem_bus_id *out, size_t max);
+
+/**
+ * @brief Whether @p iface keeps thread-current state that must be set before use.
+ *
+ * True for CUDA, whose context is per thread. When false, the scope calls are no-ops.
+ */
+bool
+nfi_hmem_needs_scope(enum fi_hmem_iface iface);
+
+/**
+ * @brief Makes @p device of @p iface current on the calling thread until the matching pop.
+ *
+ * Binds the device's primary context, and restores the previous binding on pop. A no-op when
+ * @ref nfi_hmem_needs_scope is false. Cheap enough to call per descriptor.
+ *
+ * @param iface Interface owning @p device.
+ * @param device Ordinal as reported in @ref nfi_hmem_info::device.
+ * @param[out] scope State for @ref nfi_hmem_scope_pop. Safe to pop even if the push failed.
+ * @return 0 on success, -EINVAL if @p scope is NULL, or a negative errno from the runtime.
+ */
+int
+nfi_hmem_scope_push(enum fi_hmem_iface iface, uint64_t device, struct nfi_hmem_scope *scope);
+
+/** @brief Undoes @ref nfi_hmem_scope_push on the same thread. Safe to call twice. */
+void
+nfi_hmem_scope_pop(struct nfi_hmem_scope *scope);
 
 #ifdef __cplusplus
 } /* extern "C" */

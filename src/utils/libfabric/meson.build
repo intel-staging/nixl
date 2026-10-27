@@ -14,32 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# AMD ROCm/HIP support (rocm_dep, hipify_src) is defined once in the root
-# meson.build and consumed here. On ROCm builds (-Drocm_path=<prefix>) the CUDA
-# sources are translated to HIP with hipify-perl; on CUDA-only builds they are
-# used verbatim.
-if rocm_dep.found()
-    libfabric_rail_src = hipify_src.process('libfabric_rail.cpp', extra_args: ['-o'])
-    libfabric_topology_src = hipify_src.process('libfabric_topology.cpp', extra_args: ['-o'])
-    libfabric_rail_manager_src = hipify_src.process('libfabric_rail_manager.cpp', extra_args: ['-o'])
-else
-    libfabric_rail_src = files('libfabric_rail.cpp')
-    libfabric_topology_src = files('libfabric_topology.cpp')
-    libfabric_rail_manager_src = files('libfabric_rail_manager.cpp')
-endif
-
-# Source files
-libfabric_utils_sources = [
-    libfabric_rail_src,
+# Source files. Accelerator vendor calls are made only in nfi_hmem.cpp and
+# libfabric_cuda_dmabuf.cpp, so no source needs hipify.
+libfabric_utils_sources = files(
+    'libfabric_rail.cpp',
     'libfabric_common.cpp',
     'libfabric_accel.cpp',
     'nfi_hmem.cpp',
-    # Kept out of the hipify step below: it calls the CUDA driver API directly and
-    # compiles to stubs unless NIXL_HAVE_CUDA_DRIVER_API is set.
+    # Calls the CUDA driver API directly and compiles to stubs unless
+    # NIXL_HAVE_CUDA_DRIVER_API is set.
     'libfabric_cuda_dmabuf.cpp',
-    libfabric_topology_src,
-    libfabric_rail_manager_src,
-]
+    'libfabric_topology.cpp',
+    'libfabric_rail_manager.cpp',
+)
 
 # Header files
 libfabric_utils_headers = files(
@@ -58,7 +45,7 @@ hwloc_dep = dependency('hwloc', required: true)
 # Find numa dependency
 numa_dep = dependency('numa', required: true)
 
-# dlopen/dlsym, used by nfi_hmem.cpp
+# dlopen/dlsym, used by nfi_hmem.cpp for libze_loader, libamdhip64 and libnrt
 dl_dep = dependency('dl', required: true)
 
 # Set up dependencies and compile args
@@ -91,15 +78,16 @@ if libfabric_dep.found()
     endif
 endif
 
-# Add GPU support: HIP/ROCm when rocm_path is set, CUDA otherwise.
+# Add GPU support: HIP/ROCm when rocm_path is set, CUDA otherwise. nfi_hmem.cpp selects its
+# vendors with NIXL_HAVE_ROCM and NIXL_HAVE_CUDA_DRIVER_API.
 if rocm_dep.found()
     libfabric_utils_deps += [rocm_dep]
-    libfabric_utils_cpp_args += ['-DHAVE_CUDA']
+    libfabric_utils_cpp_args += ['-DHAVE_CUDA', '-DNIXL_HAVE_ROCM']
 elif cuda_dep.found()
     libfabric_utils_deps += [cuda_dep]
     libfabric_utils_cpp_args += ['-DHAVE_CUDA']
-    # Both arms define HAVE_CUDA, and this marks a CUDA build for the translation unit
-    # that calls the CUDA driver API (libfabric_cuda_dmabuf.cpp).
+    # Both arms define HAVE_CUDA, and this marks a CUDA build for the translation units
+    # that call the CUDA driver API (nfi_hmem.cpp, libfabric_cuda_dmabuf.cpp).
     libfabric_utils_cpp_args += ['-DNIXL_HAVE_CUDA_DRIVER_API']
 
     # CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE is an enum member, so the build probes
