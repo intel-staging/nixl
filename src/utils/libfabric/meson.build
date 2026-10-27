@@ -34,6 +34,9 @@ libfabric_utils_sources = [
     'libfabric_common.cpp',
     'libfabric_accel.cpp',
     'nfi_hmem.cpp',
+    'nfi_hmem_cuda.cpp',
+    'nfi_hmem_rocr.cpp',
+    'nfi_hmem_neuron.cpp',
     # Kept out of the hipify step below: it calls the CUDA driver API directly and
     # compiles to stubs unless NIXL_HAVE_CUDA_DRIVER_API is set.
     'libfabric_cuda_dmabuf.cpp',
@@ -58,7 +61,7 @@ hwloc_dep = dependency('hwloc', required: true)
 # Find numa dependency
 numa_dep = dependency('numa', required: true)
 
-# dlopen/dlsym, used by nfi_hmem.cpp
+# dlopen/dlsym, used by nfi_hmem.cpp for libze_loader, libamdhip64 and libnrt
 dl_dep = dependency('dl', required: true)
 
 # Set up dependencies and compile args
@@ -91,15 +94,16 @@ if libfabric_dep.found()
     endif
 endif
 
-# Add GPU support: HIP/ROCm when rocm_path is set, CUDA otherwise.
+# Add GPU support: HIP/ROCm when rocm_path is set, CUDA otherwise. nfi_hmem selects its
+# vendors with NIXL_HAVE_ROCM and NIXL_HAVE_CUDA_DRIVER_API.
 if rocm_dep.found()
     libfabric_utils_deps += [rocm_dep]
-    libfabric_utils_cpp_args += ['-DHAVE_CUDA']
+    libfabric_utils_cpp_args += ['-DHAVE_CUDA', '-DNIXL_HAVE_ROCM']
 elif cuda_dep.found()
     libfabric_utils_deps += [cuda_dep]
     libfabric_utils_cpp_args += ['-DHAVE_CUDA']
-    # Both arms define HAVE_CUDA, and this marks a CUDA build for the translation unit
-    # that calls the CUDA driver API (libfabric_cuda_dmabuf.cpp).
+    # Both arms define HAVE_CUDA, and this marks a CUDA build for the translation units
+    # that call the CUDA driver API (nfi_hmem_cuda.cpp, libfabric_cuda_dmabuf.cpp).
     libfabric_utils_cpp_args += ['-DNIXL_HAVE_CUDA_DRIVER_API']
 
     # CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE is an enum member, so the build probes

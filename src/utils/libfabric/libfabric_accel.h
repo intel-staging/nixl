@@ -76,4 +76,59 @@ accelIfaceOfHwlocObj(hwloc_obj_t obj);
 bool
 accelIfaceIsGroupable(enum fi_hmem_iface iface);
 
+/**
+ * @brief The interface to register a VRAM_SEG pointer under when no runtime claimed it.
+ *
+ * FI_HMEM_SYSTEM, meaning the pointer is a caller error, when CUDA is usable. Otherwise the first
+ * usable runtime whose query can miss its own memory: Neuron, then Level Zero (which sees only
+ * driver 0's allocations). FI_HMEM_SYSTEM if neither is usable.
+ */
+enum fi_hmem_iface
+accelUnclaimedVramIface();
+
+/**
+ * @brief RAII wrapper over @ref nfi_hmem_scope_push and @ref nfi_hmem_scope_pop.
+ *
+ * Brackets operations that need the buffer's device current: registration (libfabric exports a
+ * dma-buf from inside fi_mr_regattr()) and posting (a provider may copy through the host).
+ * Detection needs no context. A no-op for runtimes without thread-current state.
+ */
+class nixlAccelScope {
+public:
+    explicit nixlAccelScope(const struct nfi_hmem_info &info)
+        : nixlAccelScope(info.iface, info.device) {}
+
+    nixlAccelScope(enum fi_hmem_iface iface, uint64_t device)
+        : scope_{},
+          iface_(iface),
+          device_(device),
+          ok_(nfi_hmem_scope_push(iface, device, &scope_) == 0) {}
+
+    ~nixlAccelScope() {
+        nfi_hmem_scope_pop(&scope_);
+    }
+
+    nixlAccelScope(const nixlAccelScope &) = delete;
+    nixlAccelScope &
+    operator=(const nixlAccelScope &) = delete;
+
+    /** @brief False when the runtime refused the binding. */
+    bool
+    ok() const {
+        return ok_;
+    }
+
+    /** @brief Whether this scope already binds the device @p info needs. */
+    bool
+    holds(const struct nfi_hmem_info &info) const {
+        return ok_ && iface_ == info.iface && device_ == info.device;
+    }
+
+private:
+    struct nfi_hmem_scope scope_;
+    enum fi_hmem_iface iface_;
+    uint64_t device_;
+    bool ok_;
+};
+
 #endif // NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_ACCEL_H

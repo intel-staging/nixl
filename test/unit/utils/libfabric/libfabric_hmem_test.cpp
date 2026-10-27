@@ -26,6 +26,7 @@
 #include "common/nixl_log.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,10 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <level_zero/ze_api.h>
+#endif
+
+#ifdef HAVE_CUDA
+#include <cuda.h>
 #endif
 
 namespace {
@@ -71,6 +76,10 @@ static_assert(std::is_standard_layout_v<nfi_hmem_bus_id>,
               "nfi_hmem_bus_id must stay a C-compatible POD");
 static_assert(std::is_standard_layout_v<nfi_hmem_info>,
               "nfi_hmem_info must stay a C-compatible POD");
+static_assert(std::is_standard_layout_v<nfi_hmem_scope>,
+              "nfi_hmem_scope must stay a C-compatible POD");
+static_assert(std::is_trivially_destructible_v<nfi_hmem_scope>,
+              "nfi_hmem_scope must not need a destructor");
 static_assert(std::is_trivially_copyable_v<nfi_hmem_info>,
               "nfi_hmem_info must be memcpy-able, as a C caller would expect");
 static_assert(std::is_same_v<decltype(nfi_hmem_query_ptr), int(const void *, nfi_hmem_info *)>,
@@ -344,12 +353,112 @@ testBusIdString() {
 }
 
 /****************************************
- * 8. Pooled-slice decision
+ * 8. Policy
+ *****************************************/
+
+void
+testPolicy() {
+    NIXL_INFO << "8. Testing rail-selection policy";
+
+    check(accelIfaceIsGroupable(FI_HMEM_CUDA), "NVIDIA GPUs join PCIe-proximity grouping");
+    check(accelIfaceIsGroupable(FI_HMEM_ROCR), "AMD GPUs join PCIe-proximity grouping");
+    check(accelIfaceIsGroupable(FI_HMEM_ZE), "Intel GPUs join PCIe-proximity grouping");
+    check(!accelIfaceIsGroupable(FI_HMEM_NEURON), "Neuron devices stay out of grouping");
+    check(!accelIfaceIsGroupable(FI_HMEM_SYSTEM), "host memory is not groupable");
+    check(!accelIfaceIsGroupable(FI_HMEM_SYNAPSEAI), "an unknown interface is not groupable");
+
+    // Unclaimed VRAM: an error where CUDA is usable, otherwise Neuron, then Level Zero.
+    const enum fi_hmem_iface fallback = accelUnclaimedVramIface();
+    if (nfi_hmem_iface_available(FI_HMEM_CUDA)) {
+        check(fallback == FI_HMEM_SYSTEM,
+              "an unclaimed VRAM pointer is an error where CUDA is usable");
+    } else if (nfi_hmem_iface_available(FI_HMEM_NEURON)) {
+        check(fallback == FI_HMEM_NEURON,
+              "without CUDA, unclaimed VRAM falls back to Neuron first");
+    } else if (nfi_hmem_iface_available(FI_HMEM_ZE)) {
+        check(fallback == FI_HMEM_ZE, "without CUDA or Neuron, unclaimed VRAM falls back to ZE");
+    } else {
+        check(fallback == FI_HMEM_SYSTEM, "with no fallback runtime, unclaimed VRAM is an error");
+    }
+
+    check(accelIfaceOfHwlocObj(nullptr) == FI_HMEM_SYSTEM, "a null hwloc object is rejected");
+}
+
+/****************************************
+ * 9. Context scope
+ *****************************************/
+
+void
+testScope() {
+    NIXL_INFO << "9. Testing context scope";
+
+    check(!nfi_hmem_needs_scope(FI_HMEM_SYSTEM), "host memory needs no context binding");
+    check(!nfi_hmem_needs_scope(FI_HMEM_NEURON), "Neuron needs no context binding");
+    check(!nfi_hmem_needs_scope(FI_HMEM_ZE), "Level Zero needs no context binding");
+    check(!nfi_hmem_needs_scope(FI_HMEM_ROCR), "ROCr needs no context binding");
+
+    check(nfi_hmem_scope_push(FI_HMEM_CUDA, 0, nullptr) == -EINVAL, "a null scope is rejected");
+
+    // A no-op scope is safe to pop, twice
+    struct nfi_hmem_scope scope;
+    memset(&scope, 0xCD, sizeof(scope));
+    check(nfi_hmem_scope_push(FI_HMEM_SYSTEM, 0, &scope) == 0,
+          "pushing a scope for host memory succeeds as a no-op");
+    nfi_hmem_scope_pop(&scope);
+    nfi_hmem_scope_pop(&scope);
+
+    {
+        const nixlAccelScope guard(FI_HMEM_SYSTEM, 0);
+        check(guard.ok(), "nixlAccelScope reports success when there is nothing to bind");
+    }
+
+    if (!nfi_hmem_iface_available(FI_HMEM_CUDA)) {
+        NIXL_INFO << "   SKIP: CUDA unavailable, cannot test real context push/pop";
+        return;
+    }
+    check(nfi_hmem_needs_scope(FI_HMEM_CUDA), "CUDA needs context binding");
+
+#ifdef HAVE_CUDA
+    // The scope must leave the thread's current context as it found it
+    CUcontext before = nullptr;
+    const bool have_before = (cuCtxGetCurrent(&before) == CUDA_SUCCESS);
+    {
+        const nixlAccelScope guard(FI_HMEM_CUDA, 0);
+        check(guard.ok(), "a CUDA scope pushes successfully");
+
+        CUcontext inside = nullptr;
+        check(cuCtxGetCurrent(&inside) == CUDA_SUCCESS && inside != nullptr,
+              "a context is current inside the scope");
+    }
+    CUcontext after = nullptr;
+    const bool have_after = (cuCtxGetCurrent(&after) == CUDA_SUCCESS);
+    check(have_before == have_after && before == after,
+          "the thread's context is restored after the scope");
+
+    // Nested scopes unwind in order
+    {
+        const nixlAccelScope outer(FI_HMEM_CUDA, 0);
+        {
+            const nixlAccelScope inner(FI_HMEM_CUDA, 0);
+            check(inner.ok(), "a nested CUDA scope pushes successfully");
+        }
+        CUcontext still = nullptr;
+        check(cuCtxGetCurrent(&still) == CUDA_SUCCESS && still != nullptr,
+              "the outer scope's context survives the inner scope's pop");
+    }
+    CUcontext final_ctx = nullptr;
+    (void)cuCtxGetCurrent(&final_ctx);
+    check(final_ctx == after, "nested scopes unwind to the original binding");
+#endif
+}
+
+/****************************************
+ * 10. Pooled-slice decision
  *****************************************/
 
 void
 testPooledSliceDecision() {
-    NIXL_INFO << "8. Testing the pooled-slice decision";
+    NIXL_INFO << "10. Testing the pooled-slice decision";
 
     constexpr uint64_t KiB = 1024;
     constexpr uint64_t MiB = 1024 * KiB;
@@ -381,7 +490,7 @@ testPooledSliceDecision() {
 }
 
 /****************************************
- * 9. Level Zero device memory
+ * 11. Level Zero device memory
  *****************************************/
 
 #ifdef HAVE_ZE
@@ -453,7 +562,7 @@ zeAlloc(const ZeApi &ze,
 
 void
 testLevelZeroMemory() {
-    NIXL_INFO << "9. Testing Level Zero device memory";
+    NIXL_INFO << "11. Testing Level Zero device memory";
 
     if (!nfi_hmem_iface_available(FI_HMEM_ZE)) {
         NIXL_INFO << "   SKIP: Level Zero is not usable on this host";
@@ -558,7 +667,7 @@ testLevelZeroMemory() {
 int
 main() {
 #ifdef HAVE_ZE
-    // Ask the Intel driver to pool small device allocations, so section 9 exercises the pooled
+    // Ask the Intel driver to pool small device allocations, so section 11 exercises the pooled
     // path; read at Level Zero initialisation, so set before anything initialises it. Not
     // overwritten when already set.
     setenv("NEOReadDebugKeys", "1", 0);
@@ -577,6 +686,8 @@ main() {
     testFillMrAttr();
     testDeviceBdfs();
     testBusIdString();
+    testPolicy();
+    testScope();
     testPooledSliceDecision();
 #ifdef HAVE_ZE
     testLevelZeroMemory();

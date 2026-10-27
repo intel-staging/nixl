@@ -191,3 +191,16 @@ bool
 accelIfaceIsGroupable(enum fi_hmem_iface iface) {
     return iface == FI_HMEM_CUDA || iface == FI_HMEM_ROCR || iface == FI_HMEM_ZE;
 }
+
+enum fi_hmem_iface
+accelUnclaimedVramIface() {
+    if (nfi_hmem_iface_available(FI_HMEM_CUDA)) {
+        return FI_HMEM_SYSTEM;
+    }
+    for (const auto iface : {FI_HMEM_NEURON, FI_HMEM_ZE}) {
+        if (nfi_hmem_iface_available(iface)) {
+            return iface;
+        }
+    }
+    return FI_HMEM_SYSTEM;
+}

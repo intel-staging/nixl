@@ -18,10 +18,12 @@
 
 /*
  * Vendor table for nfi_hmem.h. Each runtime is reached through dlopen, so only its SDK headers are
- * a build-time dependency, and its section compiles out without them.
+ * a build-time dependency, and its section compiles out without them. Level Zero is implemented
+ * here; CUDA, ROCr and Neuron are in nfi_hmem_{cuda,rocr,neuron}.cpp (see nfi_hmem_vendor.h).
  */
 
 #include "nfi_hmem.h"
+#include "nfi_hmem_vendor.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
@@ -51,7 +53,7 @@ nfi_hmem_set_log_fn(nfi_hmem_log_fn fn) {
     nfi_log_fn.store(fn, std::memory_order_release);
 }
 
-__attribute__((format(printf, 2, 3))) static void
+void
 nfi_log(enum nfi_hmem_log_level level, const char *fmt, ...) {
     const nfi_hmem_log_fn fn = nfi_log_fn.load(std::memory_order_acquire);
     if (fn == nullptr) {
@@ -82,6 +84,10 @@ struct nfi_vendor {
 
     /* Enumerates accelerator PCI addresses; nullptr for a vendor that cannot. */
     size_t (*device_bdfs)(struct nfi_hmem_bus_id *out, size_t max);
+
+    /* Thread-current context management; nullptr for a runtime without such state. */
+    int (*scope_push)(uint64_t device, uint64_t *saved);
+    void (*scope_pop)(uint64_t saved);
 };
 
 /****************************************
@@ -419,15 +425,26 @@ nfi_ze_device_bdfs(struct nfi_hmem_bus_id *out, size_t max) {
  * and providers that call it (cxi, rxm, opx) attribute a pointer to the same runtime.
  */
 static const struct nfi_vendor nfi_vendors[] = {
+    {FI_HMEM_NEURON, nfi_neuron_init, nfi_neuron_query, nullptr, nullptr, nullptr},
 #ifdef HAVE_ZE
-    {
-        FI_HMEM_ZE,
-        nfi_ze_init,
-        nfi_ze_query,
-        nfi_ze_device_bdfs,
-    },
+    {FI_HMEM_ZE, nfi_ze_init, nfi_ze_query, nfi_ze_device_bdfs, nullptr, nullptr},
 #else
-    {FI_HMEM_ZE, nullptr, nullptr, nullptr},
+    {FI_HMEM_ZE, nullptr, nullptr, nullptr, nullptr, nullptr},
+#endif
+#ifdef NIXL_HAVE_ROCM
+    {FI_HMEM_ROCR, nfi_rocr_init, nfi_rocr_query, nfi_rocr_device_bdfs, nullptr, nullptr},
+#else
+    {FI_HMEM_ROCR, nullptr, nullptr, nullptr, nullptr, nullptr},
+#endif
+#ifdef NIXL_HAVE_CUDA_DRIVER_API
+    {FI_HMEM_CUDA,
+     nfi_cuda_init,
+     nfi_cuda_query,
+     nfi_cuda_device_bdfs,
+     nfi_cuda_scope_push,
+     nfi_cuda_scope_pop},
+#else
+    {FI_HMEM_CUDA, nullptr, nullptr, nullptr, nullptr, nullptr},
 #endif
 };
 
@@ -659,4 +676,53 @@ nfi_hmem_device_bdfs(enum fi_hmem_iface iface, struct nfi_hmem_bus_id *out, size
     }
 
     return nfi_vendors[index].device_bdfs(out, out ? max : 0);
+}
+
+bool
+nfi_hmem_needs_scope(enum fi_hmem_iface iface) {
+    size_t index = nfi_vendor_index(iface);
+
+    if (index >= NFI_NUM_VENDORS || !nfi_vendors[index].scope_push) {
+        return false;
+    }
+    return nfi_vendor_available(index);
+}
+
+int
+nfi_hmem_scope_push(enum fi_hmem_iface iface, uint64_t device, struct nfi_hmem_scope *scope) {
+    if (!scope) {
+        return -EINVAL;
+    }
+
+    scope->iface = FI_HMEM_SYSTEM;
+    scope->saved = 0;
+    scope->pushed = 0;
+
+    size_t index = nfi_vendor_index(iface);
+    if (index >= NFI_NUM_VENDORS || !nfi_vendors[index].scope_push ||
+        !nfi_vendor_available(index)) {
+        return 0;
+    }
+
+    int ret = nfi_vendors[index].scope_push(device, &scope->saved);
+    if (ret) {
+        return ret;
+    }
+
+    scope->iface = iface;
+    scope->pushed = 1;
+    return 0;
+}
+
+void
+nfi_hmem_scope_pop(struct nfi_hmem_scope *scope) {
+    if (!scope || !scope->pushed) {
+        return;
+    }
+
+    size_t index = nfi_vendor_index(scope->iface);
+    if (index < NFI_NUM_VENDORS && nfi_vendors[index].scope_pop) {
+        nfi_vendors[index].scope_pop(scope->saved);
+    }
+    scope->pushed = 0;
 }
