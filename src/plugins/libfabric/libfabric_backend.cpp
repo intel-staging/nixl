@@ -460,6 +460,33 @@ nixlLibfabricEngine::getConnInfo(std::string &str) const {
 nixl_status_t
 nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
                                         const std::string &remote_conn_info) {
+    std::shared_ptr<nixlLibfabricConnection> conn_for_handshake;
+    nixl_status_t status =
+        createConnectionFromInfo(remote_agent, remote_conn_info, conn_for_handshake);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
+    if (conn_for_handshake) {
+        nixl_status_t hs = sendHandshakeTo(*conn_for_handshake);
+        if (hs != NIXL_SUCCESS) {
+            NIXL_ERROR << "Handshake send to '" << remote_agent << "' failed with status " << hs
+                       << "; their first transfers to us will land in the pre-handshake bucket";
+            return hs;
+        }
+    }
+
+    NIXL_INFO << "Successfully stored multirail connection for " << remote_agent << " on "
+              << rail_manager_.getNumRails() << " rails";
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlLibfabricEngine::createConnectionFromInfo(
+    const std::string &remote_agent,
+    const std::string &remote_conn_info,
+    std::shared_ptr<nixlLibfabricConnection> &conn_for_handshake) {
+    conn_for_handshake.reset();
 
     NIXL_DEBUG << "Loading remote info for agent: " << remote_agent
                << ", info length=" << remote_conn_info.length() << ", info (hex): "
@@ -483,39 +510,24 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
         return status;
     }
 
-    std::shared_ptr<nixlLibfabricConnection> conn_for_handshake;
-    {
-        std::lock_guard<std::mutex> lock(connection_state_mutex_);
+    std::lock_guard<std::mutex> lock(connection_state_mutex_);
 
-        bool already_exists = (connections_.find(remote_agent) != connections_.end());
-        if (already_exists) {
-            NIXL_INFO << "Connection for " << remote_agent
-                      << " already exists, skipping duplicate loadRemoteConnInfo";
-            return NIXL_SUCCESS;
-        }
-
-        nixl_status_t conn_status = createAgentConnection(remote_agent, data_endpoints);
-        if (conn_status != NIXL_SUCCESS) {
-            NIXL_ERROR << "createAgentConnection failed with status: " << conn_status;
-            return conn_status;
-        }
-
-        if (remote_agent != localAgent) {
-            conn_for_handshake = connections_[remote_agent];
-        }
+    bool already_exists = (connections_.find(remote_agent) != connections_.end());
+    if (already_exists) {
+        NIXL_INFO << "Connection for " << remote_agent
+                  << " already exists, skipping duplicate loadRemoteConnInfo";
+        return NIXL_SUCCESS;
     }
 
-    if (conn_for_handshake) {
-        nixl_status_t hs = sendHandshakeTo(*conn_for_handshake);
-        if (hs != NIXL_SUCCESS) {
-            NIXL_ERROR << "Handshake send to '" << remote_agent << "' failed with status " << hs
-                       << "; their first transfers to us will land in the pre-handshake bucket";
-            return hs;
-        }
+    nixl_status_t conn_status = createAgentConnection(remote_agent, data_endpoints);
+    if (conn_status != NIXL_SUCCESS) {
+        NIXL_ERROR << "createAgentConnection failed with status: " << conn_status;
+        return conn_status;
     }
 
-    NIXL_INFO << "Successfully stored multirail connection for " << remote_agent << " on "
-              << rail_manager_.getNumRails() << " rails";
+    if (remote_agent != localAgent) {
+        conn_for_handshake = connections_[remote_agent];
+    }
     return NIXL_SUCCESS;
 }
 

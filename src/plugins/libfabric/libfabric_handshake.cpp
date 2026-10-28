@@ -240,15 +240,30 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
                        << ", and no piggybacked_conn_info provided in handshake";
             return;
         } else {
+            // Creating the connection drains the buffered handshake. The reply is sent from the
+            // CM thread when this runs on the progress thread, for the reason given below.
+            std::shared_ptr<nixlLibfabricConnection> new_conn;
             nixl_status_t load_status =
-                this->loadRemoteConnInfo(peer_agent_name, piggybacked_conn_info);
+                createConnectionFromInfo(peer_agent_name, piggybacked_conn_info, new_conn);
             if (load_status != NIXL_SUCCESS) {
-                NIXL_ERROR << "Failed to loadRemoteConnInfo() received with handshake. "
+                NIXL_ERROR << "Failed to load the connection info received with a handshake. "
                            << "peer agent: " << peer_agent_name
                            << ", piggybacked_conn_info size: " << piggybacked_conn_info.size();
+                return;
             }
-            return; // loadRemoteConnInfo will take care of draining the
-                    // buffered handshake as part of connection creation.
+            if (!new_conn) {
+                return;
+            }
+            if (progress_thread_enabled_) {
+                queueHandshakeReply(new_conn);
+            } else {
+                nixl_status_t status = sendHandshakeTo(*new_conn);
+                if (status != NIXL_SUCCESS) {
+                    NIXL_WARN << "Handshake send to '" << peer_agent_name << "' failed with status "
+                              << status;
+                }
+            }
+            return;
         }
     } else {
         {
@@ -339,14 +354,14 @@ nixlLibfabricEngine::cmThread() {
             std::lock_guard<std::mutex> lock(connection_state_mutex_);
             auto it = connections_.find(conn->remoteAgent_);
             if (it == connections_.end() || it->second != conn) {
-                NIXL_DEBUG << "Skipping re-establishment reply to '" << conn->remoteAgent_
+                NIXL_DEBUG << "Skipping handshake to '" << conn->remoteAgent_
                            << "': connection no longer registered";
                 continue;
             }
         }
         nixl_status_t status = sendHandshakeTo(*conn);
         if (status != NIXL_SUCCESS) {
-            NIXL_WARN << "Replying to re-establishment handshake from '" << conn->remoteAgent_
+            NIXL_WARN << "Handshake to '" << conn->remoteAgent_
                       << "' failed (non-fatal; re-triggers on the peer's next re-add): status="
                       << status;
         }

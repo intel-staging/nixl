@@ -345,10 +345,17 @@ private:
     // Will load the peer's connection info from the handshake payload, if it's a new peer.
     void
     handleHandshake(const std::string &raw_payload);
-    // Queues a re-establishment reply for the CM thread; dropped once teardown started.
+    // Creates the connection for a peer from its serialized connection info, without sending a
+    // handshake. conn_for_handshake is the new connection to handshake, or null when the
+    // connection already existed or is the self-connection.
+    nixl_status_t
+    createConnectionFromInfo(const std::string &remote_agent,
+                             const std::string &remote_conn_info,
+                             std::shared_ptr<nixlLibfabricConnection> &conn_for_handshake);
+    // Queues a handshake for the CM thread to send; dropped once teardown started.
     void
     queueHandshakeReply(std::shared_ptr<nixlLibfabricConnection> conn);
-    // CM thread body: sends queued re-establishment replies off the progress thread.
+    // CM thread body: sends queued handshakes off the progress thread.
     void
     cmThread();
     // Marks a peer rejected for its protocol version; establishConnection() then fails fast.
