@@ -1514,17 +1514,23 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
                    << ", expected_completions: " << backend_handle->get_submitted_requests_count();
     }
 
-    // Progress rails to kick off transfers
+    // Progress rails to kick off transfers. A rail error is not returned; see checkXfer().
     if (!progress_thread_enabled_) {
         nixl_status_t progress_status = rail_manager_.progressActiveRails();
         if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
-            NIXL_ERROR << "Failed to progress rails in postXfer";
-            return progress_status;
+            NIXL_ERROR << "Failed to progress rails in postXfer (status " << progress_status
+                       << "); checking this transfer's own completions";
         }
     }
 
     // For very small transfers we can check for local completions immediately.
     if (backend_handle->is_completed()) {
+        const nixl_status_t err = backend_handle->get_error_status();
+        if (err != NIXL_SUCCESS) {
+            NIXL_ERROR << "Transfer completed with CQ error status " << err;
+            notifXferFailure(backend_handle, err);
+            return err;
+        }
         if (backend_handle->has_notif && backend_handle->operation_ == nixl_xfer_op_t::NIXL_READ) {
             nixl_status_t notif_status = notifSendPriv(remote_agent,
                                                        backend_handle->binary_notifs,
@@ -1547,10 +1553,13 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
     auto backend_handle = static_cast<nixlLibfabricBackendH *>(handle);
 
     if (!progress_thread_enabled_) {
+        // Not returned: a CQ error reaches the request it belongs to through that request's
+        // completion callback, and that may be another transfer's. This transfer is judged by its
+        // own handle below, which also tells the target of a failed notified WRITE.
         nixl_status_t progress_status = rail_manager_.progressActiveRails();
         if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
-            NIXL_ERROR << "Failed to progress rails in checkXfer";
-            return progress_status;
+            NIXL_ERROR << "Failed to progress rails in checkXfer (status " << progress_status
+                       << "); checking this transfer's own completions";
         }
     }
 
@@ -1755,12 +1764,13 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
             return NIXL_ERR_BACKEND;
         }
 
-        // Progress rail 0 to ensure the message is sent
+        // Progress the rail so the message is sent. An error here belongs to another request on
+        // the rail, not to this fragment, which was posted.
         if (!progress_thread_enabled_) {
             status = rail_manager_.getRail(rail_id).progressCompletionQueue();
             if (status != NIXL_SUCCESS && status != NIXL_IN_PROG) {
-                NIXL_ERROR << "Failed to progress rail 0 in notifSendPriv";
-                return status;
+                NIXL_ERROR << "Failed to progress rail " << rail_id << " in notifSendPriv (status "
+                           << status << "); the fragment itself was posted";
             }
         }
     }

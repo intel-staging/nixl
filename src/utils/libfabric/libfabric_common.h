@@ -58,6 +58,9 @@
 
 // Handshake timeout (seconds) for waiting on peer's inbound handshake
 #define NIXL_LIBFABRIC_HANDSHAKE_TIMEOUT_S 60
+// How long a post may keep returning -FI_EAGAIN before it is failed, so a transfer to a peer that
+// is gone ends with an error instead of hanging. Same bound as the handshake.
+#define NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S 60
 
 // Handshake SerDes tag names
 constexpr const char *NIXL_HANDSHAKE_TAG_VER = "ver";

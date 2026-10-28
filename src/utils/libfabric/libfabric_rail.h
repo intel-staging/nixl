@@ -24,6 +24,8 @@
 #include <limits>
 #include <string>
 #include <functional>
+#include <chrono>
+#include <optional>
 #include <mutex>
 #include <shared_mutex>
 #include <atomic>
@@ -661,9 +663,17 @@ private:
     using post_ring_t = MpscRing<nixlLibfabricPostRequest>;
     post_ring_t post_ring_;
 
+    // A post drainPostQueue() could not make within POST_EAGAIN_RETRIES attempts, kept for the
+    // next drain. Touched only by the progress thread.
+    std::optional<nixlLibfabricPostRequest> pending_post_;
+    // When pending_post_ was first parked; past NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S it is failed.
+    std::chrono::steady_clock::time_point pending_since_;
+
     // the post/poll interleave ratio constants
     static constexpr size_t POST_MAX_BATCH_SIZE = 256;
     static constexpr size_t POST_POLL_INTERLEAVE_RATIO = 32;
+    // -FI_EAGAIN retries of one post, each after reaping this rail's CQ, before it is parked
+    static constexpr size_t POST_EAGAIN_RETRIES = 16;
 
     // Whether a progress thread is handling CQ draining
     bool progress_thread_enabled_ = false;
