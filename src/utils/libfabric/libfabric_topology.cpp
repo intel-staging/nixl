@@ -23,6 +23,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <tuple>
 #include <set>
 #include <cmath>
 
@@ -1435,12 +1436,12 @@ nixlLibfabricTopology::groupNicsWithAccel(const std::vector<NicInfo> &discovered
         const std::vector<AccelInfo> &accel = node_accel[ancestor];
 
         if (num_groups > 0 && !accel.empty()) {
-            // Sort NICs by bus ID for consistent assignment
+            // Sort NICs by full BDF for consistent assignment. The order must be total: the input
+            // comes in unordered_map order and std::sort is not stable, so comparing only bus and
+            // device leaves the two ports of a dual-port NIC in arbitrary order.
             std::sort(nics.begin(), nics.end(), [](const NicInfo &a, const NicInfo &b) {
-                if (a.bus_id != b.bus_id) {
-                    return a.bus_id < b.bus_id;
-                }
-                return a.device_id < b.device_id;
+                return std::tie(a.domain_id, a.bus_id, a.device_id, a.function_id) <
+                    std::tie(b.domain_id, b.bus_id, b.device_id, b.function_id);
             });
 
             // Split NICs among accelerators
