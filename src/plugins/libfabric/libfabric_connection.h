@@ -50,6 +50,10 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
     std::vector<size_t> peer_rail_for_local_rail_;
     // Local/peer rail pairs known to be on different segments; see nixlLibfabricRailUnreachable
     nixlLibfabricRailUnreachable rail_unreachable_;
+    // Local rail control messages (handshakes, notifications) leave from. They must arrive on the
+    // peer's rail 0, where the receive callbacks are, so this is the local rail paired with peer
+    // rail 0; local rail 0 may be on another segment.
+    size_t control_rail_ = 0;
     std::atomic<ConnectionState> overall_state_; // Current connection state
 
     // Set once the peer holds our endpoints in its AV, so it can attribute our traffic.

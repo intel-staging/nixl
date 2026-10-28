@@ -161,8 +161,8 @@ Notes specific to verbs:
   alongside them: about 4 us later on a 400G RoCE link. With the progress thread it goes out as
   soon as the progress thread reaps the last completion; without one, from the `postXfer()` or
   `checkXfer()` call that sees the transfer complete, as a READ's notification does. A WRITE that
-  fails sends the target a transfer-error message and then the notification, which the target
-  releases with a warning that the data is incomplete, as on other providers.
+  fails sends nothing: the target holds no state for it, and a failed transfer's notification is
+  not delivered on any provider.
   - The notification travels on rail 0, possibly through a different NIC than the data. The
     initiator's completion of a write means the target NIC has acknowledged it, and the target
     relies on that NIC having written the data before it acknowledged, as the UCX backend does
@@ -192,6 +192,9 @@ fall back to index order. Nothing new goes on the wire.
 - A peer rail counts as unreachable only on a segmented fabric: when the local rail shares a subnet
   with some peer rail and this one is not on it. A local rail with no peer rail on its subnet is
   assumed to be routed and may use any of them.
+- Control traffic (handshakes, notifications, transfer-error messages) must arrive on the peer's
+  rail 0, where the receive callbacks are, so it is sent from the local rail paired with peer
+  rail 0 (`nixlLibfabricConnection::control_rail_`).
 - A pairing that differs from index order is logged at INFO, e.g.
   `Rail pairing differs from index order (2/2 matched by fabric): 0->1 1->0`.
 

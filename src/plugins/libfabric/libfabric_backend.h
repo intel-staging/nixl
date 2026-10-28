@@ -338,7 +338,8 @@ private:
     handleXferError(uint16_t notif_xfer_id, uint32_t sender_peer_idx, uint32_t final_completions);
 
     // Tell the target once that this transfer failed, so it stops waiting for writes that never
-    // went out. With notify-after-completion, also sends the notification it was still owed.
+    // went out. With notify-after-completion the target holds nothing for the transfer, so
+    // nothing is sent.
     // Called only from checkXfer: an asynchronous post failure must not turn postXfer into an
     // error.
     void
