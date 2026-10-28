@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <filesystem>
+#include <list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -128,6 +129,10 @@ protected:
             params["num_workers"] = std::to_string(getNumWorkers());
             params["num_threads"] = std::to_string(getNumThreads());
             params["split_batch_size"] = "32";
+        } else if (getBackendName() == "LIBFABRIC") {
+            // Posting thread pool parameters; num_threads == 0 keeps serial posting
+            params["num_threads"] = std::to_string(getNumThreads());
+            params["split_batch_size"] = "32";
         }
 
         params["engine_config"] = GetParam().engineConfig;
@@ -140,6 +145,25 @@ protected:
         agents.emplace_back(std::make_unique<nixlAgent>(
             getAgentName(agent_num), getConfig(getPort(agent_num), capture_telemetry)));
         nixlBackendH *backend_handle = nullptr;
+
+        // The libfabric plugin warns about the host's own PCIe/NUMA asymmetry and about NICs whose
+        // provider reports no link speed (verbs) during topology discovery, and falls back to the
+        // all-rails DRAM policy when it cannot derive a per-node limit; all depend on the test
+        // host, not on the test.
+        std::list<LogIgnoreGuard> topology_warnings;
+        if (getBackendName() == "LIBFABRIC") {
+            topology_warnings.emplace_back("Non-uniform NUMA node .* PCIe capacity");
+            topology_warnings.emplace_back("NUMA PCIe capacity is non-uniform across all nodes");
+            topology_warnings.emplace_back("Non-uniform NIC .* speed");
+            topology_warnings.emplace_back("NIC bandwidth is non-uniform across all PCIe devices");
+            topology_warnings.emplace_back(
+                "NIC upstream link bandwidth is non-uniform across all PCIe devices");
+            topology_warnings.emplace_back("Could not get NIC link speed for device");
+            topology_warnings.emplace_back("Could not deduce average .* bandwidth");
+            topology_warnings.emplace_back(
+                "Using default \\(all\\) rail selection policy for DRAM memory type");
+        }
+
         nixl_status_t status =
             agents.back()->createBackend(getBackendName(), getBackendParams(), backend_handle);
         ASSERT_EQ(status, NIXL_SUCCESS);
@@ -706,6 +730,13 @@ TEST_P(TestTransferTelemetry, GetXferTelemetryDisabled) {
 
 NIXL_INSTANTIATE_TEST(ucx, TestTransfer, "UCX", true, 2, 0, "");
 NIXL_INSTANTIATE_TEST(ucx_no_pt, TestTransfer, "UCX", false, 2, 0, "");
+#ifdef HAVE_LIBFABRIC
+// The plugin falls back to tcp/sockets without an RDMA fabric, so this runs wherever it is built.
+// On verbs it needs a raised locked-memory limit (see the plugin README). Only the progress-thread
+// configuration: these tests drive both agents from one thread, and a provider that connects on
+// demand (tcp, verbs;ofi_rxm) needs the passive agent progressed to accept.
+NIXL_INSTANTIATE_TEST(libfabric, TestTransfer, "LIBFABRIC", true, 2, 0, "");
+#endif
 NIXL_INSTANTIATE_TEST(ucx_threadpool, TestTransfer, "UCX", true, 6, 4, "");
 NIXL_INSTANTIATE_TEST(ucx_threadpool_no_pt, TestTransfer, "UCX", false, 6, 4, "");
 
