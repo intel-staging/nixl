@@ -96,6 +96,17 @@ if get_option('buildtype') != 'release'
 
     test('libfabric_pending_notif_rail_test', libfabric_pending_notif_rail_test_bin)
 
+    libfabric_post_eagain_test_bin = executable('libfabric_post_eagain_test',
+               'libfabric_post_eagain_test.cpp',
+               dependencies: libfabric_utils_dep,
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               link_with: libfabric_utils_lib,
+               cpp_args: libfabric_test_cpp_args,
+               link_args: src_addr_resolution_test_link_args,
+               install: true)
+
+    test('libfabric_post_eagain_test', libfabric_post_eagain_test_bin)
+
     # Alignment arithmetic of the CUDA dmabuf export. The helper under test is
     # header-inline and free of CUDA types, so the test runs on any host.
     libfabric_dmabuf_test_bin = executable('libfabric_dmabuf_test',

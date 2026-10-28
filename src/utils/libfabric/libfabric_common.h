@@ -59,6 +59,10 @@
 
 // Handshake timeout (seconds) for waiting on peer's inbound handshake
 #define NIXL_LIBFABRIC_HANDSHAKE_TIMEOUT_S 60
+// Default for post_eagain_timeout, the longest a destination may keep refusing posts with
+// -FI_EAGAIN before they fail: 0, retry until the provider takes them. -FI_EAGAIN cannot tell a
+// dead peer from a healthy one under pressure, so failing on it is the application's choice.
+#define NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S 0
 
 // Handshake SerDes tag names
 constexpr const char *NIXL_HANDSHAKE_TAG_VER = "ver";
