@@ -365,6 +365,7 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &nic_device
     }
     // Pre-allocate to ensure contiguous memory allocation
     rails_.reserve(num_rails_);
+    control_rail_used_ = std::make_unique<std::atomic<bool>[]>(num_rails_);
 
     // Build NIC to rail index mapping for O(1) lookup
     nic_device_to_rail_map.clear();
@@ -1147,7 +1148,6 @@ nixlLibfabricRailManager::postControlMessage(
     nixlLibfabricReq *req,
     fi_addr_t dest_addr,
     std::function<void(nixl_status_t)> completion_callback) {
-    // Validation - use rail 0 for notifications
     if (rails_.empty()) {
         NIXL_ERROR << "No rails available";
         return NIXL_ERR_INVALID_PARAM;
@@ -1173,7 +1173,17 @@ nixlLibfabricRailManager::postControlMessage(
         NIXL_ERROR << "Unknown message type";
         return NIXL_ERR_INVALID_PARAM;
     }
-    size_t rail_id = 0; // Use rail 0 for notifications
+    // The rail the request was allocated from: the buffer and its MR belong to it
+    const size_t rail_id = req->rail_id;
+    if (rail_id >= rails_.size()) {
+        NIXL_ERROR << "Control request carries out-of-range rail id " << rail_id;
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    // Before posting, so progressActiveRails() reaps the send completion even if nothing is
+    // registered on this rail
+    if (control_rail_used_ && !control_rail_used_[rail_id].load(std::memory_order_relaxed)) {
+        control_rail_used_[rail_id].store(true, std::memory_order_release);
+    }
     uint32_t xfer_id = req->xfer_id;
     // For control messages, use SEQ_ID 0 since they don't need sequence tracking
     // TODO: Add sequencing for connection establishment workflow.
@@ -1188,7 +1198,6 @@ nixlLibfabricRailManager::postControlMessage(
     NIXL_DEBUG << "Sending control message type " << msg_type_value << " XFER_ID=" << xfer_id
                << " imm_data=" << imm_data << " dest_addr=" << dest_addr << " on rail " << rail_id;
 
-    // Use rail 0 for notifications
     nixl_status_t status = rails_[rail_id]->postSend(imm_data, dest_addr, req);
 
     if (status != NIXL_SUCCESS) {
@@ -1218,6 +1227,16 @@ nixlLibfabricRailManager::progressActiveRails() {
         rails_to_process.insert(0);
         for (const auto &[rail_id, refcount] : active_rails_) {
             rails_to_process.insert(rail_id);
+        }
+    }
+
+    // Rails control messages were sent from, whose send completions would otherwise go unread when
+    // nothing is registered on them
+    if (control_rail_used_) {
+        for (size_t rail_id = 0; rail_id < rails_.size(); ++rail_id) {
+            if (control_rail_used_[rail_id].load(std::memory_order_acquire)) {
+                rails_to_process.insert(rail_id);
+            }
         }
     }
 

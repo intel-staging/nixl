@@ -499,6 +499,11 @@ private:
     // rail selection policy for DRAM memory type
     std::unique_ptr<nixlLibfabricRailSelectionPolicy> dram_rail_selection_policy_;
 
+    // Rails a control message has been sent from, sized in createRails(). The send completions land
+    // on the sending rail, which may hold no registration, so progressActiveRails() reads these
+    // too.
+    std::unique_ptr<std::atomic<bool>[]> control_rail_used_;
+
     // get rail count limit for DRAM memory type, either computed or from user
     bool
     getDramRailLimit(const nixl_b_params_t &custom_params,

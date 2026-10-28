@@ -665,6 +665,16 @@ nixlLibfabricEngine::createAgentConnection(
     // this picks the reachable one
     conn->peer_rail_for_local_rail_ =
         rail_manager_.computeRailPeering(data_rail_endpoints, conn->rail_unreachable_);
+    for (size_t rail_id = 0; rail_id < conn->peer_rail_for_local_rail_.size(); ++rail_id) {
+        if (conn->peer_rail_for_local_rail_[rail_id] == 0) {
+            conn->control_rail_ = rail_id;
+            break;
+        }
+    }
+    if (conn->control_rail_ != 0) {
+        NIXL_INFO << "Control traffic to " << agent_name << " will use local rail "
+                  << conn->control_rail_ << ", the rail paired with its rail 0";
+    }
 
     for (size_t i = 0; i < agent_names_.size(); ++i) {
         NIXL_DEBUG << "Index " << i << ": " << agent_names_[i];
@@ -1780,8 +1790,8 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
                 total_message_length, expected_completions, metadata.agent_name_length);
         }
 
-        // Allocate control request for this notification fragment from rail 0
-        size_t rail_id = 0;
+        // Allocate the request on the rail paired with the peer's rail 0
+        const size_t rail_id = connection->control_rail_;
         size_t max_size = BinaryNotification::MAX_FRAGMENT_SIZE;
         nixlLibfabricReq *control_request =
             rail_manager_.getRail(rail_id).allocateControlRequest(max_size, notif_xfer_id);
@@ -1842,58 +1852,84 @@ nixlLibfabricEngine::notifXferErrorPriv(const std::string &remote_agent,
         connection = it->second;
     }
 
-    const size_t rail_id = 0; // Control messages always travel on rail 0
-    nixlLibfabricReq *control_request = rail_manager_.getRail(rail_id).allocateControlRequest(
-        sizeof(XferErrorPayload), notif_xfer_id);
-    if (!control_request) {
-        NIXL_ERROR << "Failed to allocate control request for transfer error, XFER_ID="
-                   << notif_xfer_id;
-        return NIXL_ERR_BACKEND;
-    }
+    // Sent from the rail paired with the peer's rail 0; see nixlLibfabricConnection::control_rail_
+    const size_t rail_id = connection->control_rail_;
+    nixlLibfabricRail &rail = rail_manager_.getRail(rail_id);
 
-    XferErrorPayload payload{};
-    payload.final_completions = final_completions;
-    memcpy(control_request->buffer, &payload, sizeof(payload));
-    control_request->buffer_size = sizeof(payload);
+    // Resent until its own send completes successfully. When the failed transfer used this rail,
+    // the provider's connection may be broken (an RC QP in the error state under verbs;ofi_rxm),
+    // and this message is flushed with FI_ECANCELED along with everything else; the provider
+    // reconnects on the next send. A peer that is gone fails until the -FI_EAGAIN deadline. The
+    // completion can fire after this function returns, so it only records into a shared flag.
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S);
+    constexpr auto k_resend_backoff = std::chrono::milliseconds(100);
 
-    // A successful postControlMessage() only means fi_senddata() accepted the message, so watch
-    // the send completion as well: if it lands in the CQ as an error the target is left waiting
-    // and nothing else reports it. This runs later on the progress thread, by which time the
-    // caller's backend handle may already have been released, so capture values only and never
-    // touch the handle.
-    auto send_completion = [agent = remote_agent,
-                            xfer_id = notif_xfer_id](nixl_status_t send_status) {
-        if (send_status == NIXL_SUCCESS) {
-            return;
+    enum : int { k_send_pending = 0, k_send_ok = 1, k_send_failed = 2 };
+
+    for (int attempt = 1;; ++attempt) {
+        nixlLibfabricReq *control_request =
+            rail.allocateControlRequest(sizeof(XferErrorPayload), notif_xfer_id);
+        if (!control_request) {
+            NIXL_ERROR << "Failed to allocate control request for transfer error, XFER_ID="
+                       << notif_xfer_id;
+            return NIXL_ERR_BACKEND;
         }
-        NIXL_ERROR << "Transfer-error message to " << agent << " for XFER_ID=" << xfer_id
-                   << " failed in its send CQ with status " << send_status << "; that agent will "
-                   << "keep waiting for writes that never arrive and will not see this transfer's "
-                   << "notification";
-    };
 
-    nixl_status_t status =
-        rail_manager_.postControlMessage(nixlLibfabricRailManager::ControlMessageType::XFER_ERROR,
-                                         control_request,
-                                         connection->rail_remote_addr_list_[rail_id][0],
-                                         std::move(send_completion));
-    if (status != NIXL_SUCCESS) {
-        NIXL_ERROR << "Failed to send transfer-error message for XFER_ID=" << notif_xfer_id;
-        return NIXL_ERR_BACKEND;
-    }
+        XferErrorPayload payload{};
+        payload.final_completions = final_completions;
+        memcpy(control_request->buffer, &payload, sizeof(payload));
+        control_request->buffer_size = sizeof(payload);
 
-    // Without a progress thread, progress rail to ensure the message is sent
-    if (!progress_thread_enabled_) {
-        status = rail_manager_.getRail(rail_id).progressCompletionQueue();
-        if (status != NIXL_SUCCESS && status != NIXL_IN_PROG) {
-            NIXL_ERROR << "Failed to progress rail 0 in notifXferErrorPriv";
-            return status;
+        auto outcome = std::make_shared<std::atomic<int>>(k_send_pending);
+        auto send_completion = [outcome](nixl_status_t send_status) {
+            outcome->store(send_status == NIXL_SUCCESS ? k_send_ok : k_send_failed,
+                           std::memory_order_release);
+        };
+
+        nixl_status_t status = rail_manager_.postControlMessage(
+            nixlLibfabricRailManager::ControlMessageType::XFER_ERROR,
+            control_request,
+            connection->rail_remote_addr_list_[rail_id][0],
+            std::move(send_completion));
+        if (status == NIXL_SUCCESS) {
+            while (outcome->load(std::memory_order_acquire) == k_send_pending &&
+                   std::chrono::steady_clock::now() < deadline) {
+                if (progress_thread_enabled_) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                } else {
+                    // An error here may belong to another request on the rail; this message is
+                    // judged by its own completion
+                    rail.progressCompletionQueue();
+                }
+            }
+            if (outcome->load(std::memory_order_acquire) == k_send_ok) {
+                NIXL_DEBUG << "Sent transfer-error message to " << remote_agent
+                           << " XFER_ID=" << notif_xfer_id
+                           << " final_completions=" << final_completions << " on attempt "
+                           << attempt;
+                if (attempt > 1) {
+                    NIXL_INFO << "Transfer-error message to " << remote_agent
+                              << " for XFER_ID=" << notif_xfer_id << " got through on attempt "
+                              << attempt;
+                }
+                return NIXL_SUCCESS;
+            }
         }
-    }
 
-    NIXL_DEBUG << "Sent transfer-error message to " << remote_agent << " XFER_ID=" << notif_xfer_id
-               << " final_completions=" << final_completions;
-    return NIXL_SUCCESS;
+        if (std::chrono::steady_clock::now() + k_resend_backoff >= deadline) {
+            NIXL_ERROR << "Transfer-error message to " << remote_agent
+                       << " for XFER_ID=" << notif_xfer_id << " not delivered after " << attempt
+                       << " attempt(s) in " << NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S << "s";
+            return NIXL_ERR_BACKEND;
+        }
+        NIXL_WARN << "Transfer-error message to " << remote_agent
+                  << " for XFER_ID=" << notif_xfer_id << " failed on rail " << rail_id
+                  << " (attempt " << attempt
+                  << (status == NIXL_SUCCESS ? ", in its send CQ" : ", at post")
+                  << "); resending once the connection is re-established";
+        std::this_thread::sleep_for(k_resend_backoff);
+    }
 }
 
 void
@@ -2053,12 +2089,6 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif,
                        << " expected_msg_fragments=" << notif_seq_len;
         }
 
-        // Initialize fragment vector on first fragment (check if vector is empty)
-        if (it->second.message_fragments.empty()) {
-            it->second.message_fragments.resize(notif_seq_len);
-            it->second.expected_msg_fragments = notif_seq_len;
-        }
-
         // Validate fragment index
         if (notif_seq_id >= notif_seq_len) {
             NIXL_ERROR << "Invalid fragment sequence: notif_seq_id=" << notif_seq_id
@@ -2066,11 +2096,23 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif,
             return;
         }
 
-        // Check for duplicate fragment
-        if (!it->second.message_fragments[notif_seq_id].empty()) {
-            NIXL_WARN << "Duplicate fragment received: sender_peer_idx=" << sender_peer_idx
-                      << " notif_xfer_id=" << notif_xfer_id << " notif_seq_id=" << notif_seq_id;
-            return;
+        // Each fragment is sent once over a reliable connection, so an entry with another fragment
+        // count, or with this slot filled, was left by an earlier use of this XFER_ID (a failed
+        // transfer's late notification): replace its notification. Its write count stays, since
+        // the failed transfer's writes had all arrived before it was dropped.
+        if (it->second.message_fragments.empty()) {
+            it->second.message_fragments.resize(notif_seq_len);
+            it->second.expected_msg_fragments = notif_seq_len;
+        } else if (it->second.message_fragments.size() != notif_seq_len ||
+                   !it->second.message_fragments[notif_seq_id].empty()) {
+            NIXL_WARN << "Replacing a stale notification left under sender_peer_idx="
+                      << sender_peer_idx << " notif_xfer_id=" << notif_xfer_id
+                      << " by an earlier use of that XFER_ID";
+            it->second.message_fragments.assign(notif_seq_len, std::string());
+            it->second.expected_msg_fragments = notif_seq_len;
+            it->second.received_msg_fragments = 0;
+            it->second.expected_completions = INT_MAX;
+            it->second.xfer_failed = false;
         }
 
         // Store payload chunk (combined agent_name + message chunk)
@@ -2197,19 +2239,26 @@ nixlLibfabricEngine::checkPendingNotification(uint64_t key) {
             (it->second.received_msg_fragments >= it->second.expected_msg_fragments);
         bool writes_complete = (it->second.received_completions >= it->second.expected_completions);
 
+        // A failed transfer's notification is dropped, not delivered: notif_list carries no status,
+        // so delivering it would report data that is not in place (UCX does not send it either).
+        // Dropped once all the writes that will arrive have, without waiting for the fragments,
+        // which may have been flushed with the broken connection. Fragments that arrive later
+        // recreate the entry, which is never delivered; the next use of the XFER_ID replaces it.
+        if (it->second.xfer_failed && writes_complete) {
+            NIXL_ERROR << "Dropping the notification for notif_xfer_id=" << it->second.notif_xfer_id
+                       << ": its transfer failed on the initiator after "
+                       << it->second.received_completions
+                       << " writes arrived, so the data is incomplete"
+                       << (fragments_complete ? "" : " (its notification never arrived)");
+            pending_notifications_.erase(it);
+            return;
+        }
+
         if (fragments_complete && writes_complete) {
             NIXL_TRACE << "Notification complete: fragments=" << it->second.received_msg_fragments
                        << "/" << it->second.expected_msg_fragments
                        << " writes=" << it->second.received_completions << "/"
                        << it->second.expected_completions;
-
-            if (it->second.xfer_failed) {
-                NIXL_WARN << "Releasing the notification for notif_xfer_id="
-                          << it->second.notif_xfer_id
-                          << " whose transfer failed on the initiator; only "
-                          << it->second.received_completions
-                          << " writes arrived, so the data for this transfer is incomplete";
-            }
 
             // Reassemble combined payload from fragments
             std::string combined_payload;

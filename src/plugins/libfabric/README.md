@@ -183,6 +183,9 @@ fall back to index order. Nothing new goes on the wire.
 - A peer rail counts as unreachable only on a segmented fabric: when the local rail shares a subnet
   with some peer rail and this one is not on it. A local rail with no peer rail on its subnet is
   assumed to be routed and may use any of them.
+- Control traffic (handshakes, notifications, transfer-error messages) must arrive on the peer's
+  rail 0, where the receive callbacks are, so it is sent from the local rail paired with peer
+  rail 0 (`nixlLibfabricConnection::control_rail_`).
 - A pairing that differs from index order is logged at INFO, e.g.
   `Rail pairing differs from index order (2/2 matched by fabric): 0->1 1->0`.
 

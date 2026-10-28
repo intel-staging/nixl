@@ -85,7 +85,8 @@ nixlLibfabricEngine::sendHandshakeTo(const nixlLibfabricConnection &conn) const 
         return NIXL_ERR_BACKEND;
     }
 
-    constexpr size_t kRailId = 0;
+    // Sent from the rail paired with the peer's rail 0; see nixlLibfabricConnection::control_rail_
+    const size_t kRailId = conn.control_rail_;
     auto rail_it = conn.rail_remote_addr_list_.find(kRailId);
     if (rail_it == conn.rail_remote_addr_list_.end() || rail_it->second.empty()) {
         NIXL_WARN << "No remote rail addresses on record for '" << conn.remoteAgent_
@@ -288,7 +289,7 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
             if (peer_agent_name == localAgent) {
                 return; // we never handshake ourselves (mirrors loadRemoteConnInfo)
             }
-            auto rail_it = conn->rail_remote_addr_list_.find(0);
+            auto rail_it = conn->rail_remote_addr_list_.find(conn->control_rail_);
             if (rail_it == conn->rail_remote_addr_list_.end() || rail_it->second.empty()) {
                 NIXL_WARN << "Cannot reply to re-establishment handshake from '" << peer_agent_name
                           << "': no remote rail addresses on record";
