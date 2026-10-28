@@ -40,6 +40,14 @@ static constexpr size_t NIXL_LF_NO_PEER_RAIL = static_cast<size_t>(-1);
  */
 using nixlLibfabricRailUnreachable = std::vector<std::vector<bool>>;
 
+/** False only where @p unreachable marks peer rail @p peer unreachable from local rail
+ *  @p rail_id. */
+inline bool
+railReaches(const nixlLibfabricRailUnreachable &unreachable, size_t rail_id, size_t peer) {
+    return rail_id >= unreachable.size() || peer >= unreachable[rail_id].size() ||
+        !unreachable[rail_id][peer];
+}
+
 // Forward declarations
 class nixlLibfabricTopology;
 class nixlLibfabricRailManager;
@@ -142,6 +150,29 @@ public:
     getNumRails() const {
         return rails_.size();
     }
+
+    /** Peer rail for each entry of @p selected_rails, for the rails whose fabric-matched peer rail
+     *  did not register the buffer. See prepareAndSubmitTransfer() for the rule.
+     * @param remote_selected_endpoints Peer rails that registered the buffer, ascending
+     * @param peer_rail_for_local_rail computeRailPeering() result
+     * @param unreachable computeRailPeering() reachability; unreachable peer rails are not assigned
+     * @return Peer rail per entry of @p selected_rails; NIXL_LF_NO_PEER_RAIL for a rail that
+     *         reaches none of @p remote_selected_endpoints */
+    static std::vector<size_t>
+    assignFallbackPeerRails(const std::vector<size_t> &selected_rails,
+                            const std::vector<size_t> &remote_selected_endpoints,
+                            const std::vector<size_t> &peer_rail_for_local_rail,
+                            const nixlLibfabricRailUnreachable &unreachable = {});
+
+    /** The rails of @p selected_rails that reach at least one of @p remote_selected_endpoints.
+     *  The rail choice and the caller's FI_MORE flush precompute must agree, so both call this.
+     * @param storage Filled only when some rail is dropped
+     * @return @p selected_rails itself when every rail is usable, else @p storage */
+    static const std::vector<size_t> &
+    usableRails(const std::vector<size_t> &selected_rails,
+                const std::vector<size_t> &remote_selected_endpoints,
+                const nixlLibfabricRailUnreachable &unreachable,
+                std::vector<size_t> &storage);
 
     /** Round-robin index of a descriptor into a selection array of `count` entries.
      * batch_write groups NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE consecutive descriptors per entry.
@@ -249,6 +280,8 @@ public:
      * @param local_mrs Local memory registrations
      * @param remote_keys Remote access keys
      * @param remote_selected_endpoints Selected remote endpoints, where remote keys are registered
+     * @param peer_rail_for_local_rail computeRailPeering() pairing for this peer
+     * @param unreachable computeRailPeering() reachability for this peer
      * @param dest_addrs Destination addresses for each rail
      * @param xfer_id Transfer ID for tracking
      * @param completion_callback Callback for completion notification
@@ -273,6 +306,8 @@ public:
                              const std::vector<struct fid_mr *> &local_mrs,
                              const std::vector<uint64_t> &remote_keys,
                              const std::vector<size_t> &remote_selected_endpoints,
+                             const std::vector<size_t> &peer_rail_for_local_rail,
+                             const nixlLibfabricRailUnreachable &unreachable,
                              const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
                              uint16_t xfer_id,
                              std::function<void(nixl_status_t)> completion_callback,

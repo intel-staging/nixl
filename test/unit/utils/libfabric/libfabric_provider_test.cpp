@@ -19,10 +19,11 @@
 /*
  * Tests for libfabric provider handling: baseProviderName(), the provider table, selectProvider()
  * and selectNetworkDevices(), using synthetic prov_name -> domain maps and synthetic fi_getinfo()
- * lists, and reading fabric ids. The verbs-specific tests are in libfabric_verbs_test.cpp.
+ * lists, and rail pairing by fabric id. The verbs-specific tests are in libfabric_verbs_test.cpp.
  */
 
 #include "libfabric/libfabric_common.h"
+#include "libfabric/libfabric_rail_manager.h"
 #include "common/nixl_log.h"
 
 #include <arpa/inet.h>
@@ -377,6 +378,87 @@ testFabricId() {
           "an invalid id never matches");
 }
 
+void
+testFallbackPeerRails() {
+    NIXL_INFO << "Testing fallback peer rail assignment";
+    using V = std::vector<size_t>;
+    const size_t none = NIXL_LF_NO_PEER_RAIL;
+    const auto assign = [](const V &selected,
+                           const V &registered,
+                           const V &peering,
+                           const nixlLibfabricRailUnreachable &unreachable = {}) {
+        return nixlLibfabricRailManager::assignFallbackPeerRails(
+            selected, registered, peering, unreachable);
+    };
+
+    // Without fabric ids a registered same-id peer rail wins (a rail-optimised fabric needs it)
+    check(assign({2, 3}, {0, 1, 2, 3}, {}) == V({2, 3}),
+          "without fabric ids, a registered same-id peer rail is preferred");
+
+    // Policy order does not change the pairing, and it stays one-to-one
+    check(assign({2, 0}, {0, 1}, {}) == V({1, 0}),
+          "without a same-id peer rail, rails pair by rank in rail-id order, one-to-one");
+    check(assign({1, 0}, {0, 1}, {}) == V({1, 0}), "policy order does not change the pairing");
+
+    // A fabric match claims its peer rail; an unmatched rail takes another
+    check(assign({0, 1}, {0, 1}, {1, none}) == V({1, 0}),
+          "an unmatched rail takes an unclaimed peer rail, not one a fabric match holds");
+
+    // Matched peer rail unregistered: the same-id rail is on another segment, so it is skipped
+    check(assign({0, 1}, {0, 2}, {2, 3}) == V({2, 0}),
+          "a rail whose matched peer is unregistered skips the same-id rail");
+
+    // More local rails than registered peer rails: sharing only once all are claimed
+    check(assign({0, 1, 2}, {0}, {}) == V({0, 0, 0}),
+          "with one registered peer rail, every local rail shares it");
+    check(assign({0, 1, 2, 3}, {0, 1}, {}) == V({0, 1, 0, 1}),
+          "sharing only starts once every registered peer rail is claimed");
+
+    check(assign({0, 1}, {}, {}) == V({none, none}),
+          "no registered peer rail leaves the rails unassigned rather than indexing an empty list");
+
+    // Rails cabled across, buffer on peer rail 0 only: local rail 0 cannot reach it
+    const nixlLibfabricRailUnreachable crossed = {{true, false}, {false, true}};
+    check(assign({0, 1}, {0}, {1, 0}, crossed) == V({none, 0}),
+          "a rail that reaches no registered peer rail is left unassigned, not given another's");
+    check(assign({0, 1}, {0}, {1, 0}) == V({0, 0}),
+          "without reachability information, sharing is unchanged");
+
+    // One subnet, buffers on disjoint rail sets: every pair is reachable
+    const nixlLibfabricRailUnreachable flat(4, std::vector<bool>(4, false));
+    check(assign({0, 1}, {2, 3}, {0, 1, 2, 3}, flat) == V({2, 3}),
+          "on a single segment, an unregistered matched peer rail does not strand the rail");
+
+    // Sharing skips unreachable peer rails: local rail 2 reaches only peer rail 1
+    const nixlLibfabricRailUnreachable partial = {{false, false}, {false, false}, {true, false}};
+    check(assign({0, 1, 2}, {0, 1}, {}, partial) == V({0, 1, 1}),
+          "sharing picks among the peer rails a rail can reach");
+
+    // Both local rails on segment A, peer rail 1 on B: local rail 1 shares peer rail 0
+    const nixlLibfabricRailUnreachable one_segment = {{false, true}, {false, true}};
+    check(assign({0, 1}, {0, 1}, {0, none}, one_segment) == V({0, 0}),
+          "same-id pairing skips a peer rail the rail is known not to reach");
+
+    std::vector<size_t> storage;
+    const auto usable = [&](const V &selected,
+                            const V &registered,
+                            const nixlLibfabricRailUnreachable &unreachable) {
+        return nixlLibfabricRailManager::usableRails(selected, registered, unreachable, storage);
+    };
+    check(usable({0, 1}, {0}, crossed) == V({1}),
+          "usableRails drops a rail that reaches no registered peer rail");
+    check(usable({1, 0}, {0, 1}, crossed) == V({1, 0}),
+          "usableRails keeps every rail, in policy order, when each reaches one");
+    check(usable({0}, {0}, crossed).empty(), "usableRails is empty when no rail is usable");
+    check(usable({0, 1}, {0}, {}) == V({0, 1}),
+          "usableRails keeps every rail without reachability information");
+    const V selected = {0, 1};
+    check(&nixlLibfabricRailManager::usableRails(selected, {0, 1}, crossed, storage) == &selected,
+          "usableRails returns the caller's list, not a copy, when nothing is dropped");
+    check(&nixlLibfabricRailManager::usableRails(selected, {0}, {}, storage) == &selected,
+          "usableRails returns the caller's list at once when no pair is marked unreachable");
+}
+
 int
 main() {
     NIXL_INFO << "=== Testing Libfabric provider selection ===";
@@ -386,6 +468,7 @@ main() {
     testProviderSelection();
     testDeviceMetadataPerProvider();
     testFabricId();
+    testFallbackPeerRails();
 
     if (failures != 0) {
         NIXL_ERROR << "=== " << failures << " check(s) FAILED ===";
