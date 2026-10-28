@@ -17,14 +17,16 @@
  */
 
 /*
- * Tests for libfabric provider handling: baseProviderName(), the provider table and
- * selectProvider(), using synthetic prov_name -> domain maps.
+ * Tests for libfabric provider handling: baseProviderName(), the provider table,
+ * selectProvider() and selectNetworkDevices(), using synthetic prov_name -> domain maps and
+ * synthetic fi_getinfo() lists.
  */
 
 #include "libfabric/libfabric_common.h"
 #include "common/nixl_log.h"
 
 #include <algorithm>
+#include <deque>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -195,6 +197,93 @@ testProviderSelection() {
           "a host offering only an unlisted provider selects nothing rather than mis-claiming it");
 }
 
+/****************************************
+ * 4. Per-provider NIC metadata
+ *****************************************/
+
+/** @brief A synthetic fi_getinfo() list; entries stay valid while the list lives. */
+class FakeInfoList {
+public:
+    /** @brief Appends an entry for a NIC on PCI bus @p bus (0:bus:00.0); -1 reports no NIC. */
+    void
+    add(const std::string &prov_name, const std::string &domain, int bus = -1, size_t speed = 0) {
+        Entry &e = entries_.emplace_back();
+        e.prov_name = prov_name;
+        e.domain = domain;
+        e.fabric_attr.prov_name = e.prov_name.data();
+        e.domain_attr.name = e.domain.data();
+        e.info.fabric_attr = &e.fabric_attr;
+        e.info.domain_attr = &e.domain_attr;
+        e.info.ep_attr = &e.ep_attr;
+        if (bus >= 0) {
+            e.bus_attr.bus_type = FI_BUS_PCI;
+            e.bus_attr.attr.pci.bus_id = static_cast<uint8_t>(bus);
+            e.link_attr.speed = speed;
+            e.nic.bus_attr = &e.bus_attr;
+            e.nic.link_attr = &e.link_attr;
+            e.info.nic = &e.nic;
+        }
+        if (entries_.size() > 1) {
+            entries_[entries_.size() - 2].info.next = &e.info;
+        }
+    }
+
+    const fi_info *
+    head() const {
+        return entries_.empty() ? nullptr : &entries_.front().info;
+    }
+
+private:
+    struct Entry {
+        std::string prov_name;
+        std::string domain;
+        fi_fabric_attr fabric_attr{};
+        fi_domain_attr domain_attr{};
+        fi_ep_attr ep_attr{};
+        fi_bus_attr bus_attr{};
+        fi_link_attr link_attr{};
+        fid_nic nic{};
+        fi_info info{};
+    };
+
+    // A deque keeps earlier entries in place, so their next pointers stay valid.
+    std::deque<Entry> entries_;
+};
+
+void
+testDeviceMetadataPerProvider() {
+    NIXL_INFO << "4. Testing that NIC metadata comes from the selected provider";
+
+    // An unselected provider lists the same domain name first, with another NIC's metadata.
+    FakeInfoList colliding;
+    colliding.add("psm3", "rdmap0", 0xaa, 100);
+    colliding.add("efa;ofi_rxd", "rdmap0", 0xcc, 50);
+    colliding.add("efa", "rdmap0", 0xbb, 200);
+    colliding.add("efa", "rdmap0", 0xdd, 400);
+    const auto [provider, devices] = LibfabricUtils::selectNetworkDevices(colliding.head());
+    check(provider == "efa" && devices.size() == 1, "efa is selected with one rail");
+    check(!devices.empty() && devices[0].domain_name == "rdmap0", "the rail keeps its domain");
+    check(!devices.empty() && devices[0].pcie_address == "0:bb:00.0",
+          "the PCIe address is the selected provider's, not that of an earlier provider "
+          "reporting the same domain name");
+    check(!devices.empty() && devices[0].link_speed == 200,
+          "the link speed is the selected provider's first, not another provider's");
+
+    // The selected provider reports no NIC: another provider's metadata must not fill it in.
+    FakeInfoList no_nic;
+    no_nic.add("psm3", "rdmap0", 0xaa, 100);
+    no_nic.add("efa", "rdmap0");
+    const auto [no_nic_provider, no_nic_devices] =
+        LibfabricUtils::selectNetworkDevices(no_nic.head());
+    check(no_nic_provider == "efa" && no_nic_devices.size() == 1, "efa is selected with one rail");
+    check(!no_nic_devices.empty() && no_nic_devices[0].pcie_address.empty() &&
+              no_nic_devices[0].link_speed == 0,
+          "a domain the selected provider reports no NIC for stays unknown");
+
+    check(LibfabricUtils::selectNetworkDevices(nullptr).first == "none",
+          "an empty fi_getinfo() list selects no provider");
+}
+
 } // namespace
 
 int
@@ -204,6 +293,7 @@ main() {
     testBaseProviderName();
     testProviderTable();
     testProviderSelection();
+    testDeviceMetadataPerProvider();
 
     if (failures != 0) {
         NIXL_ERROR << "=== " << failures << " check(s) FAILED ===";

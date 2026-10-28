@@ -392,6 +392,14 @@ selectDomainsGeneric(const nixlProviderDeviceMap &provider_device_map, const cha
  */
 std::pair<std::string, std::vector<std::string>>
 selectProvider(const nixlProviderDeviceMap &provider_device_map);
+
+/**
+ * @brief Selects a provider from an fi_getinfo() list (see @ref selectProvider) and returns its
+ *        domains with the PCIe address and link speed that the selected provider reported.
+ * @return Core provider name and one entry per rail, in rail order; {"none", {}} if none found.
+ */
+std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
+selectNetworkDevices(const struct fi_info *info);
 // String utilities
 std::string
 hexdump(const void *data, size_t size);

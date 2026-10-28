@@ -166,9 +166,81 @@ selectProvider(const nixlProviderDeviceMap &provider_device_map) {
 }
 
 std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
-getAvailableNetworkDevices() {
+selectNetworkDevices(const struct fi_info *info) {
+    nixlProviderDeviceMap provider_device_map;
+    // Bus address and link speed per prov_name and domain name. Several providers can report the
+    // same domain name (verbs and psm3) for different NICs or with different metadata, so a
+    // domain's metadata is only taken from the provider that lists it. Within one provider the
+    // first non-empty value is kept.
+    std::unordered_map<std::string, std::unordered_map<std::string, nixlLibfabricDeviceInfo>>
+        device_info;
 
-    std::unordered_map<std::string, std::vector<std::string>> provider_device_map;
+    for (const struct fi_info *cur = info; cur; cur = cur->next) {
+        if (cur->domain_attr && cur->domain_attr->name && cur->fabric_attr &&
+            cur->fabric_attr->prov_name) {
+
+            std::string device_name = cur->domain_attr->name;
+            std::string provider_name = cur->fabric_attr->prov_name;
+
+            NIXL_TRACE << "Found device - domain: " << device_name << ", provider=" << provider_name
+                       << ", ep_type=" << (cur->ep_attr ? cur->ep_attr->type : FI_EP_UNSPEC)
+                       << ", caps=" << std::hex << cur->caps << std::dec;
+
+            provider_device_map[provider_name].push_back(device_name);
+
+            nixlLibfabricDeviceInfo &dev = device_info[provider_name][device_name];
+            dev.domain_name = device_name;
+
+            if (cur->nic == nullptr) {
+                continue;
+            }
+            if (dev.pcie_address.empty() && cur->nic->bus_attr != nullptr &&
+                cur->nic->bus_attr->bus_type == FI_BUS_PCI &&
+                cur->nic->bus_attr->attr.pci.domain_id != FI_ADDR_UNSPEC) {
+                char pcie_addr[32];
+                snprintf(pcie_addr,
+                         sizeof(pcie_addr),
+                         "%x:%02x:%02x.%x",
+                         cur->nic->bus_attr->attr.pci.domain_id,
+                         cur->nic->bus_attr->attr.pci.bus_id,
+                         cur->nic->bus_attr->attr.pci.device_id,
+                         cur->nic->bus_attr->attr.pci.function_id);
+                dev.pcie_address = pcie_addr;
+            }
+            if (dev.link_speed == 0 && cur->nic->link_attr != nullptr) {
+                dev.link_speed = cur->nic->link_attr->speed;
+            }
+        }
+    }
+
+    for (const auto &device_list : provider_device_map) {
+        for (const auto &device : device_list.second) {
+            NIXL_TRACE << "provider=" << device_list.first << ", device=" << device;
+        }
+    }
+
+    const auto [provider_name, domains] = selectProvider(provider_device_map);
+    if (provider_name == "none") {
+        return {"none", {}};
+    }
+
+    // selectProvider() returns an exact prov_name key, so every selected domain has an entry.
+    const auto &provider_info = device_info[provider_name];
+    std::vector<nixlLibfabricDeviceInfo> devices;
+    devices.reserve(domains.size());
+    for (const auto &domain : domains) {
+        devices.push_back(provider_info.at(domain));
+        NIXL_TRACE << "Selected " << provider_name << " domain " << devices.back().domain_name
+                   << " pcie="
+                   << (devices.back().pcie_address.empty() ? "unknown" :
+                                                             devices.back().pcie_address)
+                   << " link_speed=" << devices.back().link_speed;
+    }
+    return {provider_name, devices};
+}
+
+std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
+getAvailableNetworkDevices() {
     struct fi_info *hints, *info;
     hints = fi_allocinfo();
     if (!hints) {
@@ -201,80 +273,13 @@ getAvailableNetworkDevices() {
         return {"none", {}};
     }
 
-    // Bus address and link speed per domain name. Several providers can report the same domain
-    // (verbs and psm3); the first non-empty value is kept.
-    std::unordered_map<std::string, nixlLibfabricDeviceInfo> device_info;
-
-    for (struct fi_info *cur = info; cur; cur = cur->next) {
-        if (cur->domain_attr && cur->domain_attr->name && cur->fabric_attr &&
-            cur->fabric_attr->name) {
-
-            std::string device_name = cur->domain_attr->name;
-            std::string provider_name = cur->fabric_attr->prov_name;
-
-            NIXL_TRACE << "Found device - domain: " << device_name << ", provider=" << provider_name
-                       << ", ep_type=" << cur->ep_attr->type << ", caps=" << std::hex << cur->caps
-                       << std::dec;
-
-            if (provider_device_map.find(provider_name) == provider_device_map.end()) {
-                provider_device_map[provider_name] = {};
-            }
-            provider_device_map[provider_name].push_back(device_name);
-
-            nixlLibfabricDeviceInfo &dev = device_info[device_name];
-            dev.domain_name = device_name;
-
-            if (cur->nic == nullptr) {
-                continue;
-            }
-            if (dev.pcie_address.empty() && cur->nic->bus_attr != nullptr &&
-                cur->nic->bus_attr->bus_type == FI_BUS_PCI &&
-                cur->nic->bus_attr->attr.pci.domain_id != FI_ADDR_UNSPEC) {
-                char pcie_addr[32];
-                snprintf(pcie_addr,
-                         sizeof(pcie_addr),
-                         "%x:%02x:%02x.%x",
-                         cur->nic->bus_attr->attr.pci.domain_id,
-                         cur->nic->bus_attr->attr.pci.bus_id,
-                         cur->nic->bus_attr->attr.pci.device_id,
-                         cur->nic->bus_attr->attr.pci.function_id);
-                dev.pcie_address = pcie_addr;
-            }
-            if (dev.link_speed == 0 && cur->nic->link_attr != nullptr) {
-                dev.link_speed = cur->nic->link_attr->speed;
-            }
-        }
-    }
+    auto result = selectNetworkDevices(info);
 
     fi_freeinfo(info);
     fi_freeinfo(hints);
 
-    for (auto device_list : provider_device_map) {
-        for (auto device : device_list.second) {
-            NIXL_TRACE << "provider=" << device_list.first << ", device=" << device;
-        }
-    }
-
-    const auto [provider_name, domains] = selectProvider(provider_device_map);
-    if (provider_name != "none") {
-        std::vector<nixlLibfabricDeviceInfo> devices;
-        devices.reserve(domains.size());
-        for (const auto &domain : domains) {
-            const auto it = device_info.find(domain);
-            if (it != device_info.end()) {
-                devices.push_back(it->second);
-            } else {
-                nixlLibfabricDeviceInfo dev;
-                dev.domain_name = domain;
-                devices.push_back(dev);
-            }
-            NIXL_TRACE << "Selected " << provider_name << " domain " << devices.back().domain_name
-                       << " pcie="
-                       << (devices.back().pcie_address.empty() ? "unknown" :
-                                                                 devices.back().pcie_address)
-                       << " link_speed=" << devices.back().link_speed;
-        }
-        return {provider_name, devices};
+    if (result.first != "none") {
+        return result;
     }
 
     NIXL_ERROR << "No network devices found with any provider";
