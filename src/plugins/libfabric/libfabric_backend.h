@@ -29,6 +29,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
+#include <functional>
 
 #include "nixl.h"
 #include "backend/backend_engine.h"
@@ -237,14 +238,20 @@ private:
     mutable std::atomic<uint64_t> completion_callbacks_started_{0};
     mutable std::atomic<uint64_t> completion_callbacks_finished_{0};
 
-    // Threading infrastructure - remaining members
-    // Connection Management (CM) thread: sends re-establishment replies queued by the
-    // progress thread (handleHandshake), which must not post from its own completion context
-    std::mutex cm_mutex_;
-    std::thread cm_thread_;
-    std::condition_variable cm_cv_;
-    std::deque<std::shared_ptr<nixlLibfabricConnection>> pending_replies_;
-    std::atomic<bool> cm_thread_stop_{false};
+    // Handshake replies queued by handleHandshake() on the progress thread, which must not post
+    // from inside CQ processing; that thread sends them after its CQ pass, like
+    // completion_notifs_ (sendQueuedHandshakeReplies())
+    std::mutex handshake_replies_mutex_;
+    std::vector<std::shared_ptr<nixlLibfabricConnection>> handshake_replies_;
+    std::atomic<bool> handshake_replies_pending_{false};
+    // Held by the progress thread across the registration check and send of each queued reply,
+    // and taken by disconnect() once the connection is gone, so it cannot return while a reply to
+    // that peer is still being sent. Never held with connection_state_mutex_ taken first.
+    std::mutex handshake_reply_send_mutex_;
+
+    // Unit tests only: called in handleHandshake() between its lookup that found no connection
+    // and buffering the handshake, so a test can register the connection there
+    std::function<void(const std::string &)> handshake_lookup_miss_hook_;
 
     // Progress thread for rail CQs
     std::thread progress_thread_;
@@ -432,12 +439,25 @@ private:
     // Will load the peer's connection info from the handshake payload, if it's a new peer.
     void
     handleHandshake(const std::string &raw_payload);
-    // Queues a re-establishment reply for the CM thread; dropped once teardown started.
+    // Creates the connection for a peer from its serialized connection info, without sending a
+    // handshake. conn_for_handshake is the new connection to handshake, or null when the
+    // connection already existed or is the self-connection.
+    nixl_status_t
+    createConnectionFromInfo(const std::string &remote_agent,
+                             const std::string &remote_conn_info,
+                             std::shared_ptr<nixlLibfabricConnection> &conn_for_handshake);
+    // Reply to a peer's handshake: queued for the progress thread when this runs on it, else
+    // inline. @p what names it in the failure warning.
     void
-    queueHandshakeReply(std::shared_ptr<nixlLibfabricConnection> conn);
-    // CM thread body: sends queued re-establishment replies off the progress thread.
+    replyHandshake(const std::shared_ptr<nixlLibfabricConnection> &conn, const char *what);
+
+    // Progress thread, after its CQ pass: send the queued handshake replies
     void
-    cmThread();
+    sendQueuedHandshakeReplies();
+
+    // Forget a handshake buffered for a peer that has no connection
+    void
+    dropBufferedHandshake(const std::string &peer_agent_name);
     // Marks a peer rejected for its protocol version; establishConnection() then fails fast.
     void
     rejectHandshake(const std::string &peer_agent_name, uint16_t peer_proto_ver);
