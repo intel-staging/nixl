@@ -28,6 +28,18 @@
 #include "libfabric_rail.h"
 #include "libfabric_accel.h"
 
+/** @brief No peer rail shares this local rail's fabric. */
+static constexpr size_t NIXL_LF_NO_PEER_RAIL = static_cast<size_t>(-1);
+
+/**
+ * @brief Which peer rails each local rail is known not to reach, indexed [local rail][peer rail].
+ *
+ * Set only for a local rail that shares a subnet with at least one peer rail (a segmented fabric),
+ * and only for the peer rails off that subnet. A local rail with no peer rail on its subnet may be
+ * on a routed network and is left unmarked. Empty when nothing is marked.
+ */
+using nixlLibfabricRailUnreachable = std::vector<std::vector<bool>>;
+
 // Forward declarations
 class nixlLibfabricTopology;
 class nixlLibfabricRailManager;
@@ -174,6 +186,15 @@ public:
                      const std::vector<struct fid_mr *> &mr_list);
 
     // Connection Management APIs
+    /** Pairs each local rail with the peer rail on its own subnet.
+     * @param endpoints The peer's rail endpoint names, in the peer's rail order
+     * @param unreachable_out Local/peer rail pairs known to be on different segments
+     * @return One entry per local rail: an index into @p endpoints, or NIXL_LF_NO_PEER_RAIL.
+     *         Empty when no fabric identity is readable, which leaves index pairing. */
+    std::vector<size_t>
+    computeRailPeering(const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,
+                       nixlLibfabricRailUnreachable &unreachable_out) const;
+
     /** Insert addresses into address vectors for all rails
      * @param endpoints Remote endpoint addresses to insert
      * @param agent_idx Local index of the agent owning these endpoints, for sender lookup

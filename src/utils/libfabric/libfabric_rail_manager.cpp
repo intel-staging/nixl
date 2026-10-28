@@ -1186,6 +1186,113 @@ nixlLibfabricRailManager::progressActiveRails() {
     return any_completions ? NIXL_SUCCESS : NIXL_IN_PROG;
 }
 
+std::vector<size_t>
+nixlLibfabricRailManager::computeRailPeering(
+    const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,
+    nixlLibfabricRailUnreachable &unreachable_out) const {
+    std::vector<size_t> peering;
+    unreachable_out.clear();
+
+    // The peer's fabric ids, from the endpoint names it sent; only local ids carry a netmask
+    std::vector<LibfabricUtils::nixlLibfabricFabricId> peer_ids;
+    peer_ids.reserve(endpoints.size());
+    bool any_peer_valid = false;
+    for (const auto &ep : endpoints) {
+        // Both agents use one provider, so rail 0's address format describes the peer's names too
+        const uint32_t fmt = rails_.empty() ? FI_FORMAT_UNSPEC : rails_[0]->addr_format;
+        peer_ids.push_back(LibfabricUtils::fabricIdFromEpName(fmt, ep.data(), ep.size()));
+        any_peer_valid = any_peer_valid || peer_ids.back().valid;
+    }
+
+    bool any_local_valid = false;
+    for (const auto &rail : rails_) {
+        any_local_valid = any_local_valid || rail->fabric_id.valid;
+    }
+
+    if (!any_local_valid || !any_peer_valid) {
+        NIXL_DEBUG << "No readable fabric identities, pairing rails by index";
+        return peering;
+    }
+
+    // Greedy one-to-one assignment, so two local rails never stripe onto one peer NIC
+    peering.assign(rails_.size(), NIXL_LF_NO_PEER_RAIL);
+    std::vector<bool> peer_taken(endpoints.size(), false);
+
+    // Mark peer rails off the subnet of a local rail that shares a subnet with some peer rail. A
+    // local rail with no netmask, or with no peer rail on its subnet (possibly routed), stays
+    // unmarked.
+    bool any_unreachable = false;
+    unreachable_out.assign(rails_.size(), std::vector<bool>(endpoints.size(), false));
+    for (size_t rail_id = 0; rail_id < rails_.size(); ++rail_id) {
+        const auto &local_id = rails_[rail_id]->fabric_id;
+        if (!local_id.valid || local_id.mask == 0) {
+            continue;
+        }
+        const bool has_segment_peer =
+            std::any_of(peer_ids.begin(), peer_ids.end(), [&](const auto &peer_id) {
+                return LibfabricUtils::sameFabric(local_id, peer_id);
+            });
+        if (!has_segment_peer) {
+            continue;
+        }
+        for (size_t peer = 0; peer < peer_ids.size(); ++peer) {
+            const bool off_segment =
+                peer_ids[peer].valid && !LibfabricUtils::sameFabric(local_id, peer_ids[peer]);
+            unreachable_out[rail_id][peer] = off_segment;
+            any_unreachable = any_unreachable || off_segment;
+        }
+    }
+    if (!any_unreachable) {
+        unreachable_out.clear();
+    }
+
+    for (size_t rail_id = 0; rail_id < rails_.size(); ++rail_id) {
+        const auto &local_id = rails_[rail_id]->fabric_id;
+        for (size_t peer = 0; peer < peer_ids.size(); ++peer) {
+            if (peer_taken[peer] || !LibfabricUtils::sameFabric(local_id, peer_ids[peer])) {
+                continue;
+            }
+            peering[rail_id] = peer;
+            peer_taken[peer] = true;
+            break;
+        }
+    }
+
+    size_t matched = 0;
+    for (size_t rail_id = 0; rail_id < peering.size(); ++rail_id) {
+        if (peering[rail_id] == NIXL_LF_NO_PEER_RAIL) {
+            NIXL_WARN << "Rail " << rail_id << " (" << rails_[rail_id]->device_name
+                      << ") found no peer rail on its subnet (shown as none below). Transfers on"
+                         " it post to the same-numbered peer rail when that one holds the buffer,"
+                         " otherwise to another peer rail that does; on an unrouted fabric those"
+                         " may be unreachable";
+            continue;
+        }
+        matched++;
+        NIXL_DEBUG << "Rail " << rail_id << " (" << rails_[rail_id]->device_name
+                   << ") paired with peer rail " << peering[rail_id];
+    }
+
+    // Logged at INFO when it differs from index order, which is otherwise invisible
+    bool is_identity = true;
+    for (size_t i = 0; is_identity && i < peering.size(); ++i) {
+        is_identity = (peering[i] == i);
+    }
+    if (!is_identity) {
+        std::string map_str;
+        for (size_t i = 0; i < peering.size(); ++i) {
+            map_str += std::to_string(i) + "->" +
+                (peering[i] == NIXL_LF_NO_PEER_RAIL ? std::string("none") :
+                                                      std::to_string(peering[i])) +
+                " ";
+        }
+        NIXL_INFO << "Rail pairing differs from index order (" << matched << "/" << rails_.size()
+                  << " matched by fabric): " << map_str;
+    }
+
+    return peering;
+}
+
 void
 nixlLibfabricRailManager::unmapAgentAddresses(
     const std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs,

@@ -19,13 +19,18 @@
 /*
  * Tests for libfabric provider handling: baseProviderName(), the provider table, selectProvider()
  * and selectNetworkDevices(), using synthetic prov_name -> domain maps and synthetic fi_getinfo()
- * lists. The verbs-specific tests are in libfabric_verbs_test.cpp.
+ * lists, and reading fabric ids. The verbs-specific tests are in libfabric_verbs_test.cpp.
  */
 
 #include "libfabric/libfabric_common.h"
 #include "common/nixl_log.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <deque>
 #include <string>
 #include <unordered_map>
@@ -336,6 +341,42 @@ testDeviceMetadataPerProvider() {
 
 } // namespace
 
+void
+testFabricId() {
+    NIXL_INFO << "Testing fabric ids";
+
+    auto ep_name = [](const char *ip) {
+        struct sockaddr_in sin = {};
+        sin.sin_family = AF_INET;
+        inet_pton(AF_INET, ip, &sin.sin_addr);
+        std::array<char, sizeof(sin)> buf;
+        memcpy(buf.data(), &sin, sizeof(sin));
+        return buf;
+    };
+    const auto a = ep_name("192.168.10.6");
+    auto local = LibfabricUtils::fabricIdFromEpName(FI_SOCKADDR_IN, a.data(), a.size());
+    check(local.valid, "an IPv4 endpoint name gives a valid fabric id");
+    check(!LibfabricUtils::fabricIdFromEpName(FI_ADDR_EFA, a.data(), a.size()).valid,
+          "an unreadable address format gives an invalid id");
+    check(!LibfabricUtils::fabricIdFromEpName(FI_SOCKADDR_IN, a.data(), 4).valid,
+          "a short endpoint name gives an invalid id");
+
+    const auto same = ep_name("192.168.10.16");
+    const auto other = ep_name("192.168.20.6");
+    const auto peer_same =
+        LibfabricUtils::fabricIdFromEpName(FI_SOCKADDR_IN, same.data(), same.size());
+    const auto peer_other =
+        LibfabricUtils::fabricIdFromEpName(FI_SOCKADDR_IN, other.data(), other.size());
+
+    check(!LibfabricUtils::sameFabric(local, peer_same),
+          "without a netmask only an exact address matches");
+    inet_pton(AF_INET, "255.255.255.0", &local.mask);
+    check(LibfabricUtils::sameFabric(local, peer_same), "an address on the subnet matches");
+    check(!LibfabricUtils::sameFabric(local, peer_other), "an address off the subnet does not");
+    check(!LibfabricUtils::sameFabric(local, LibfabricUtils::nixlLibfabricFabricId{}),
+          "an invalid id never matches");
+}
+
 int
 main() {
     NIXL_INFO << "=== Testing Libfabric provider selection ===";
@@ -344,6 +385,7 @@ main() {
     testProviderTable();
     testProviderSelection();
     testDeviceMetadataPerProvider();
+    testFabricId();
 
     if (failures != 0) {
         NIXL_ERROR << "=== " << failures << " check(s) FAILED ===";

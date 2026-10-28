@@ -652,6 +652,11 @@ nixlLibfabricEngine::createAgentConnection(
         return data_status;
     }
 
+    // Which of the peer's rails each local rail should post to: every pairing is addressable,
+    // this picks the reachable one
+    conn->peer_rail_for_local_rail_ =
+        rail_manager_.computeRailPeering(data_rail_endpoints, conn->rail_unreachable_);
+
     for (size_t i = 0; i < agent_names_.size(); ++i) {
         NIXL_DEBUG << "Index " << i << ": " << agent_names_[i];
     }
