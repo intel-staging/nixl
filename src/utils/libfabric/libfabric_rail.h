@@ -23,6 +23,9 @@
 #include <limits>
 #include <string>
 #include <functional>
+#include <chrono>
+#include <optional>
+#include <unordered_map>
 #include <mutex>
 #include <shared_mutex>
 #include <atomic>
@@ -601,6 +604,13 @@ public:
     void
     setProgressThreadEnabled(bool enabled);
 
+    /** How long a destination may refuse posts with -FI_EAGAIN before they fail; 0 never fails
+     *  them. Defaults to NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S. Set before posting. */
+    void
+    setPostEagainTimeout(std::chrono::seconds timeout) {
+        post_eagain_timeout_ = timeout;
+    }
+
     /** Check if progress thread is enabled for this rail */
     bool
     isProgressThreadEnabled() const {
@@ -676,9 +686,35 @@ private:
     using post_ring_t = MpscRing<nixlLibfabricPostRequest>;
     post_ring_t post_ring_;
 
+    // A post drainPostQueue() could not make within POST_EAGAIN_RETRIES attempts, kept for the
+    // next drain. Touched only by the progress thread.
+    std::optional<nixlLibfabricPostRequest> pending_post_;
+
+    // Since when each destination has refused posts with -FI_EAGAIN. Per destination, so all
+    // posts to a peer that is gone fail once it has refused them for post_eagain_timeout_, not
+    // each after a timeout of its own. Cleared once a refused post ends any other way.
+    mutable std::mutex refused_mutex_;
+    mutable std::unordered_map<fi_addr_t, std::chrono::steady_clock::time_point> refused_since_;
+    mutable std::atomic<size_t> refused_count_{0};
+    std::chrono::seconds post_eagain_timeout_{NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S};
+    // -FI_EAGAIN retries between checks of refused_since_ in a post's retry loop
+    static constexpr int kRefusedCheckInterval = 256;
+
+    // A post to dest_addr was refused: whether that destination has now refused posts for
+    // post_eagain_timeout_ (logged if so)
+    bool
+    refusedTooLong(fi_addr_t dest_addr, const char *op, int attempt) const;
+
+    // A post to dest_addr ended otherwise than by the refusal timeout; cheap unless some
+    // destination is refusing
+    void
+    clearRefused(fi_addr_t dest_addr) const;
+
     // the post/poll interleave ratio constants
     static constexpr size_t POST_MAX_BATCH_SIZE = 256;
     static constexpr size_t POST_POLL_INTERLEAVE_RATIO = 32;
+    // -FI_EAGAIN retries of one post, each after reaping this rail's CQ, before it is parked
+    static constexpr size_t POST_EAGAIN_RETRIES = 16;
 
     // Whether a progress thread is handling CQ draining
     bool progress_thread_enabled_ = false;
@@ -728,6 +764,10 @@ private:
     void
     pollForCompletions();
 
+    /** Read and handle one batch of the CQ; see the definition */
+    nixl_status_t
+    reapCompletions();
+
     /** Record that fi_addr belongs to agent_idx; returns its previous index */
     uint32_t
     mapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx, uint32_t replaces_agent_idx) const;
@@ -741,6 +781,10 @@ private:
     processLocalTransferCompletion(struct fi_cq_data_entry *comp, const char *operation_type) const;
     nixl_status_t
     processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_t src_addr) const;
+
+    /** Post a receive to replace one that completed */
+    nixl_status_t
+    postReplacementRecv() const;
     nixl_status_t
     processRemoteWriteCompletion(struct fi_cq_data_entry *comp, fi_addr_t src_addr) const;
 };

@@ -330,6 +330,24 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
                          "writes complete, and writes carry no remote CQ data";
         }
 
+        // NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT, or the backend parameter of that name
+        size_t eagain_secs = NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S;
+        if (LibfabricUtils::getCustomIntParam(
+                getCustomParams(), "post_eagain_timeout", eagain_secs) == NIXL_SUCCESS) {
+            if (eagain_secs > static_cast<size_t>(kMaxStaleAge.count())) {
+                NIXL_WARN << "post_eagain_timeout " << eagain_secs << " s exceeds the maximum "
+                          << kMaxStaleAge.count() << " s; using "
+                          << NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S << " s";
+                eagain_secs = NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S;
+            }
+            NIXL_INFO << "post_eagain_timeout: "
+                      << (eagain_secs == 0 ? std::string("never") :
+                                             std::to_string(eagain_secs) + " s");
+        }
+        for (size_t rail_id = 0; rail_id < rail_manager_.getNumRails(); ++rail_id) {
+            rail_manager_.getRail(rail_id).setPostEagainTimeout(std::chrono::seconds(eagain_secs));
+        }
+
         // NIXL_LIBFABRIC_PENDING_{NOTIF,WRITES}_TIMEOUT, or the backend parameters of that name
         for (auto [key, age] : {std::pair{"pending_notif_timeout", &stale_pending_age_},
                                 std::pair{"pending_writes_timeout", &stale_writes_age_}}) {
@@ -1232,13 +1250,13 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
             apply_fi_more,
             local_md->hmem_info_);
 
+        // Counted even on failure: requests posted before it are in flight
+        submitted_count += desc_submitted_count;
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "prepareAndSubmitTransfer failed for descriptor " << desc_idx
                        << " device " << local[desc_idx].devId;
             return status;
         }
-
-        submitted_count += desc_submitted_count;
     }
 
     return NIXL_SUCCESS;
@@ -1372,20 +1390,18 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
     const bool use_post_pool = post_thread_pool_ && post_thread_count_ > 0 && desc_count > 0 &&
         static_cast<size_t>(desc_count) >= post_split_batch_size_;
 
+    nixl_status_t post_status = NIXL_SUCCESS;
     if (!use_post_pool) {
-        nixl_status_t status = postXferDescriptors(op_type,
-                                                   local,
-                                                   remote,
-                                                   conn,
-                                                   backend_handle,
-                                                   0,
-                                                   desc_count,
-                                                   xfer_base_offset,
-                                                   /*allow_fi_more=*/true,
-                                                   total_submitted);
-        if (status != NIXL_SUCCESS) {
-            return status;
-        }
+        post_status = postXferDescriptors(op_type,
+                                          local,
+                                          remote,
+                                          conn,
+                                          backend_handle,
+                                          0,
+                                          desc_count,
+                                          xfer_base_offset,
+                                          /*allow_fi_more=*/true,
+                                          total_submitted);
     } else {
         const size_t num_chunks = std::min(post_thread_count_, static_cast<size_t>(desc_count));
         const size_t chunk_size = (desc_count + num_chunks - 1) / num_chunks;
@@ -1428,10 +1444,10 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
                         status = NIXL_ERR_BACKEND;
                     }
 
+                    // Counted even on failure: requests posted before it are in flight
+                    parallel_total_submitted.fetch_add(chunk_submitted);
                     if (status != NIXL_SUCCESS) {
                         storeFirstError(first_status, status);
-                    } else {
-                        parallel_total_submitted.fetch_add(chunk_submitted);
                     }
 
                     {
@@ -1451,20 +1467,31 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
             done_cv.wait(lock, [&remaining, num_chunks, submitted_chunks]() {
                 return remaining == num_chunks - submitted_chunks;
             });
-            return NIXL_ERR_BACKEND;
-        }
-
-        {
+            storeFirstError(first_status, NIXL_ERR_BACKEND);
+        } else {
             std::unique_lock<std::mutex> lock(done_mutex);
             done_cv.wait(lock, [&remaining]() { return remaining == 0; });
         }
 
-        nixl_status_t status = static_cast<nixl_status_t>(first_status.load());
-        if (status != NIXL_SUCCESS) {
-            return status;
-        }
-
+        post_status = static_cast<nixl_status_t>(first_status.load());
         total_submitted = parallel_total_submitted.load();
+    }
+
+    if (post_status != NIXL_SUCCESS) {
+        if (total_submitted == 0 || remote_agent == localAgent) {
+            return post_status;
+        }
+        // Requests posted before the failure are in flight and their callbacks hold the handle:
+        // count only those, record the error, and let checkXfer() report it once they finish and
+        // tell the target of a failed notified WRITE (notifXferFailure()), which then also sends
+        // the notification this path skips.
+        NIXL_ERROR << "Posting failed after " << total_submitted
+                   << " requests went out; the transfer fails once they complete";
+        backend_handle->notif_deferred = backend_handle->has_notif &&
+            backend_handle->operation_ == nixl_xfer_op_t::NIXL_WRITE && !notify_after_completion_;
+        backend_handle->record_request_status(post_status);
+        backend_handle->adjust_total_submitted_requests(total_submitted);
+        return NIXL_IN_PROG;
     }
 
     NIXL_DEBUG << "Processing complete: submitted " << total_submitted << " requests from "
@@ -1942,8 +1969,10 @@ nixlLibfabricEngine::notifXferFailure(nixlLibfabricBackendH *backend_handle,
     }
 
     // Sent after the error message on the same rail and endpoint, so the target sees the failure
-    // first (ofi_rxm keeps send-after-send order).
-    if (notify_after_completion_ && backend_handle->claim_completion_notif()) {
+    // first (ofi_rxm keeps send-after-send order): with notify-after-completion, or when posting
+    // failed before postXfer() sent it.
+    if ((notify_after_completion_ || backend_handle->notif_deferred) &&
+        backend_handle->claim_completion_notif()) {
         status = notifSendPriv(backend_handle->remote_agent_,
                                backend_handle->binary_notifs,
                                backend_handle->total_notif_msg_len,
