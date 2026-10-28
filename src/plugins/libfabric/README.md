@@ -164,6 +164,28 @@ Notes specific to verbs:
   newer than v2.6.0. On a build without it the rail comes up without `FI_HMEM` (logged at
   startup) and device buffers are registered as host memory.
 
+## Rail Pairing
+
+A transfer posts on a local rail to one of the peer's rails. Rails are paired by fabric segment,
+not by index: libfabric domain names are host-local and cabling need not follow them, so local
+rail *k* and peer rail *k* can be on different subnets, and a post to an unreachable address
+retries `-FI_EAGAIN` for 60 s before failing.
+
+Each side reads the peer rails' IP addresses from the endpoint names exchanged at connection setup
+and matches them against its own rails' subnets (`LibfabricUtils::sameFabric`). The assignment is
+one-to-one. A rail with no match, and a provider whose address format cannot be read (efa, cxi),
+fall back to index order. Nothing new goes on the wire.
+
+- When a remote buffer is registered on only some peer rails, a local rail whose matched peer rail
+  is not among them takes another registered peer rail it is not known to be unable to reach. A
+  rail that reaches none is left out of that transfer, and if no rail of the buffer is usable,
+  `postXfer()` fails with `NIXL_ERR_BACKEND` before posting anything.
+- A peer rail counts as unreachable only on a segmented fabric: when the local rail shares a subnet
+  with some peer rail and this one is not on it. A local rail with no peer rail on its subnet is
+  assumed to be routed and may use any of them.
+- A pairing that differs from index order is logged at INFO, e.g.
+  `Rail pairing differs from index order (2/2 matched by fabric): 0->1 1->0`.
+
 ## Build Instructions
 
 ```bash

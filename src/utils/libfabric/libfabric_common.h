@@ -430,6 +430,40 @@ providerNeedsAllRailProgress(const std::string &prov_name);
 bool
 providerNeedsWriteTag(const std::string &prov_name);
 
+/**
+ * @brief A rail's position on the fabric, used to pair local rails with a peer's rails.
+ *
+ * Read from the endpoint name each side already exchanges, so nothing new goes on the wire.
+ */
+struct nixlLibfabricFabricId {
+    /** @brief Whether @ref addr holds a usable identity. */
+    bool valid = false;
+    /** @brief IPv4 address of the rail's NIC, network byte order. */
+    uint32_t addr = 0;
+    /** @brief Netmask of the local interface owning @ref addr; 0 if unknown or for a peer. */
+    uint32_t mask = 0;
+};
+
+/**
+ * @brief Reads a @ref nixlLibfabricFabricId from a libfabric endpoint name.
+ *
+ * Only sockaddr formats can be read; anything else (efa, cxi) yields an invalid id, and rails are
+ * then paired by index.
+ */
+nixlLibfabricFabricId
+fabricIdFromEpName(uint32_t addr_format, const void *ep_name, size_t len);
+
+/**
+ * @brief Fills in the netmask of a local rail's @p id from getifaddrs(). Leaves it 0 when the
+ * address is on no local interface, which makes @ref sameFabric compare exact addresses.
+ */
+void
+resolveLocalFabricMask(nixlLibfabricFabricId &id);
+
+/** @brief Whether peer rail @p peer is on local rail @p local's subnet. Both must be valid. */
+bool
+sameFabric(const nixlLibfabricFabricId &local, const nixlLibfabricFabricId &peer);
+
 /** @brief See @ref nixlLibfabricProviderInfo::needs_full_topology. */
 bool
 providerNeedsFullTopology(const std::string &prov_name);

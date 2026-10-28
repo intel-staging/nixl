@@ -24,6 +24,7 @@
 #include "serdes/serdes.h"
 #include <sstream>
 #include <algorithm>
+#include <numeric>
 #include <cctype>
 #include <numaif.h>
 
@@ -412,6 +413,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     const std::vector<struct fid_mr *> &local_mrs,
     const std::vector<uint64_t> &remote_keys,
     const std::vector<size_t> &remote_selected_endpoints,
+    const std::vector<size_t> &peer_rail_for_local_rail,
+    const nixlLibfabricRailUnreachable &unreachable,
     const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
     uint16_t xfer_id,
     uint8_t write_tag,
@@ -429,9 +432,56 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
         NIXL_ERROR << "No rails selected for transfer";
         return NIXL_ERR_INVALID_PARAM;
     }
+    if (remote_selected_endpoints.empty()) {
+        NIXL_ERROR << "Remote buffer is registered on no rail";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    /*
+     * The peer rail each local rail posts to. Normally the fabric-matched one from
+     * computeRailPeering(). When that did not register the buffer, the rails are assigned together
+     * by assignFallbackPeerRails(), so no two land on one peer rail while another is idle:
+     *  1. A rail whose matched peer rail registered the buffer takes it.
+     *  2. A rail with no fabric information takes the same-id peer rail, if registered, unclaimed
+     *     and reachable (index pairing, as a rail-optimised fabric needs).
+     *  3. The rest, in rail-id order, take the first unclaimed registered peer rail they reach.
+     *  4. Once all are claimed, they share by rank in rail-id order.
+     * Rails that reach no registered peer rail are dropped by usableRails(): a post to an address
+     * on another segment retries -FI_EAGAIN until NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S.
+     */
+    std::vector<size_t> usable_storage;
+    const std::vector<size_t> &rails =
+        usableRails(selected_rails, remote_selected_endpoints, unreachable, usable_storage);
+    if (rails.empty()) {
+        NIXL_ERROR << "None of the " << selected_rails.size() << " local rail(s) of this buffer "
+                   << "reaches a peer rail the remote buffer is registered on";
+        return NIXL_ERR_BACKEND;
+    }
+
+    const auto remote_registered = [&](size_t peer) {
+        return std::find(remote_selected_endpoints.begin(),
+                         remote_selected_endpoints.end(),
+                         peer) != remote_selected_endpoints.end();
+    };
+    // Built on first need, at most once per call, indexed like rails
+    std::vector<size_t> fallback_peer;
+    const auto pick_remote_ep = [&](size_t rail_id) -> size_t {
+        const size_t peer = rail_id < peer_rail_for_local_rail.size() ?
+            peer_rail_for_local_rail[rail_id] :
+            NIXL_LF_NO_PEER_RAIL;
+        if (peer != NIXL_LF_NO_PEER_RAIL && remote_registered(peer)) {
+            return peer;
+        }
+        if (fallback_peer.empty()) {
+            fallback_peer = assignFallbackPeerRails(
+                rails, remote_selected_endpoints, peer_rail_for_local_rail, unreachable);
+        }
+        const auto pos = std::find(rails.begin(), rails.end(), rail_id);
+        return fallback_peer[static_cast<size_t>(pos - rails.begin())];
+    };
 
     // Determine striping strategy
-    bool use_striping = usesStriping(transfer_size, selected_rails.size());
+    bool use_striping = usesStriping(transfer_size, rails.size());
     NIXL_DEBUG << "use_striping=" << use_striping;
     if (!use_striping) {
         // WRITE: group NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE consecutive descriptors on one rail
@@ -440,12 +490,13 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
         // on each rail so that every rail's FI_MORE batch is flushed.
         const bool batch_write = (op_type == nixlLibfabricReq::WRITE);
         const size_t rail_sel_idx =
-            railSelectionIndex(base_offset, desc_idx, batch_write, selected_rails.size());
-        const size_t rail_id = selected_rails[rail_sel_idx];
-        // The remote endpoint round-robins over its own count, which can differ from the
-        // local rail count.
-        const size_t remote_ep_id = remote_selected_endpoints[railSelectionIndex(
-            base_offset, desc_idx, batch_write, remote_selected_endpoints.size())];
+            railSelectionIndex(base_offset, desc_idx, batch_write, rails.size());
+        const size_t rail_id = rails[rail_sel_idx];
+        const size_t remote_ep_id = pick_remote_ep(rail_id);
+        if (remote_ep_id == NIXL_LF_NO_PEER_RAIL) {
+            NIXL_ERROR << "No reachable peer rail for local rail " << rail_id;
+            return NIXL_ERR_BACKEND;
+        }
         const uint64_t fi_flags = (batch_write && apply_fi_more) ? FI_MORE : 0;
         NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id " << remote_ep_id;
         // Allocate request
@@ -530,13 +581,16 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     } else {
         // Striping: distribute across multiple rails (no FI_MORE for striped transfers)
         uint64_t fi_flags = 0;
-        size_t num_rails = selected_rails.size();
+        size_t num_rails = rails.size();
         size_t chunk_size = transfer_size / num_rails;
         size_t remainder = transfer_size % num_rails;
         for (size_t i = 0; i < num_rails; ++i) {
-            const size_t rail_id = selected_rails[i];
-            const size_t remote_ep_id =
-                remote_selected_endpoints[i % remote_selected_endpoints.size()];
+            const size_t rail_id = rails[i];
+            const size_t remote_ep_id = pick_remote_ep(rail_id);
+            if (remote_ep_id == NIXL_LF_NO_PEER_RAIL) {
+                NIXL_ERROR << "No reachable peer rail for local rail " << rail_id;
+                return NIXL_ERR_BACKEND;
+            }
             NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id=" << remote_ep_id;
             size_t current_chunk_size = chunk_size + (i == num_rails - 1 ? remainder : 0);
             if (current_chunk_size == 0) {
@@ -1196,6 +1250,214 @@ nixlLibfabricRailManager::progressActiveRails() {
         return first_error;
     }
     return any_completions ? NIXL_SUCCESS : NIXL_IN_PROG;
+}
+
+std::vector<size_t>
+nixlLibfabricRailManager::computeRailPeering(
+    const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,
+    nixlLibfabricRailUnreachable &unreachable_out) const {
+    std::vector<size_t> peering;
+    unreachable_out.clear();
+
+    // The peer's fabric ids, from the endpoint names it sent; only local ids carry a netmask
+    std::vector<LibfabricUtils::nixlLibfabricFabricId> peer_ids;
+    peer_ids.reserve(endpoints.size());
+    bool any_peer_valid = false;
+    for (const auto &ep : endpoints) {
+        // Both agents use one provider, so rail 0's address format describes the peer's names too
+        const uint32_t fmt = rails_.empty() ? FI_FORMAT_UNSPEC : rails_[0]->addr_format;
+        peer_ids.push_back(LibfabricUtils::fabricIdFromEpName(fmt, ep.data(), ep.size()));
+        any_peer_valid = any_peer_valid || peer_ids.back().valid;
+    }
+
+    bool any_local_valid = false;
+    for (const auto &rail : rails_) {
+        any_local_valid = any_local_valid || rail->fabric_id.valid;
+    }
+
+    if (!any_local_valid || !any_peer_valid) {
+        NIXL_DEBUG << "No readable fabric identities, pairing rails by index";
+        return peering;
+    }
+
+    // Greedy one-to-one assignment, so two local rails never stripe onto one peer NIC
+    peering.assign(rails_.size(), NIXL_LF_NO_PEER_RAIL);
+    std::vector<bool> peer_taken(endpoints.size(), false);
+
+    // Mark peer rails off the subnet of a local rail that shares a subnet with some peer rail. A
+    // local rail with no netmask, or with no peer rail on its subnet (possibly routed), stays
+    // unmarked.
+    bool any_unreachable = false;
+    unreachable_out.assign(rails_.size(), std::vector<bool>(endpoints.size(), false));
+    for (size_t rail_id = 0; rail_id < rails_.size(); ++rail_id) {
+        const auto &local_id = rails_[rail_id]->fabric_id;
+        if (!local_id.valid || local_id.mask == 0) {
+            continue;
+        }
+        const bool has_segment_peer =
+            std::any_of(peer_ids.begin(), peer_ids.end(), [&](const auto &peer_id) {
+                return LibfabricUtils::sameFabric(local_id, peer_id);
+            });
+        if (!has_segment_peer) {
+            continue;
+        }
+        for (size_t peer = 0; peer < peer_ids.size(); ++peer) {
+            const bool off_segment =
+                peer_ids[peer].valid && !LibfabricUtils::sameFabric(local_id, peer_ids[peer]);
+            unreachable_out[rail_id][peer] = off_segment;
+            any_unreachable = any_unreachable || off_segment;
+        }
+    }
+    if (!any_unreachable) {
+        unreachable_out.clear();
+    }
+
+    for (size_t rail_id = 0; rail_id < rails_.size(); ++rail_id) {
+        const auto &local_id = rails_[rail_id]->fabric_id;
+        for (size_t peer = 0; peer < peer_ids.size(); ++peer) {
+            if (peer_taken[peer] || !LibfabricUtils::sameFabric(local_id, peer_ids[peer])) {
+                continue;
+            }
+            peering[rail_id] = peer;
+            peer_taken[peer] = true;
+            break;
+        }
+    }
+
+    size_t matched = 0;
+    for (size_t rail_id = 0; rail_id < peering.size(); ++rail_id) {
+        if (peering[rail_id] == NIXL_LF_NO_PEER_RAIL) {
+            NIXL_WARN << "Rail " << rail_id << " (" << rails_[rail_id]->device_name
+                      << ") found no peer rail on its subnet (shown as none below). Transfers on"
+                         " it post to the same-numbered peer rail when that one holds the buffer,"
+                         " otherwise to another peer rail that does; on an unrouted fabric those"
+                         " may be unreachable";
+            continue;
+        }
+        matched++;
+        NIXL_DEBUG << "Rail " << rail_id << " (" << rails_[rail_id]->device_name
+                   << ") paired with peer rail " << peering[rail_id];
+    }
+
+    // Logged at INFO when it differs from index order, which is otherwise invisible
+    bool is_identity = true;
+    for (size_t i = 0; is_identity && i < peering.size(); ++i) {
+        is_identity = (peering[i] == i);
+    }
+    if (!is_identity) {
+        std::string map_str;
+        for (size_t i = 0; i < peering.size(); ++i) {
+            map_str += std::to_string(i) + "->" +
+                (peering[i] == NIXL_LF_NO_PEER_RAIL ? std::string("none") :
+                                                      std::to_string(peering[i])) +
+                " ";
+        }
+        NIXL_INFO << "Rail pairing differs from index order (" << matched << "/" << rails_.size()
+                  << " matched by fabric): " << map_str;
+    }
+
+    return peering;
+}
+
+std::vector<size_t>
+nixlLibfabricRailManager::assignFallbackPeerRails(
+    const std::vector<size_t> &selected_rails,
+    const std::vector<size_t> &remote_selected_endpoints,
+    const std::vector<size_t> &peer_rail_for_local_rail,
+    const nixlLibfabricRailUnreachable &unreachable) {
+    // Steps 1-4 as described in prepareAndSubmitTransfer()
+    const size_t n = selected_rails.size();
+    std::vector<size_t> peer_for(n, NIXL_LF_NO_PEER_RAIL);
+    if (remote_selected_endpoints.empty()) {
+        return peer_for;
+    }
+
+    const auto registered = [&](size_t peer) {
+        return std::find(remote_selected_endpoints.begin(),
+                         remote_selected_endpoints.end(),
+                         peer) != remote_selected_endpoints.end();
+    };
+    const auto matched = [&](size_t rail_id) {
+        return rail_id < peer_rail_for_local_rail.size() ? peer_rail_for_local_rail[rail_id] :
+                                                           NIXL_LF_NO_PEER_RAIL;
+    };
+    const auto reaches = [&](size_t rail_id, size_t peer) {
+        return railReaches(unreachable, rail_id, peer);
+    };
+    std::vector<size_t> claimed;
+    const auto is_claimed = [&](size_t peer) {
+        return std::find(claimed.begin(), claimed.end(), peer) != claimed.end();
+    };
+
+    // Steps 2-4 go in ascending rail id, so the result does not depend on policy order
+    std::vector<size_t> by_id(n);
+    std::iota(by_id.begin(), by_id.end(), 0);
+    std::sort(by_id.begin(), by_id.end(), [&](size_t a, size_t b) {
+        return selected_rails[a] < selected_rails[b];
+    });
+
+    for (size_t i = 0; i < n; ++i) { // 1: fabric match
+        const size_t peer = matched(selected_rails[i]);
+        if (peer != NIXL_LF_NO_PEER_RAIL && registered(peer)) {
+            peer_for[i] = peer;
+            claimed.push_back(peer);
+        }
+    }
+    for (const size_t i : by_id) { // 2: same id, only without fabric information
+        const size_t rail_id = selected_rails[i];
+        if (peer_for[i] == NIXL_LF_NO_PEER_RAIL && matched(rail_id) == NIXL_LF_NO_PEER_RAIL &&
+            registered(rail_id) && !is_claimed(rail_id) && reaches(rail_id, rail_id)) {
+            peer_for[i] = rail_id;
+            claimed.push_back(rail_id);
+        }
+    }
+    size_t rank = 0;
+    std::vector<size_t> reachable;
+    for (const size_t i : by_id) { // 3: first unclaimed; 4: share by rank -- reachable ones only
+        const size_t rail_id = selected_rails[i];
+        if (peer_for[i] == NIXL_LF_NO_PEER_RAIL) {
+            reachable.clear();
+            for (const size_t peer : remote_selected_endpoints) {
+                if (reaches(rail_id, peer)) {
+                    reachable.push_back(peer);
+                }
+            }
+            for (const size_t peer : reachable) {
+                if (!is_claimed(peer)) {
+                    peer_for[i] = peer;
+                    claimed.push_back(peer);
+                    break;
+                }
+            }
+            if (peer_for[i] == NIXL_LF_NO_PEER_RAIL && !reachable.empty()) {
+                peer_for[i] = reachable[rank % reachable.size()];
+            }
+        }
+        ++rank;
+    }
+    return peer_for;
+}
+
+const std::vector<size_t> &
+nixlLibfabricRailManager::usableRails(const std::vector<size_t> &selected_rails,
+                                      const std::vector<size_t> &remote_selected_endpoints,
+                                      const nixlLibfabricRailUnreachable &unreachable,
+                                      std::vector<size_t> &storage) {
+    // Empty unless some pair is known unreachable, so the usual case costs nothing
+    if (unreachable.empty()) {
+        return selected_rails;
+    }
+    const auto usable = [&](size_t rail_id) {
+        return std::any_of(remote_selected_endpoints.begin(),
+                           remote_selected_endpoints.end(),
+                           [&](size_t peer) { return railReaches(unreachable, rail_id, peer); });
+    };
+    if (std::all_of(selected_rails.begin(), selected_rails.end(), usable)) {
+        return selected_rails;
+    }
+    storage.clear();
+    std::copy_if(selected_rails.begin(), selected_rails.end(), std::back_inserter(storage), usable);
+    return storage;
 }
 
 void

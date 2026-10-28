@@ -28,6 +28,26 @@
 #include "libfabric_rail.h"
 #include "libfabric_accel.h"
 
+/** @brief No peer rail shares this local rail's fabric. */
+static constexpr size_t NIXL_LF_NO_PEER_RAIL = static_cast<size_t>(-1);
+
+/**
+ * @brief Which peer rails each local rail is known not to reach, indexed [local rail][peer rail].
+ *
+ * Set only for a local rail that shares a subnet with at least one peer rail (a segmented fabric),
+ * and only for the peer rails off that subnet. A local rail with no peer rail on its subnet may be
+ * on a routed network and is left unmarked. Empty when nothing is marked.
+ */
+using nixlLibfabricRailUnreachable = std::vector<std::vector<bool>>;
+
+/** False only where @p unreachable marks peer rail @p peer unreachable from local rail
+ *  @p rail_id. */
+inline bool
+railReaches(const nixlLibfabricRailUnreachable &unreachable, size_t rail_id, size_t peer) {
+    return rail_id >= unreachable.size() || peer >= unreachable[rail_id].size() ||
+        !unreachable[rail_id][peer];
+}
+
 // Forward declarations
 class nixlLibfabricTopology;
 class nixlLibfabricRailManager;
@@ -131,6 +151,29 @@ public:
         return rails_.size();
     }
 
+    /** Peer rail for each entry of @p selected_rails, for the rails whose fabric-matched peer rail
+     *  did not register the buffer. See prepareAndSubmitTransfer() for the rule.
+     * @param remote_selected_endpoints Peer rails that registered the buffer, ascending
+     * @param peer_rail_for_local_rail computeRailPeering() result
+     * @param unreachable computeRailPeering() reachability; unreachable peer rails are not assigned
+     * @return Peer rail per entry of @p selected_rails; NIXL_LF_NO_PEER_RAIL for a rail that
+     *         reaches none of @p remote_selected_endpoints */
+    static std::vector<size_t>
+    assignFallbackPeerRails(const std::vector<size_t> &selected_rails,
+                            const std::vector<size_t> &remote_selected_endpoints,
+                            const std::vector<size_t> &peer_rail_for_local_rail,
+                            const nixlLibfabricRailUnreachable &unreachable = {});
+
+    /** The rails of @p selected_rails that reach at least one of @p remote_selected_endpoints.
+     *  The rail choice and the caller's FI_MORE flush precompute must agree, so both call this.
+     * @param storage Filled only when some rail is dropped
+     * @return @p selected_rails itself when every rail is usable, else @p storage */
+    static const std::vector<size_t> &
+    usableRails(const std::vector<size_t> &selected_rails,
+                const std::vector<size_t> &remote_selected_endpoints,
+                const nixlLibfabricRailUnreachable &unreachable,
+                std::vector<size_t> &storage);
+
     /** Round-robin index of a descriptor into a selection array of `count` entries.
      * batch_write groups NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE consecutive descriptors per entry.
      * The FI_MORE flush precompute and the rail selection must agree, so both call this. */
@@ -174,6 +217,15 @@ public:
                      const std::vector<struct fid_mr *> &mr_list);
 
     // Connection Management APIs
+    /** Pairs each local rail with the peer rail on its own subnet.
+     * @param endpoints The peer's rail endpoint names, in the peer's rail order
+     * @param unreachable_out Local/peer rail pairs known to be on different segments
+     * @return One entry per local rail: an index into @p endpoints, or NIXL_LF_NO_PEER_RAIL.
+     *         Empty when no fabric identity is readable, which leaves index pairing. */
+    std::vector<size_t>
+    computeRailPeering(const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,
+                       nixlLibfabricRailUnreachable &unreachable_out) const;
+
     /** Insert addresses into address vectors for all rails
      * @param endpoints Remote endpoint addresses to insert
      * @param agent_idx Local index of the agent owning these endpoints, for sender lookup
@@ -238,6 +290,8 @@ public:
      * @param local_mrs Local memory registrations
      * @param remote_keys Remote access keys
      * @param remote_selected_endpoints Selected remote endpoints, where remote keys are registered
+     * @param peer_rail_for_local_rail computeRailPeering() pairing for this peer
+     * @param unreachable computeRailPeering() reachability for this peer
      * @param dest_addrs Destination addresses for each rail
      * @param xfer_id Transfer ID for tracking
      * @param write_tag Target-assigned write tag for imm_data, or 0. Ignored for READ.
@@ -264,6 +318,8 @@ public:
                              const std::vector<struct fid_mr *> &local_mrs,
                              const std::vector<uint64_t> &remote_keys,
                              const std::vector<size_t> &remote_selected_endpoints,
+                             const std::vector<size_t> &peer_rail_for_local_rail,
+                             const nixlLibfabricRailUnreachable &unreachable,
                              const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
                              uint16_t xfer_id,
                              uint8_t write_tag,

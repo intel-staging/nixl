@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "libfabric/libfabric_rail.h"
+#include "libfabric/libfabric_rail_manager.h"
 
 /** Multi-rail connection metadata for remote agents */
 struct nixlLibfabricConnection : public nixlBackendConnMD {
@@ -44,6 +45,11 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
     std::unordered_map<size_t, std::vector<fi_addr_t>>
         rail_remote_addr_list_; // Rail libfabric addresses. key=rail id.
     std::vector<char *> src_ep_names_; // Rail endpoint names
+    // Peer rail for each local rail, by fabric segment (see computeRailPeering()). Empty when no
+    // fabric identity was readable; NIXL_LF_NO_PEER_RAIL for a rail with no peer on its segment.
+    std::vector<size_t> peer_rail_for_local_rail_;
+    // Local/peer rail pairs known to be on different segments; see nixlLibfabricRailUnreachable
+    nixlLibfabricRailUnreachable rail_unreachable_;
     std::atomic<ConnectionState> overall_state_; // Current connection state
 
     // Set once the peer holds our endpoints in its AV, so it can attribute our traffic.

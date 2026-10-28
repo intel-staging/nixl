@@ -31,6 +31,11 @@
 
 #include <numa.h>
 
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 namespace LibfabricUtils {
 
 namespace {
@@ -90,6 +95,76 @@ selectVerbsDomains(const nixlProviderDeviceMap &provider_device_map) {
     // Sorted so rail indices do not depend on the unordered map's iteration order.
     std::sort(domains.begin(), domains.end());
     return domains;
+}
+
+/****************************************
+ * Fabric identity
+ *****************************************/
+
+nixlLibfabricFabricId
+fabricIdFromEpName(uint32_t addr_format, const void *ep_name, size_t len) {
+    nixlLibfabricFabricId id;
+
+    if (ep_name == nullptr) {
+        return id;
+    }
+
+    // IPv4 only; anything else gives an invalid id and index pairing.
+    if (addr_format == FI_SOCKADDR_IN || addr_format == FI_SOCKADDR) {
+        struct sockaddr_in sin;
+        if (len < sizeof(sin)) {
+            return id;
+        }
+        memcpy(&sin, ep_name, sizeof(sin));
+        if (sin.sin_family != AF_INET) {
+            return id;
+        }
+        id.valid = true;
+        id.addr = sin.sin_addr.s_addr;
+    }
+
+    return id;
+}
+
+void
+resolveLocalFabricMask(nixlLibfabricFabricId &id) {
+    if (!id.valid) {
+        return;
+    }
+
+    struct ifaddrs *ifa_list = nullptr;
+    if (getifaddrs(&ifa_list) != 0) {
+        NIXL_DEBUG << "getifaddrs failed, rail pairing will compare addresses exactly";
+        return;
+    }
+
+    for (struct ifaddrs *ifa = ifa_list; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET ||
+            ifa->ifa_netmask == nullptr) {
+            continue;
+        }
+        const auto *sin = reinterpret_cast<const struct sockaddr_in *>(ifa->ifa_addr);
+        if (sin->sin_addr.s_addr != id.addr) {
+            continue;
+        }
+        const auto *mask = reinterpret_cast<const struct sockaddr_in *>(ifa->ifa_netmask);
+        id.mask = mask->sin_addr.s_addr;
+        break;
+    }
+
+    freeifaddrs(ifa_list);
+}
+
+bool
+sameFabric(const nixlLibfabricFabricId &local, const nixlLibfabricFabricId &peer) {
+    if (!local.valid || !peer.valid) {
+        return false;
+    }
+    // Without a netmask only an exact match can be trusted.
+    if (local.mask == 0) {
+        return local.addr == peer.addr;
+    }
+    return (local.addr & local.mask) == (peer.addr & local.mask);
 }
 
 /****************************************

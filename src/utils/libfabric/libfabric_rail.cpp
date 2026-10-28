@@ -22,6 +22,9 @@
 #include "libfabric_common.h"
 #include "libfabric_accel.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include <cstring>
 #include <optional>
 #include <stdexcept>
@@ -705,6 +708,19 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         if (ret) {
             NIXL_ERROR << "fi_getname failed for rail " << rail_id << ": " << fi_strerror(-ret);
             throw std::runtime_error("fi_getname failed for rail " + std::to_string(rail_id));
+        }
+
+        // Remember how this rail is addressed, to pair it with the peer rail on its segment
+        this->ep_name_len = ep_name_len;
+        this->addr_format = (info != nullptr) ? info->addr_format : FI_FORMAT_UNSPEC;
+        fabric_id = LibfabricUtils::fabricIdFromEpName(this->addr_format, ep_name, ep_name_len);
+        LibfabricUtils::resolveLocalFabricMask(fabric_id);
+        if (fabric_id.valid) {
+            char ip[INET_ADDRSTRLEN] = {0};
+            struct in_addr a;
+            a.s_addr = fabric_id.addr;
+            inet_ntop(AF_INET, &a, ip, sizeof(ip));
+            NIXL_DEBUG << "Rail " << rail_id << " (" << device_name << ") fabric address " << ip;
         }
 
         // Initialize control request pool with buffers

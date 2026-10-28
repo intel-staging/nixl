@@ -405,6 +405,11 @@ public:
     std::string device_name; ///< Libfabric domain name for this rail
     std::string provider_name; ///< Core provider name (e.g., "efa", "efa-direct", "verbs")
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
+    size_t ep_name_len = 0; ///< Valid bytes in @ref ep_name
+    uint32_t addr_format = FI_FORMAT_UNSPEC; ///< fi_info::addr_format, for reading @ref ep_name
+    /// Where this rail sits on the fabric, including the local netmask; see
+    /// LibfabricUtils::sameFabric. Invalid when the address format cannot be read.
+    LibfabricUtils::nixlLibfabricFabricId fabric_id;
     struct fid_ep *endpoint; ///< Libfabric endpoint handle
 
     /** Initialize libfabric rail with all resources
