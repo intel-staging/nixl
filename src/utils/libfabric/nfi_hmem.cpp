@@ -306,7 +306,6 @@ nfi_ze_device_index(ze_device_handle_t handle) {
  */
 static void
 nfi_ze_check_pooled(const void *addr, struct nfi_hmem_info *info) {
-    constexpr uint64_t min_bo_size = 64 * 1024;
     void *base = nullptr;
     size_t size = 0;
 
@@ -339,9 +338,8 @@ nfi_ze_check_pooled(const void *addr, struct nfi_hmem_info *info) {
         return;
     }
 
-    const uint64_t rounded =
-        (static_cast<uint64_t>(size) + min_bo_size - 1) / min_bo_size * min_bo_size;
-    if (static_cast<uint64_t>(dmabuf_size) > rounded) {
+    if (nfi_hmem_ze_is_pooled_slice(static_cast<uint64_t>(size),
+                                    static_cast<uint64_t>(dmabuf_size))) {
         info->pooled_dmabuf_size = static_cast<uint64_t>(dmabuf_size);
         info->alloc_size = static_cast<uint64_t>(size);
         nfi_log(NFI_HMEM_LOG_DEBUG,
@@ -486,6 +484,18 @@ nfi_vendor_index(enum fi_hmem_iface iface) {
  * Public interface
  *****************************************/
 
+bool
+nfi_hmem_ze_is_pooled_slice(uint64_t alloc_size, uint64_t dmabuf_size) {
+    /* Smallest buffer object Level Zero allocates; a standalone allocation is rounded up to it. */
+    constexpr uint64_t min_bo_size = 64 * 1024;
+
+    if (alloc_size == 0 || alloc_size > UINT64_MAX - (min_bo_size - 1)) {
+        return false;
+    }
+    const uint64_t rounded = (alloc_size + min_bo_size - 1) / min_bo_size * min_bo_size;
+    return dmabuf_size > rounded;
+}
+
 int
 nfi_hmem_query_ptr(const void *addr, struct nfi_hmem_info *info) {
     if (!addr || !info) {
@@ -537,8 +547,9 @@ nfi_hmem_fill_mr_attr(const struct nfi_hmem_info *info, struct fi_mr_attr *attr)
         attr->device.neuron = static_cast<int>(info->device);
         break;
     case FI_HMEM_ROCR:
-        /* device.rocr exists from libfabric 2.3; older versions leave the union zeroed. */
-#if FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION) >= FI_VERSION(2, 3)
+        /* device.rocr exists from libfabric 2.5 (not 2.3 or 2.4); older versions leave the
+         * union zeroed. */
+#if FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION) >= FI_VERSION(2, 5)
         attr->device.rocr = static_cast<int>(info->device);
 #endif
         break;

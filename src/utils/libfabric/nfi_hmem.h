@@ -176,6 +176,20 @@ nfi_hmem_iface_name(enum fi_hmem_iface iface);
 size_t
 nfi_hmem_device_bdfs(enum fi_hmem_iface iface, struct nfi_hmem_bus_id *out, size_t max);
 
+/**
+ * @brief Whether a Level Zero allocation of @p alloc_size bytes whose exported dma-buf is
+ *        @p dmabuf_size bytes is a slice of a pooled buffer object.
+ *
+ * A standalone allocation gets its own buffer object of at least 64 KiB, so its dma-buf is
+ * @p alloc_size rounded up to 64 KiB; anything larger is shared with other allocations. This is
+ * the decision behind @ref nfi_hmem_info::pooled_dmabuf_size, exposed so it can be tested without
+ * a GPU.
+ *
+ * @return False for a zero @p alloc_size.
+ */
+bool
+nfi_hmem_ze_is_pooled_slice(uint64_t alloc_size, uint64_t dmabuf_size);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

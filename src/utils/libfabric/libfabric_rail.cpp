@@ -1803,11 +1803,11 @@ nixlLibfabricRail::registerMemory(void *buffer,
                 // AMD ROCr memory registration
                 // ROCr uses HSA agent handles for device identification.
                 // The device_id corresponds to the GPU index (0-based).
-                // The device.rocr union member was added in libfabric v2.3; on
-                // older libfabric the union has no rocr member (and the EFA
-                // provider ignores the device handle for ROCr), so the
+                // The device.rocr union member was added in libfabric v2.5 (v2.3 and
+                // v2.4 do not have it); on older libfabric the union has no rocr member
+                // (and the EFA provider ignores the device handle for ROCr), so the
                 // zero-initialized union is sufficient.
-#if FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION) >= FI_VERSION(2, 3)
+#if FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION) >= FI_VERSION(2, 5)
                 mr_attr.device.rocr = device_id;
 #endif
                 NIXL_DEBUG << "ROCr memory registration - iface: FI_HMEM_ROCR, device_id: "

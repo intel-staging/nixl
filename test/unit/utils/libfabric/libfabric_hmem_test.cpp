@@ -26,12 +26,19 @@
 #include "common/nixl_log.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
 #include <type_traits>
 #include <vector>
+
+#ifdef HAVE_ZE
+#include <dirent.h>
+#include <dlfcn.h>
+#include <level_zero/ze_api.h>
+#endif
 
 namespace {
 
@@ -336,10 +343,228 @@ testBusIdString() {
     check(accelBusIdString(info).empty(), "an info block with no address renders empty");
 }
 
+/****************************************
+ * 8. Pooled-slice decision
+ *****************************************/
+
+void
+testPooledSliceDecision() {
+    NIXL_INFO << "8. Testing the pooled-slice decision";
+
+    constexpr uint64_t KiB = 1024;
+    constexpr uint64_t MiB = 1024 * KiB;
+
+    // A standalone allocation's dma-buf is its size rounded up to 64 KiB.
+    check(!nfi_hmem_ze_is_pooled_slice(4 * KiB, 64 * KiB),
+          "a 4 KiB allocation in its own 64 KiB buffer object is not pooled");
+    check(!nfi_hmem_ze_is_pooled_slice(64 * KiB, 64 * KiB),
+          "an allocation exactly filling 64 KiB is not pooled");
+    check(!nfi_hmem_ze_is_pooled_slice(64 * KiB + 1, 128 * KiB),
+          "64 KiB + 1 rounds up to 128 KiB, and is not pooled there");
+    check(!nfi_hmem_ze_is_pooled_slice(2 * MiB + 4 * KiB, 2 * MiB + 64 * KiB),
+          "an odd large size rounds up to the next 64 KiB, not to 2 MiB");
+
+    // Anything larger than the rounded size is shared with other allocations.
+    check(nfi_hmem_ze_is_pooled_slice(4 * KiB, 64 * KiB + 1),
+          "one byte past the rounded size is pooled");
+    check(nfi_hmem_ze_is_pooled_slice(64 * KiB, 128 * KiB),
+          "64 KiB inside a 128 KiB buffer object is pooled");
+    check(nfi_hmem_ze_is_pooled_slice(4 * KiB, 2 * MiB), "a 4 KiB slice of a 2 MiB pool is pooled");
+    check(nfi_hmem_ze_is_pooled_slice(1 * MiB, 16 * MiB),
+          "a 1 MiB slice of a 16 MiB pool is pooled");
+
+    // Degenerate inputs never claim pooling.
+    check(!nfi_hmem_ze_is_pooled_slice(0, 2 * MiB), "a zero-size allocation is not pooled");
+    check(!nfi_hmem_ze_is_pooled_slice(4 * KiB, 0), "a zero-size dma-buf is not pooled");
+    check(!nfi_hmem_ze_is_pooled_slice(UINT64_MAX, UINT64_MAX),
+          "a size whose rounding would overflow is not pooled");
+}
+
+/****************************************
+ * 9. Level Zero device memory
+ *****************************************/
+
+#ifdef HAVE_ZE
+
+/** The Level Zero entry points the test allocates with, from the loader nfi_hmem also opens. */
+struct ZeApi {
+    decltype(&zeInit) init = nullptr;
+    decltype(&zeDriverGet) driver_get = nullptr;
+    decltype(&zeDeviceGet) device_get = nullptr;
+    decltype(&zeContextCreate) context_create = nullptr;
+    decltype(&zeContextDestroy) context_destroy = nullptr;
+    decltype(&zeMemAllocDevice) mem_alloc_device = nullptr;
+    decltype(&zeMemFree) mem_free = nullptr;
+
+    bool
+    load() {
+        void *handle = dlopen("libze_loader.so.1", RTLD_NOW);
+        if (handle == nullptr) {
+            return false;
+        }
+        init = reinterpret_cast<decltype(init)>(dlsym(handle, "zeInit"));
+        driver_get = reinterpret_cast<decltype(driver_get)>(dlsym(handle, "zeDriverGet"));
+        device_get = reinterpret_cast<decltype(device_get)>(dlsym(handle, "zeDeviceGet"));
+        context_create =
+            reinterpret_cast<decltype(context_create)>(dlsym(handle, "zeContextCreate"));
+        context_destroy =
+            reinterpret_cast<decltype(context_destroy)>(dlsym(handle, "zeContextDestroy"));
+        mem_alloc_device =
+            reinterpret_cast<decltype(mem_alloc_device)>(dlsym(handle, "zeMemAllocDevice"));
+        mem_free = reinterpret_cast<decltype(mem_free)>(dlsym(handle, "zeMemFree"));
+        return init && driver_get && device_get && context_create && context_destroy &&
+            mem_alloc_device && mem_free;
+    }
+};
+
+int
+countOpenFds() {
+    int count = 0;
+    DIR *dir = opendir("/proc/self/fd");
+    if (dir == nullptr) {
+        return -1;
+    }
+    while (readdir(dir) != nullptr) {
+        ++count;
+    }
+    closedir(dir);
+    return count;
+}
+
+void *
+zeAlloc(const ZeApi &ze,
+        ze_context_handle_t ctx,
+        ze_device_handle_t device,
+        size_t size,
+        bool exportable) {
+    ze_external_memory_export_desc_t export_desc = {};
+    export_desc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_DESC;
+    export_desc.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
+    ze_device_mem_alloc_desc_t alloc_desc = {};
+    alloc_desc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+    alloc_desc.pNext = exportable ? &export_desc : nullptr;
+
+    void *ptr = nullptr;
+    if (ze.mem_alloc_device(ctx, &alloc_desc, size, 64, device, &ptr) != ZE_RESULT_SUCCESS) {
+        return nullptr;
+    }
+    return ptr;
+}
+
+void
+testLevelZeroMemory() {
+    NIXL_INFO << "9. Testing Level Zero device memory";
+
+    if (!nfi_hmem_iface_available(FI_HMEM_ZE)) {
+        NIXL_INFO << "   SKIP: Level Zero is not usable on this host";
+        return;
+    }
+    ZeApi ze;
+    uint32_t driver_count = 1;
+    ze_driver_handle_t driver = nullptr;
+    uint32_t device_count = 0;
+    if (!ze.load() || ze.init(ZE_INIT_FLAG_GPU_ONLY) != ZE_RESULT_SUCCESS ||
+        ze.driver_get(&driver_count, &driver) != ZE_RESULT_SUCCESS || driver_count == 0 ||
+        ze.device_get(driver, &device_count, nullptr) != ZE_RESULT_SUCCESS || device_count == 0) {
+        check(false, "Level Zero is usable to the shim, so the test can reach it too");
+        return;
+    }
+    std::vector<ze_device_handle_t> devices(device_count);
+    ze.device_get(driver, &device_count, devices.data());
+
+    ze_context_desc_t ctx_desc = {};
+    ctx_desc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
+    ze_context_handle_t ctx = nullptr;
+    if (ze.context_create(driver, &ctx_desc, &ctx) != ZE_RESULT_SUCCESS) {
+        check(false, "a Level Zero context can be created");
+        return;
+    }
+
+    // Each device's memory carries that device's ordinal, as libfabric numbers driver 0's devices.
+    for (uint32_t i = 0; i < device_count; ++i) {
+        void *ptr = zeAlloc(ze, ctx, devices[i], 64 * 1024, true);
+        if (ptr == nullptr) {
+            NIXL_INFO << "   device " << i << ": allocation failed, skipping it";
+            continue;
+        }
+        struct nfi_hmem_info info;
+        check(nfi_hmem_query_ptr(ptr, &info) == 0 && info.iface == FI_HMEM_ZE,
+              "device " + std::to_string(i) + " memory is claimed by Level Zero");
+        check(info.device == static_cast<uint64_t>(fi_hmem_ze_device(0, static_cast<int>(i))),
+              "device " + std::to_string(i) + " memory carries ordinal " + std::to_string(i));
+        check(info.pooled_dmabuf_size == 0,
+              "an exportable allocation on device " + std::to_string(i) + " is not pooled");
+        ze.mem_free(ctx, ptr);
+    }
+
+    // An interior pointer belongs to the allocation, which is still not pooled.
+    void *big = zeAlloc(ze, ctx, devices[0], 1024 * 1024, true);
+    if (big != nullptr) {
+        struct nfi_hmem_info info;
+        check(nfi_hmem_query_ptr(static_cast<char *>(big) + 4096, &info) == 0 &&
+                  info.iface == FI_HMEM_ZE && info.pooled_dmabuf_size == 0,
+              "an interior pointer of an exportable allocation is ZE and not pooled");
+
+        // Each query exports the dma-buf; the driver hands back the same fd every time.
+        const int fds_before = countOpenFds();
+        for (int q = 0; q < 20; ++q) {
+            nfi_hmem_query_ptr(big, &info);
+        }
+        const int fds_after = countOpenFds();
+        check(fds_before >= 0 && fds_after - fds_before <= 1,
+              "repeated queries of one allocation open at most one fd");
+        ze.mem_free(ctx, big);
+    }
+
+    // Small allocations without an export descriptor. Whether the driver pools them is decided
+    // from where they land: two in the same 64 KiB share a buffer object.
+    void *a = zeAlloc(ze, ctx, devices[0], 4096, false);
+    void *b = zeAlloc(ze, ctx, devices[0], 4096, false);
+    if (a != nullptr && b != nullptr) {
+        const uintptr_t pa = reinterpret_cast<uintptr_t>(a);
+        const uintptr_t pb = reinterpret_cast<uintptr_t>(b);
+        const bool pooled = (pa > pb ? pa - pb : pb - pa) < 64 * 1024;
+        struct nfi_hmem_info info_a;
+        struct nfi_hmem_info info_b;
+        nfi_hmem_query_ptr(a, &info_a);
+        nfi_hmem_query_ptr(b, &info_b);
+        if (pooled) {
+            check(info_a.pooled_dmabuf_size > 0 && info_b.pooled_dmabuf_size > 0,
+                  "allocations sharing a buffer object are both reported as pooled");
+            check(info_a.alloc_size == 4096 && info_b.alloc_size == 4096,
+                  "a pooled report carries the allocation's own size");
+        } else {
+            NIXL_INFO << "   the driver did not pool these allocations";
+            check(info_a.pooled_dmabuf_size == 0 && info_b.pooled_dmabuf_size == 0,
+                  "allocations in their own buffer objects are not reported as pooled");
+        }
+    } else {
+        check(false, "two 4 KiB device allocations succeed");
+    }
+    if (a != nullptr) {
+        ze.mem_free(ctx, a);
+    }
+    if (b != nullptr) {
+        ze.mem_free(ctx, b);
+    }
+
+    ze.context_destroy(ctx);
+}
+
+#endif // HAVE_ZE
+
 } // namespace
 
 int
 main() {
+#ifdef HAVE_ZE
+    // Ask the Intel driver to pool small device allocations, so section 9 exercises the pooled
+    // path; read at Level Zero initialisation, so set before anything initialises it. Not
+    // overwritten when already set.
+    setenv("NEOReadDebugKeys", "1", 0);
+    setenv("EnableDeviceUsmAllocationPool", "2", 0);
+#endif
+
     NIXL_INFO << "=== Testing the libfabric HMEM shim ===";
 
     // Before vendor initialisation, so its log lines appear.
@@ -352,6 +577,10 @@ main() {
     testFillMrAttr();
     testDeviceBdfs();
     testBusIdString();
+    testPooledSliceDecision();
+#ifdef HAVE_ZE
+    testLevelZeroMemory();
+#endif
 
     if (failures != 0) {
         NIXL_ERROR << "=== " << failures << " check(s) FAILED ===";
