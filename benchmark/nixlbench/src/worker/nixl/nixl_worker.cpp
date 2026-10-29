@@ -32,6 +32,7 @@
 #include "utils/neuron.h"
 #include "utils/scope_guard.h"
 #include "utils/utils.h"
+#include "utils/ze.h"
 #include <unistd.h>
 #include <utility>
 #include <sys/time.h>
@@ -46,20 +47,29 @@
 #define MAP_HUGE_2MB (21 << 26) // 2MB hugepage size encoding
 #endif
 
+// @p local: whether this process allocates the segment. The initiator also types the target's
+// segment, which lives on the peer, so it needs no local accelerator.
 static nixl_mem_t
-resolveVramSegment() {
+resolveVramSegment(bool local) {
+    if (!local) {
+        return VRAM_SEG;
+    }
+    // Checked at runtime first, so a build with CUDA headers still uses Neuron or Level Zero
+    if (neuronCoreCount() > 0 || xferBenchUtils::useZeVram()) {
+        return VRAM_SEG;
+    }
 #if HAVE_CUDA
     return VRAM_SEG;
 #elif HAVE_ROCM
     return VRAM_SEG;
 #else
-    if (neuronCoreCount() > 0) return VRAM_SEG;
-    std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
+    std::cerr << "VRAM not supported without CUDA, ROCm, Neuron or Level Zero" << std::endl;
     std::exit(EXIT_FAILURE);
 #endif
 }
 
-#define GET_SEG_TYPE(is_initiator)                                                          \
+// @p local: whether the segment is this process's own (see resolveVramSegment())
+#define GET_SEG_TYPE(is_initiator, local)                                                   \
     ({                                                                                      \
         std::string _seg_type_str = ((is_initiator) ? xferBenchConfig::initiator_seg_type : \
                                                       xferBenchConfig::target_seg_type);    \
@@ -67,7 +77,7 @@ resolveVramSegment() {
         if (0 == _seg_type_str.compare("DRAM")) {                                           \
             _seg_type = DRAM_SEG;                                                           \
         } else if (0 == _seg_type_str.compare("VRAM")) {                                    \
-            _seg_type = resolveVramSegment();                                               \
+            _seg_type = resolveVramSegment(local);                                          \
         } else {                                                                            \
             std::cerr << "Invalid segment type: " << _seg_type_str << std::endl;            \
             exit(EXIT_FAILURE);                                                             \
@@ -118,7 +128,7 @@ getRandomSeed() {
 xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices)
     : xferBenchWorker(),
       default_rng_(getRandomSeed()) {
-    seg_type = GET_SEG_TYPE(isInitiator());
+    seg_type = GET_SEG_TYPE(isInitiator(), true);
 
     int rank;
     std::string backend_name;
@@ -624,6 +634,22 @@ cleanupVramNeuron(xferBenchIOV &iov) {
     CHECK_NEURON_ERROR(neuronFree((void *)iov.addr), "Failed to free nrt tensor");
 }
 
+static std::optional<xferBenchIOV>
+getVramDescZe(int devid, size_t buffer_size, uint8_t memset_value) {
+    void *addr;
+    CHECK_ZE_ERROR(zeAccelMalloc(&addr, buffer_size, devid),
+                   "Failed to allocate Level Zero device buffer");
+    CHECK_ZE_ERROR(zeAccelMemset(addr, memset_value, buffer_size),
+                   "Failed to set Level Zero device memory");
+
+    return std::optional<xferBenchIOV>(std::in_place, (uintptr_t)addr, buffer_size, devid);
+}
+
+static void
+cleanupVramZe(xferBenchIOV &iov) {
+    CHECK_ZE_ERROR(zeAccelFree((void *)iov.addr), "Failed to free Level Zero device buffer");
+}
+
 #if HAVE_CUDA
 static std::optional<xferBenchIOV>
 getVramDescCuda(int devid, size_t buffer_size, uint8_t memset_value) {
@@ -749,6 +775,16 @@ getVramDesc(int devid, size_t buffer_size, bool isInit) {
         return getVramDescNeuron(devid, buffer_size, memset_value);
     }
 
+    if (xferBenchUtils::useZeVram()) {
+        if (xferBenchConfig::enable_vmm) {
+            std::cerr << "--enable_vmm (and --use_localized) need CUDA VMM; not supported for "
+                         "Level Zero VRAM"
+                      << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        return getVramDescZe(devid, buffer_size, memset_value);
+    }
+
 #if HAVE_CUDA
     CHECK_CUDA_ERROR(cudaSetDevice(devid), "Failed to set device");
     if (xferBenchConfig::enable_vmm) {
@@ -760,7 +796,7 @@ getVramDesc(int devid, size_t buffer_size, bool isInit) {
     CHECK_CUDA_ERROR(hipSetDevice(devid), "Failed to set device");
     return getVramDescRocm(devid, buffer_size, memset_value);
 #else
-    std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
+    std::cerr << "VRAM not supported without CUDA, ROCm, Neuron or Level Zero" << std::endl;
     return std::nullopt;
 #endif
 }
@@ -954,12 +990,17 @@ cleanupBasicDescVram(xferBenchIOV &iov) {
         return;
     }
 
+    if (xferBenchUtils::useZeVram()) {
+        cleanupVramZe(iov);
+        return;
+    }
+
 #if HAVE_CUDA
     cleanupVramCuda(iov);
 #elif HAVE_ROCM
     cleanupVramRocm(iov);
 #else
-    std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
+    std::cerr << "VRAM not supported without CUDA, ROCm, Neuron or Level Zero" << std::endl;
 #endif
 }
 
@@ -1623,7 +1664,7 @@ getRemoteSegType() {
     } else if (xferBenchConfig::isStorageBackend()) {
         return FILE_SEG;
     }
-    return GET_SEG_TYPE(false);
+    return GET_SEG_TYPE(false, false);
 }
 
 // Register local and remote memory with the agent.
@@ -1635,7 +1676,7 @@ registerIterationMem(nixlAgent *agent,
     nixl_opt_args_t reg_args;
     reg_args.backends.push_back(backend_engine);
 
-    nixl_reg_dlist_t local_reg = iovListToNixlRegDlist(local_iov, GET_SEG_TYPE(true));
+    nixl_reg_dlist_t local_reg = iovListToNixlRegDlist(local_iov, GET_SEG_TYPE(true, true));
     nixl_status_t rc = agent->registerMem(local_reg, &reg_args);
     if (rc != NIXL_SUCCESS) {
         return rc;
@@ -1661,7 +1702,7 @@ deregisterIterationMem(nixlAgent *agent,
     nixl_opt_args_t reg_args;
     reg_args.backends.push_back(backend_engine);
 
-    nixl_reg_dlist_t local_reg = iovListToNixlRegDlist(local_iov, GET_SEG_TYPE(true));
+    nixl_reg_dlist_t local_reg = iovListToNixlRegDlist(local_iov, GET_SEG_TYPE(true, true));
     nixl_status_t rc = agent->deregisterMem(local_reg, &reg_args);
     if (rc != NIXL_SUCCESS) {
         return rc;
@@ -1721,8 +1762,8 @@ prepareSlot(nixlAgent *agent,
         nixl_status_t rc;
         if (xferBenchConfig::prepared_xfer) {
             if (!slot.prep_local_dlist) {
-                nixl_xfer_dlist_t ld(GET_SEG_TYPE(true));
-                nixl_xfer_dlist_t rd(GET_SEG_TYPE(false));
+                nixl_xfer_dlist_t ld(GET_SEG_TYPE(true, true));
+                nixl_xfer_dlist_t rd(GET_SEG_TYPE(false, false));
                 prepareTransferDescriptors(ld, rd, slot.local_iov, slot.remote_iov);
                 rc = agent->prepXferDlist(NIXL_INIT_AGENT, ld, slot.prep_local_dlist, &params);
                 if (rc != NIXL_SUCCESS) {
@@ -1743,8 +1784,8 @@ prepareSlot(nixlAgent *agent,
                                     slot.req,
                                     &params);
         } else {
-            nixl_xfer_dlist_t ld(GET_SEG_TYPE(true));
-            nixl_xfer_dlist_t rd(GET_SEG_TYPE(false));
+            nixl_xfer_dlist_t ld(GET_SEG_TYPE(true, true));
+            nixl_xfer_dlist_t rd(GET_SEG_TYPE(false, false));
             prepareTransferDescriptors(ld, rd, slot.local_iov, slot.remote_iov);
             rc = agent->createXferReq(op, ld, rd, target, slot.req, &params);
         }

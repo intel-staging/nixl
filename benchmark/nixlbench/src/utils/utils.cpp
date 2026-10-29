@@ -36,6 +36,7 @@
 
 #include "runtime/etcd/etcd_rt.h"
 #include "utils/neuron.h"
+#include "utils/ze.h"
 #include "utils/utils.h"
 
 namespace {
@@ -1253,6 +1254,45 @@ xferBenchUtils::getDevToUse() {
     return dev_to_use;
 }
 
+/* CUDA and ROCm take precedence when they have a device: such hosts often also expose an Intel
+ * GPU to Level Zero. They are asked first, so a CUDA or ROCm run never initializes Level Zero.
+ * Only "no device" or "no driver" hands VRAM to Level Zero, so a CUDA build runs on an Intel host
+ * that has the CUDA runtime libraries but no NVIDIA GPU; any other CUDA or ROCm error keeps VRAM
+ * on that runtime, which then fails loudly instead of benchmarking a different GPU. */
+bool
+xferBenchUtils::useZeVram() {
+    /* Decided once per process. */
+    static const bool use_ze = []() {
+#if HAVE_CUDA
+        int cuda_devices = 0;
+        const cudaError_t cuda_err = cudaGetDeviceCount(&cuda_devices);
+        if (cuda_err == cudaSuccess && cuda_devices > 0) {
+            return false;
+        }
+        if (cuda_err != cudaSuccess && cuda_err != cudaErrorNoDevice &&
+            cuda_err != cudaErrorInsufficientDriver) {
+            std::cerr << "cudaGetDeviceCount failed: " << cudaGetErrorString(cuda_err)
+                      << "; not falling back to Level Zero" << std::endl;
+            return false;
+        }
+#elif HAVE_ROCM
+        int rocm_devices = 0;
+        const hipError_t hip_err = hipGetDeviceCount(&rocm_devices);
+        if (hip_err == hipSuccess && rocm_devices > 0) {
+            return false;
+        }
+        if (hip_err != hipSuccess && hip_err != hipErrorNoDevice &&
+            hip_err != hipErrorInsufficientDriver) {
+            std::cerr << "hipGetDeviceCount failed: " << hipGetErrorString(hip_err)
+                      << "; not falling back to Level Zero" << std::endl;
+            return false;
+        }
+#endif
+        return zeAccelDeviceCount() > 0;
+    }();
+    return use_ze;
+}
+
 static void
 copyVramToHost(void *host_addr, const void *device_addr, size_t len) {
     if (neuronCoreCount() > 0) {
@@ -1261,6 +1301,14 @@ copyVramToHost(void *host_addr, const void *device_addr, size_t len) {
             "nrt_tensor_read failed");
         return;
     }
+#if HAVE_ZE
+    /* Before the CUDA branch, which is compiled in whenever the CUDA headers are present. */
+    if (xferBenchUtils::useZeVram()) {
+        CHECK_ZE_ERROR(zeAccelMemcpyDtoH(host_addr, device_addr, len),
+                       "Failed to copy Level Zero device memory to host");
+        return;
+    }
+#endif
 #if HAVE_CUDA
     CHECK_CUDA_ERROR(cudaMemcpy(host_addr, (void *)device_addr, len, cudaMemcpyDeviceToHost),
                      "cudaMemcpy failed");
@@ -1268,7 +1316,7 @@ copyVramToHost(void *host_addr, const void *device_addr, size_t len) {
     CHECK_CUDA_ERROR(hipMemcpy(host_addr, (void *)device_addr, len, hipMemcpyDeviceToHost),
                      "hipMemcpy failed");
 #else
-    std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
+    std::cerr << "VRAM not supported without CUDA, ROCm, Neuron or Level Zero" << std::endl;
     exit(EXIT_FAILURE);
 #endif
 }
