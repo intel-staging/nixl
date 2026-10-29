@@ -470,6 +470,7 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
     hints->caps |= prov_info->extra_caps;
     hints->domain_attr->mr_mode = prov_info->mr_mode;
     hints->domain_attr->mr_key_size = prov_info->mr_key_size;
+    bound_post_retries_ = prov_info->needs_all_rail_progress;
     if (prov_info->needs_prov_name_hint) {
         hints->fabric_attr->prov_name = strdup(prov_info->name);
     }
@@ -1365,9 +1366,19 @@ nixlLibfabricRail::drainPostQueue() {
     // drain the queue up to configured limit,
     // to ensure requests from other rails do not wait too much time
     size_t post_req_count = 0;
-    while (post_req_count < POST_MAX_BATCH_SIZE && post_ring_.pop(pr)) {
+    // A parked post goes first, so post order is kept
+    auto next_post = [this](nixlLibfabricPostRequest &out) {
+        if (parked_post_) {
+            out = *parked_post_;
+            parked_post_.reset();
+            return true;
+        }
+        return post_ring_.pop(out);
+    };
+    while (post_req_count < POST_MAX_BATCH_SIZE && next_post(pr)) {
         ++post_req_count;
         int ret = -FI_EAGAIN;
+        size_t eagain_retries = 0;
 
 #if HAVE_CUDA
         if (pr.is_cuda_vram) {
@@ -1464,8 +1475,19 @@ nixlLibfabricRail::drainPostQueue() {
             }
 
             if (ret == -FI_EAGAIN) {
+                if (bound_post_retries_ && ++eagain_retries >= POST_MAX_EAGAIN_RETRIES) {
+                    break;
+                }
                 pollForCompletions();
             }
+        }
+
+        if (ret == -FI_EAGAIN) {
+            // Retried on the next drain, after the caller has progressed the other rails
+            NIXL_TRACE << "drainPostQueue: parking a post after " << eagain_retries
+                       << " FI_EAGAIN retries on rail " << rail_id;
+            parked_post_ = pr;
+            return NIXL_SUCCESS;
         }
 
         if (ret != 0) {

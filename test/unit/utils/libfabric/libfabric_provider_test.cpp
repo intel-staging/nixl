@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <deque>
 #include <exception>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -388,6 +389,13 @@ testDeviceMetadataPerProvider() {
  * 6. Live topology on a verbs host
  *****************************************/
 
+/** Whether @p device has the sysfs PCI device that hwloc reports it under. */
+bool
+nicVisibleInSysfs(const std::string &device) {
+    std::error_code ec;
+    return std::filesystem::exists("/sys/class/infiniband/" + device + "/device", ec);
+}
+
 void
 testLiveVerbsTopology() {
     NIXL_INFO << "6. Testing live topology";
@@ -417,23 +425,31 @@ testLiveVerbsTopology() {
         return;
     }
 
-    // verbs reports FI_BUS_UNKNOWN, so PCIe addresses come from the hwloc fallback.
-    check(topology.getTotalNicCount() == topology.getAllDevices().size(),
-          "every selected verbs device resolved to a PCIe address");
-    check(topology.hasPcieDevices(), "hasPcieDevices() reflects the resolved addresses");
-
-    // Every selected device has a PCIe address.
-    for (const auto &device : topology.getAllDevices()) {
-        check(!topology.getPcieAddress(device).empty(),
-              "selected device " + device + " has a PCIe address");
-    }
-
     for (const auto &device : topology.getAllDevices()) {
         check(device.find("-dgram") == std::string::npos &&
                   device.find("-xrc") == std::string::npos,
               "selected device " + device + " is an RDM-capable domain");
+    }
+
+    // verbs reports FI_BUS_UNKNOWN, so PCIe addresses come from the hwloc fallback, which finds
+    // a NIC through its sysfs device. Where sysfs hides it (e.g. some containers) the topology
+    // falls back to every rail, which is supported, so only visible NICs must resolve.
+    size_t visible = 0;
+    for (const auto &device : topology.getAllDevices()) {
+        if (!nicVisibleInSysfs(device)) {
+            NIXL_INFO << "   " << device << " has no sysfs PCI device, skipping its PCIe checks";
+            continue;
+        }
+        ++visible;
+        check(!topology.getPcieAddress(device).empty(),
+              "selected device " + device + " has a PCIe address");
         check(topology.getDeviceNumaNode(device) != nixlLibfabricTopology::INVALID_NUMA_NODE_ID,
               "selected device " + device + " resolved to a NUMA node");
+    }
+    if (visible > 0) {
+        check(topology.getTotalNicCount() >= visible,
+              "every sysfs-visible verbs device resolved to a PCIe address");
+        check(topology.hasPcieDevices(), "hasPcieDevices() reflects the resolved addresses");
     }
 }
 

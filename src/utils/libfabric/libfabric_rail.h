@@ -22,6 +22,7 @@
 #include <vector>
 #include <deque>
 #include <limits>
+#include <optional>
 #include <string>
 #include <functional>
 #include <mutex>
@@ -647,6 +648,16 @@ private:
     // the post/poll interleave ratio constants
     static constexpr size_t POST_MAX_BATCH_SIZE = 256;
     static constexpr size_t POST_POLL_INTERLEAVE_RATIO = 32;
+
+    // FI_EAGAIN retries of one deferred post before it is parked for the next drain. Only for
+    // lazily connecting providers (see providerNeedsAllRailProgress()), whose FI_EAGAIN can mean
+    // the peer has not yet accepted this rail's connection. Retrying in place polls only this
+    // rail, so two agents each waiting on a rail the other is not progressing would never return.
+    static constexpr size_t POST_MAX_EAGAIN_RETRIES = 64;
+    bool bound_post_retries_ = false;
+    // Deferred post parked after POST_MAX_EAGAIN_RETRIES, retried before the ring so post order
+    // is kept. Used only by the progress thread, the ring's single consumer.
+    std::optional<nixlLibfabricPostRequest> parked_post_;
 
     // Whether a progress thread is handling CQ draining
     bool progress_thread_enabled_ = false;
