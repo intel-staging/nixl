@@ -36,6 +36,7 @@
 
 #include "runtime/etcd/etcd_rt.h"
 #include "utils/neuron.h"
+#include "utils/ze.h"
 #include "utils/utils.h"
 
 namespace {
@@ -1253,6 +1254,32 @@ xferBenchUtils::getDevToUse() {
     return dev_to_use;
 }
 
+/* CUDA and ROCm take precedence when they have a device: such hosts often also expose an Intel
+ * integrated GPU to Level Zero. Decided by device count rather than build flags, so a CUDA build
+ * still uses Level Zero on a host without NVIDIA devices. */
+bool
+xferBenchUtils::useZeVram() {
+    /* Decided once per process. */
+    static const bool use_ze = []() {
+        if (zeAccelDeviceCount() <= 0) {
+            return false;
+        }
+#if HAVE_CUDA
+        int cuda_devices = 0;
+        if (cudaGetDeviceCount(&cuda_devices) == cudaSuccess && cuda_devices > 0) {
+            return false;
+        }
+#elif HAVE_ROCM
+        int rocm_devices = 0;
+        if (hipGetDeviceCount(&rocm_devices) == hipSuccess && rocm_devices > 0) {
+            return false;
+        }
+#endif
+        return true;
+    }();
+    return use_ze;
+}
+
 static void
 copyVramToHost(void *host_addr, const void *device_addr, size_t len) {
     if (neuronCoreCount() > 0) {
@@ -1261,6 +1288,14 @@ copyVramToHost(void *host_addr, const void *device_addr, size_t len) {
             "nrt_tensor_read failed");
         return;
     }
+#if HAVE_ZE
+    /* Before the CUDA branch, which is compiled in whenever the CUDA headers are present. */
+    if (xferBenchUtils::useZeVram()) {
+        CHECK_ZE_ERROR(zeAccelMemcpyDtoH(host_addr, device_addr, len),
+                       "Failed to copy Level Zero device memory to host");
+        return;
+    }
+#endif
 #if HAVE_CUDA
     CHECK_CUDA_ERROR(cudaMemcpy(host_addr, (void *)device_addr, len, cudaMemcpyDeviceToHost),
                      "cudaMemcpy failed");
@@ -1268,7 +1303,7 @@ copyVramToHost(void *host_addr, const void *device_addr, size_t len) {
     CHECK_CUDA_ERROR(hipMemcpy(host_addr, (void *)device_addr, len, hipMemcpyDeviceToHost),
                      "hipMemcpy failed");
 #else
-    std::cerr << "VRAM not supported without CUDA, ROCm or Neuron" << std::endl;
+    std::cerr << "VRAM not supported without CUDA, ROCm, Neuron or Level Zero" << std::endl;
     exit(EXIT_FAILURE);
 #endif
 }
