@@ -97,4 +97,27 @@ if get_option('buildtype') != 'release'
 
     test('libfabric_dmabuf_test', libfabric_dmabuf_test_bin)
 
+    # No call wrapping: uses only the accelerator runtimes and hwloc. With Level Zero headers it
+    # also allocates GPU memory, through a dlopen'd libze_loader, when a GPU is present.
+    libfabric_hmem_test_bin = executable('libfabric_hmem_test',
+               'libfabric_hmem_test.cpp',
+               dependencies: libfabric_utils_dep + [ hwloc_dep, dependency('dl') ],
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               link_with: libfabric_utils_lib,
+               cpp_args: libfabric_test_cpp_args + (have_ze ? [ '-DHAVE_ZE' ] : []),
+               install: true)
+
+    test('libfabric_hmem_test', libfabric_hmem_test_bin)
+
+    # No libfabric call wrapping.
+    libfabric_provider_test_bin = executable('libfabric_provider_test',
+               'libfabric_provider_test.cpp',
+               dependencies: libfabric_utils_dep + [ hwloc_dep ],
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               link_with: libfabric_utils_lib,
+               cpp_args: libfabric_test_cpp_args,
+               install: true)
+
+    test('libfabric_provider_test', libfabric_provider_test_bin)
+
 endif

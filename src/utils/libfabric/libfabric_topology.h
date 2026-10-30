@@ -19,6 +19,7 @@
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_TOPOLOGY_H
 
 #include "libfabric_common.h"
+#include "libfabric_accel.h"
 #include "nixl.h"
 #include <hwloc.h>
 #include <unordered_map>
@@ -41,10 +42,14 @@ private:
     // Network fabric name (efa-direct, efa, tcp, sockets, etc.)
     std::string provider_name;
 
+    // Every selected domain as reported by device discovery, in rail order
+    std::vector<LibfabricUtils::nixlLibfabricDeviceInfo> discovered_devices;
+
     // System information
     int num_aws_accel; // AWS Trainium accelerators
     int num_nvidia_accel; // NVIDIA GPU accelerators
     int num_amd_accel; // AMD GPU accelerators
+    int num_intel_accel; // Discrete Intel GPUs enumerated by Level Zero
     int num_numa_nodes;
     int num_devices;
 
@@ -164,12 +169,22 @@ private:
     getPcieAddressFromHwlocPcidev(const hwloc_obj_attr_u::hwloc_pcidev_attr_s &pcidev) const;
     std::string
     getPcieAddressFromHwlocObj(hwloc_obj_t obj) const;
+    /**
+     * @brief PCIe address of the PCI device behind hwloc OS device @p osdev_name, or "".
+     *
+     * Used for NICs libfabric reports no bus info for; a verbs domain name is the InfiniBand
+     * device name, e.g. "rocep153s0f0".
+     */
+    std::string
+    getPcieAddressForOsDev(const std::string &osdev_name) const;
     bool
     isNvidiaAccel(hwloc_obj_t obj) const;
     bool
     isNeuronAccel(hwloc_obj_t obj) const;
     bool
     isAmdAccel(hwloc_obj_t obj) const;
+    bool
+    isIntelAccel(hwloc_obj_t obj) const;
 
     // retrieves line speed of NIC from map
     size_t
@@ -262,6 +277,11 @@ public:
         return num_amd_accel;
     }
 
+    int
+    getNumIntelAccel() const {
+        return num_intel_accel;
+    }
+
     const std::vector<std::string> &
     getAllDevices() const {
         return all_devices;
@@ -299,6 +319,13 @@ public:
     inline bool
     hasPcieDevices() const {
         return has_pcie_devices_;
+    }
+
+    /** @brief PCIe address of @p nic_device in hwloc's format, or "" if none was resolved. */
+    inline std::string
+    getPcieAddress(const std::string &nic_device) const {
+        const auto it = libfabric_to_pcie_map.find(nic_device);
+        return (it != libfabric_to_pcie_map.end()) ? it->second : std::string();
     }
 
     /**

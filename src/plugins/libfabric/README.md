@@ -7,7 +7,7 @@ This plugin provides a high-performance RDMA backend for NIXL using the OpenFabr
 The Libfabric plugin provides a high-performance RDMA communication backend with the following key capabilities:
 
 - **Multi-Rail RDMA**: Automatic discovery and utilization of multiple network devices for increased bandwidth
-- **GPU Direct Support**: Zero-copy transfers between GPU memory (VRAM) and remote systems with CUDA integration. GDR (GPU Direct RDMA) support is currently required.
+- **Accelerator Memory Support**: Zero-copy transfers between accelerator memory (VRAM) and remote systems. Peer-direct RDMA (e.g. GPU Direct RDMA) support is currently required. NVIDIA (CUDA), AMD (ROCm), Intel (Level Zero) and AWS Neuron accelerators are supported.
 - **Scalable Connection Management**: Efficient multi-agent connectivity with robust state tracking and automatic reconnection
 - **Asynchronous Processing**: Non-blocking RDMA operations with pre-allocated request pools and completion processing
 - **Thread-Safe Concurrency**: Background progress threads with lock-free data structures and configurable threading patterns
@@ -27,11 +27,55 @@ The Libfabric plugin provides a high-performance RDMA communication backend with
 - **numa**
   - numa (libnuma-dev on Debian/Ubuntu or libnuma-devel on RPM-based systems) is required for supporting DRAM_SEG memory type NUMA-aware rail selection (for imposing NUMA-aware bandwidth limitation). Suggested version: 2.0.18 or newer.
 
+### Optional Accelerator Dependencies
+
+| Accelerator | Build dependency | Runtime library | HMEM interface |
+|---|---|---|---|
+| NVIDIA GPU | CUDA toolkit | `libcuda.so.1` | `FI_HMEM_CUDA` |
+| AMD GPU | ROCm (`-Drocm_path=...`) | `libamdhip64.so` | `FI_HMEM_ROCR` |
+| Intel GPU (Xe / Arc / Data Center GPU) | `level_zero/ze_api.h` (`libze-dev`, or oneAPI) | `libze_loader.so.1` | `FI_HMEM_ZE` |
+| AWS Trainium / Inferentia | none | `libnrt.so.1` | `FI_HMEM_NEURON` |
+
+Level Zero and Neuron are needed only at build time as headers (Neuron not even that): their runtime
+libraries are `dlopen`'d, so one binary works on hosts with and without the driver. Meson reports
+what it found -- look for `Found Level Zero headers, libfabric backend will build with FI_HMEM_ZE
+support` in the configure output. At startup the plugin logs the accelerators it found per vendor
+(`Topology: ... 3 Intel GPUs ...`) and the runtime it selected (`System runtime: ZE`).
+
+Notes specific to Intel GPUs:
+
+- Intel GPUs are matched against the Level Zero driver's own device list, and only **discrete** GPUs
+  are used for PCIe-proximity rail selection. Integrated graphics are filtered out using the
+  driver's `ZE_DEVICE_PROPERTY_FLAG_INTEGRATED` flag rather than a PCI class check, which cannot
+  separate the two (a discrete GPU and an iGPU both report class `0x0300`) and which would wrongly
+  exclude compute-only parts that carry no display class at all. Memory on an integrated GPU is
+  still registered correctly; it just does not form a proximity group.
+- Each buffer's Level Zero device ordinal is taken from the driver
+  (`zeMemGetAllocProperties()`), not from the NIXL device ID, and passed to libfabric as
+  `fi_mr_attr::device.ze`.
+- One runtime is selected per process. A build with CUDA or ROCm on a host that also has Intel GPUs
+  selects CUDA or ROCm; a build without them ignores NVIDIA and AMD GPUs when choosing.
+- Device memory needs a provider that can carry `FI_HMEM_ZE`, such as `verbs` (see
+  [Provider Selection](#provider-selection)) or `cxi`. `efa` has no Level Zero support, and on
+  `tcp`/`sockets` without `FI_HMEM` the plugin does not offer `VRAM_SEG` at all.
+- **Allocate VRAM for NIXL as exportable.** Chain a `ze_external_memory_export_desc_t` with
+  `ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF` into `zeMemAllocDevice()`. Without it, in a context that
+  holds a single device (for example under `ZE_AFFINITY_MASK`), the driver may
+  - **pool** allocations up to 2 MiB into shared buffer objects. libfabric would then register
+    them at the wrong offset and the NIC would move another allocation's bytes. The plugin detects
+    this and refuses the registration (`registerMem()` fails, and the log says why).
+  - **compress** the allocation. The NIC sees raw compressed bytes, so the destination receives
+    garbage. Level Zero offers no way to query compression, so this cannot be detected at
+    registration.
+
+  With all GPUs visible, or with the export descriptor, neither happens.
+
 ### Network Hardware Requirements
 
 Validated compatibility with:
 
 - **AWS EFA** (Elastic Fabric Adapter)
+- **InfiniBand / RoCE through `verbs`** (NVIDIA ConnectX), including Intel GPU memory
 
 Any other Libfabric providers should also work but have not been validated in production environments. Community validation and feedback are highly appreciated!
 
@@ -80,6 +124,45 @@ lspci | grep -c 'Elastic Fabric'           # same
 ```
 
 The plugin emits an `NIXL_WARN` at initialization time if it detects a Neuron accelerator count vs EFA NIC count mismatch, distinguishing the "wrong instance type" case (`trn2.3xlarge`-style, no per-device EFA in hardware) from the "instance launched without EFA NICs" case (missing `InterfaceType: efa` at `run-instances` time).
+
+## Provider Selection
+
+The plugin picks one provider at startup and creates one rail per device of that provider. The
+preference order is:
+
+1. `cxi`
+2. `efa`
+3. `verbs` (InfiniBand / RoCE, reached through the `verbs;ofi_rxm` layered endpoint)
+4. `tcp`
+5. `sockets`
+
+Only the RDM-capable verbs domains are used: the `-xrc` and `-dgram` endpoint variants of the same
+NICs are skipped, as is the `ofi_rxd`-layered stack, which would place a second, slower rail on
+hardware the `ofi_rxm` rail already covers.
+
+To force a different choice, restrict what libfabric reports rather than looking for a NIXL-specific
+knob -- for example `FI_PROVIDER=tcp` or `FI_PROVIDER=^verbs`.
+
+Notes specific to verbs:
+
+- verbs works with or without the progress thread. Without it, the rails are opened with
+  `FI_PROGRESS_AUTO`, so `ofi_rxm` accepts peers' connections on its own thread; see *Connection
+  setup with a layered provider and `useProgThread = false`* under troubleshooting.
+- verbs does not report a PCIe bus address through libfabric (`bus_type` is `FI_BUS_UNKNOWN`), so the
+  plugin resolves each NIC's address through hwloc instead, by looking up the verbs domain name as an
+  OS device. Topology-aware rail selection therefore works the same way it does for EFA.
+- `ofi_rxm` does not report a usable source address for a remote write, which the target needs to
+  credit the write to its sender's pending notification. So on verbs each agent hands every peer a
+  *write tag* in its connection handshake, and the peer carries it in the immediate data of its
+  writes. Tags are 8 bits, which limits an agent to **255 connected peers** on verbs (its
+  self-connection included); connecting beyond that fails with `NIXL_ERR_NOT_SUPPORTED`. Each tag
+  also carries a generation, so writes still in flight from a peer whose tag was released and
+  reassigned are dropped rather than credited to the new holder. The handshake fields are optional,
+  so this needs no protocol version change.
+- Device memory over verbs needs a libfabric build whose verbs provider advertises `FI_HMEM`. That
+  requires either NVIDIA peer-memory support or per-device dmabuf probing, which needs a libfabric
+  newer than v2.6.0. On a build without it the rail comes up without `FI_HMEM` (logged at
+  startup) and device buffers are registered as host memory.
 
 ## Build Instructions
 
@@ -159,12 +242,38 @@ The following table summarizes briefly the plugin's runtime configuration:
 
 ### Core Classes
 
-- **`nixlLibfabricEngine`** - Main backend engine providing multi-rail RDMA operations with GPU Direct support
+- **`nixlLibfabricEngine`** - Main backend engine providing multi-rail RDMA operations with peer-direct RDMA support
 - **`nixlLibfabricRailManager`** - Manages multiple network rails with topology-aware selection and striping strategies
 - **`nixlLibfabricRail`** - Individual network rail handling libfabric resources and completion processing
-- **`nixlLibfabricTopology`** - Hardware topology discovery for optimal GPU-to-EFA and NUMA-to-EFA mapping
+- **`nixlLibfabricTopology`** - Hardware topology discovery for optimal accelerator-to-NIC and NUMA-to-NIC mapping
 - **`nixlLibfabricBackendH`** - Request handle for tracking multi-request transfer completion with atomic counters
 - **`nixlLibfabricConnection`** - Multi-rail connection metadata for remote agents with state management
+- **`nfi_hmem.{h,cpp}`** - Heterogeneous-memory helpers libfabric has internally but does not export: which runtime owns a pointer, which `fi_mr_attr::device` arm to fill, which devices a runtime enumerated. A C-compatible interface with no nixl dependencies. Level Zero is its only vendor so far
+- **`libfabric_accel.{h,cpp}`** - nixl's side of that boundary: matching the runtime's devices against the hwloc topology, and routing the shim's diagnostics into the NIXL log
+- **`nixlLibfabricProviderInfo`** - Table entry describing one core libfabric provider (in `src/utils/libfabric/libfabric_common.cpp`); the single place provider-specific settings live
+
+### Adding a provider
+
+Provider-specific settings are confined to the table returned by `knownProviders()` in
+`src/utils/libfabric/libfabric_common.cpp`. Adding a provider is one entry:
+
+- `name` / `description` -- the core provider name (what appears before any `;` in a libfabric
+  `prov_name`) and its label in the discovery log line.
+- `extra_caps`, `mr_mode`, `mr_key_size` -- what a rail asks `fi_getinfo` for.
+- `needs_prov_name_hint` -- set when the domain name alone does not identify the provider, as for
+  verbs, whose domains are also offered by psm3.
+- `needs_full_topology` -- set for an RDMA provider that should get hwloc discovery and
+  accelerator-to-NIC proximity grouping; clear for a host-stack provider.
+- `needs_all_rail_progress` -- set for a provider layered over a connection-oriented core, where the
+  passive side must poll a rail for the peer's connection to be accepted.
+- `needs_write_tag` -- set when a remote-write completion carries no usable source address, so
+  peers must name themselves in the write's immediate data.
+- `single_domain` -- set when one rail reaches every peer, so extra rails would only add host copies.
+- `select_domains` -- a hook, needed only if the generic rule (every domain under this core provider,
+  de-duplicated, in `fi_getinfo` order) is not enough. `selectVerbsDomains()` is the one example.
+
+Table order is the preference order. A provider with no entry still works: it gets
+`defaultProviderInfo()`, the plain-RDMA settings, rather than a special code path.
 
 ## Troubleshooting
 
@@ -192,5 +301,40 @@ fi_info -l
 # For checking specific devices (e.g. EFA as an example)
 fi_info -p efa
 ```
+
+**`fi_enable` or `fi_mr_reg` fails with "Cannot allocate memory" on verbs:**
+
+The locked-memory limit is too low. Rails pin their request pools, and `ofi_rxm` sizes its internal
+completion queue by `FI_UNIVERSE_SIZE`, so a default `ulimit -l` of a few megabytes is not enough.
+Check it with `ulimit -l` and raise it to `unlimited` (`memlock` in `/etc/security/limits.conf`, or
+`--ulimit memlock=-1` for a container), as any verbs-based stack requires.
+
+**Connection setup with a layered provider and `useProgThread = false`:**
+
+A layered provider such as `verbs;ofi_rxm` establishes its per-peer MSG connection lazily, and the
+*passive* side must progress it for that connection to be accepted. Two things are needed for that:
+
+- *Which* rails get progressed. A target that has posted nothing has no active rails, so polling
+  only rail 0 plus rails with outstanding requests would never poll any rail above rail 0 on that
+  side. The provider table marks such providers `needs_all_rail_progress`, and every rail is
+  polled for them.
+- *When* progress happens. Without a progress thread the plugin polls only from
+  `checkXfer()`/`getNotifs()`, and neither is called during connection and metadata setup. So for
+  these providers the rails are opened with `FI_PROGRESS_AUTO` (and `FI_THREAD_SAFE`, which it
+  requires): `ofi_rxm` then runs its own thread per endpoint, asleep in `poll()` on the connection
+  event queue, that accepts connections as they arrive. Data completions are still read by the
+  plugin. The log says so per rail: `progresses connection setup on its own thread`.
+
+If the provider does not grant `FI_PROGRESS_AUTO`, rail creation fails with an error saying so;
+enable the progress thread (`nixlAgentConfig::useProgThread`, or `--enable_pt=1` under nixlbench)
+or pick another provider with `FI_PROVIDER`.
+
+Connectionless RDM providers (`efa`, `cxi`, `tcp`) need no accept and are unaffected.
+
+**`VRAM_SEG` is not offered on `tcp` or `sockets`:**
+
+These providers move data with CPU copies through the kernel. Unless the libfabric build gives them
+`FI_HMEM`, a device pointer would register as host memory and the first transfer would fail with
+`EFAULT` or hang, so the plugin does not advertise `VRAM_SEG` for them.
 
 For additional support, check the NIXL documentation and Libfabric provider-specific guides.

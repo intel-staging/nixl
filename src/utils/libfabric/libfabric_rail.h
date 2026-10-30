@@ -18,9 +18,11 @@
 #ifndef NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_H
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_H
 
+#include <array>
 #include <vector>
 #include <deque>
 #include <limits>
+#include <optional>
 #include <string>
 #include <functional>
 #include <mutex>
@@ -397,16 +399,20 @@ struct nixlLibfabricPostRequest {
 class nixlLibfabricRail {
 public:
     uint16_t rail_id; ///< Unique rail identifier
-    std::string device_name; ///< EFA device name for this rail
-    std::string provider_name; ///< Provider name (e.g., "efa", "efa-direct")
+    std::string device_name; ///< Libfabric domain name for this rail
+    std::string provider_name; ///< Core provider name (e.g., "efa", "efa-direct", "verbs")
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
     struct fid_ep *endpoint; ///< Libfabric endpoint handle
 
-    /** Initialize libfabric rail with all resources */
+    /** Initialize libfabric rail with all resources
+     * @param auto_progress Request FI_PROGRESS_AUTO (with FI_THREAD_SAFE) so the provider accepts
+     *        connections on its own thread. Used for lazily connecting providers when the backend
+     *        runs no progress thread. Throws if the provider does not grant it. */
     nixlLibfabricRail(const std::string &device,
                       const std::string &provider,
                       uint16_t id,
-                      enum fi_hmem_iface runtime);
+                      enum fi_hmem_iface runtime,
+                      bool auto_progress = false);
 
     /** Destroy rail and cleanup all libfabric resources */
     ~nixlLibfabricRail();
@@ -449,6 +455,12 @@ public:
     bool
     canRegisterWithDmabuf(nixl_mem_t mem_type, enum fi_hmem_iface iface) const;
 
+    /** Whether this rail can carry device memory: with FI_HMEM, or without it on an RDMA provider
+     *  (registered as host memory, relying on NIC peer-memory support). Never tcp or sockets
+     *  without FI_HMEM, which copy through the kernel and fail on device pointers. */
+    bool
+    canCarryDeviceMemory() const;
+
     /** Deregister memory from libfabric */
     nixl_status_t
     deregisterMemory(struct fid_mr *mr) const;
@@ -469,6 +481,25 @@ public:
      *  kUnknownAgentIdx if it is FI_ADDR_NOTAVAIL or unmapped; callers must then drop it. */
     [[nodiscard]] uint32_t
     resolveSourceAddress(fi_addr_t src_addr) const;
+
+    /** Map a write tag this agent handed a peer to that peer's agent index, accepting writes
+     *  under it only with generation @p write_gen (1..NIXL_LIBFABRIC_MAX_WRITE_GEN). Both take
+     *  effect together, so a previous holder's writes are never credited to the new one. */
+    void
+    mapWriteTag(uint8_t write_tag, uint32_t agent_idx, uint8_t write_gen) const;
+
+    /** Drop a write tag's mapping if it still names agent_idx. */
+    void
+    unmapWriteTag(uint8_t write_tag, uint32_t agent_idx) const;
+
+    /** Resolve a write tag to a local agent index, or kUnknownAgentIdx if unmapped. */
+    [[nodiscard]] uint32_t
+    resolveWriteTag(uint8_t write_tag) const;
+
+    /** resolveWriteTag(), returning kUnknownAgentIdx when @p write_gen is not the tag's required
+     *  generation. */
+    [[nodiscard]] uint32_t
+    resolveWriteTag(uint8_t write_tag, uint8_t write_gen) const;
 
     // Memory descriptor helper methods
     /** Get libfabric memory descriptor for MR */
@@ -624,6 +655,16 @@ private:
     static constexpr size_t POST_MAX_BATCH_SIZE = 256;
     static constexpr size_t POST_POLL_INTERLEAVE_RATIO = 32;
 
+    // FI_EAGAIN retries of one deferred post before it is parked for the next drain. Only for
+    // lazily connecting providers (see providerNeedsAllRailProgress()), whose FI_EAGAIN can mean
+    // the peer has not yet accepted this rail's connection. Retrying in place polls only this
+    // rail, so two agents each waiting on a rail the other is not progressing would never return.
+    static constexpr size_t POST_MAX_EAGAIN_RETRIES = 64;
+    bool bound_post_retries_ = false;
+    // Deferred post parked after POST_MAX_EAGAIN_RETRIES, retried before the ring so post order
+    // is kept. Used only by the progress thread, the ring's single consumer.
+    std::optional<nixlLibfabricPostRequest> parked_post_;
+
     // Whether a progress thread is handling CQ draining
     bool progress_thread_enabled_ = false;
 
@@ -638,6 +679,13 @@ private:
     // FI_AV_TABLE). Written at connection setup, read on the completion path.
     mutable std::vector<uint32_t> src_addr_to_agent_;
     mutable std::shared_mutex src_addr_mutex_;
+
+    // Write tag -> local agent index. Slot 0 means no tag. Guarded by src_addr_mutex_.
+    mutable std::array<uint32_t, NIXL_LIBFABRIC_MAX_WRITE_TAG + 1> write_tag_to_agent_;
+    // Generation each write tag must carry, 0 for an unmapped tag. Guarded by src_addr_mutex_.
+    mutable std::array<uint8_t, NIXL_LIBFABRIC_MAX_WRITE_TAG + 1> write_tag_gen_{};
+    // Remote writes dropped as unattributable, for log rate limiting.
+    mutable std::atomic<uint64_t> dropped_remote_writes_{0};
 
     // Separate request pools for optimal performance
     ControlRequestPool control_request_pool_;

@@ -19,6 +19,7 @@
 #include "libfabric/libfabric_topology.h"
 #include "libfabric/libfabric_common.h"
 #include "libfabric/libfabric_rail_manager.h"
+#include "libfabric/libfabric_accel.h"
 #include "common/nixl_log.h"
 #include "gpu_utils.h"
 
@@ -599,6 +600,18 @@ testBasicTopology() {
             }
         } else {
             NIXL_INFO << "3. Skipping GPU-specific tests (no GPUs detected)";
+        }
+
+        // Intel GPUs are matched against the Level Zero driver's devices, so check live hwloc:
+        // none may be reported without Level Zero.
+        NIXL_INFO << "4. Intel accelerators detected: " << topology.getNumIntelAccel();
+        if (!nfi_hmem_iface_available(FI_HMEM_ZE)) {
+            if (topology.getNumIntelAccel() != 0) {
+                NIXL_ERROR << "   Level Zero is unavailable but topology reports "
+                           << topology.getNumIntelAccel() << " Intel accelerator(s)";
+                return 1;
+            }
+            NIXL_INFO << "   Level Zero unavailable, correctly reporting no Intel accelerators";
         }
     }
     catch (const std::exception &e) {
