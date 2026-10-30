@@ -418,6 +418,9 @@ private:
 public:
     static bool
     debugEnabled(); // Whether NIXLBENCH_LOG_LEVEL is DEBUG or TRACE
+    // Whether Level Zero supplies VRAM; used by both allocation and the consistency copy-back
+    static bool
+    useZeVram();
     static void
     setRT(xferBenchRT *rt);
     static void
