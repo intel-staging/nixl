@@ -19,6 +19,7 @@
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_COMMON_H
 
 #include <vector>
+#include <span>
 #include <string>
 #include <unordered_set>
 #include <unordered_map>
@@ -313,9 +314,92 @@ resetSeqId();
 
 // Utility functions
 namespace LibfabricUtils {
-// Device discovery with fallback to sockets
-std::pair<std::string, std::vector<std::string>>
+/** @brief One libfabric domain as reported by the fi_getinfo() that selects the provider. */
+struct nixlLibfabricDeviceInfo {
+    /** @brief libfabric domain name, the name a rail is created on. */
+    std::string domain_name;
+    /** @brief PCIe address in hwloc's "%x:%02x:%02x.%x" format, or empty if libfabric reported
+     * none. */
+    std::string pcie_address;
+    /** @brief Link speed in bits/s, or 0 if libfabric reported none. */
+    size_t link_speed = 0;
+};
+
+/**
+ * @brief Selects a provider and returns its usable domains, with fallback to tcp/sockets.
+ * @return Core provider name and one entry per rail, in rail order; {"none", {}} if none found.
+ */
+std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
 getAvailableNetworkDevices();
+
+/** @brief Core provider of a possibly layered prov_name: "verbs;ofi_rxm" -> "verbs". */
+std::string
+baseProviderName(const std::string &prov_name);
+
+/** @brief prov_name -> domain names, as gathered from fi_getinfo. */
+using nixlProviderDeviceMap = std::unordered_map<std::string, std::vector<std::string>>;
+
+/**
+ * @brief Provider-specific settings for one core libfabric provider.
+ *
+ * Table order (see @ref knownProviders) is the preference order.
+ */
+struct nixlLibfabricProviderInfo {
+    /** @brief Core provider name, as it appears before any ';' in a prov_name. */
+    const char *name;
+    /** @brief Human-readable name for the discovery log line. */
+    const char *description;
+    /** @brief Extra capability bits added to a rail's hints->caps. */
+    uint64_t extra_caps;
+    /** @brief hints->domain_attr->mr_mode for a rail. */
+    uint64_t mr_mode;
+    /** @brief hints->domain_attr->mr_key_size for a rail; 0 lets the provider choose. */
+    size_t mr_key_size;
+    /** @brief Whether to do hwloc topology discovery and accelerator-to-NIC grouping. */
+    bool needs_full_topology;
+    /** @brief Use only the first domain: every domain reaches every peer (tcp, sockets). */
+    bool single_domain;
+};
+
+/** @brief The provider table, in preference order (highest first). */
+std::span<const nixlLibfabricProviderInfo *const>
+knownProviders();
+
+/** @brief Table entry for a core or layered @p prov_name, or nullptr if unknown. */
+const nixlLibfabricProviderInfo *
+findProviderInfo(const std::string &prov_name);
+
+/** @brief Settings used for a provider with no table entry (the plain-RDMA defaults of efa). */
+const nixlLibfabricProviderInfo &
+defaultProviderInfo();
+
+/** @brief See @ref nixlLibfabricProviderInfo::needs_full_topology. */
+bool
+providerNeedsFullTopology(const std::string &prov_name);
+
+/**
+ * @brief Domains listed under exactly the prov_name @p name, de-duplicated, in fi_getinfo order.
+ *
+ * Layered variants such as "efa;ofi_rxd" are not merged in: they reach the same NICs.
+ */
+std::vector<std::string>
+selectDomainsGeneric(const nixlProviderDeviceMap &provider_device_map, const char *name);
+
+/**
+ * @brief The first knownProviders() entry with usable domains, and those domains (one for a
+ *        single_domain provider).
+ * @return Core provider name and its domains in rail order; {"none", {}} if none.
+ */
+std::pair<std::string, std::vector<std::string>>
+selectProvider(const nixlProviderDeviceMap &provider_device_map);
+
+/**
+ * @brief Selects a provider from an fi_getinfo() list (see @ref selectProvider) and returns its
+ *        domains with the PCIe address and link speed that the selected provider reported.
+ * @return Core provider name and one entry per rail, in rail order; {"none", {}} if none found.
+ */
+std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
+selectNetworkDevices(const struct fi_info *info);
 // String utilities
 std::string
 hexdump(const void *data, size_t size);

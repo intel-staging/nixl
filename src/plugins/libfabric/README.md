@@ -165,6 +165,22 @@ The following table summarizes briefly the plugin's runtime configuration:
 - **`nixlLibfabricTopology`** - Hardware topology discovery for optimal GPU-to-EFA and NUMA-to-EFA mapping
 - **`nixlLibfabricBackendH`** - Request handle for tracking multi-request transfer completion with atomic counters
 - **`nixlLibfabricConnection`** - Multi-rail connection metadata for remote agents with state management
+- **`nixlLibfabricProviderInfo`** - Table entry describing one core libfabric provider (in `src/utils/libfabric/libfabric_common.cpp`); the single place provider-specific settings live
+
+### Adding a provider
+
+Provider-specific settings are confined to the table returned by `knownProviders()` in
+`src/utils/libfabric/libfabric_common.cpp`. Adding a provider is one entry:
+
+- `name` / `description` -- the core provider name (what appears before any `;` in a libfabric
+  `prov_name`) and its label in the discovery log line.
+- `extra_caps`, `mr_mode`, `mr_key_size` -- what a rail asks `fi_getinfo` for.
+- `needs_full_topology` -- set for an RDMA provider that should get hwloc discovery and
+  accelerator-to-NIC proximity grouping; clear for a host-stack provider.
+- `single_domain` -- set when one rail reaches every peer, so extra rails would only add host copies.
+
+Table order is the preference order. A provider with no entry still works: it gets
+`defaultProviderInfo()`, the plain-RDMA settings, rather than a special code path.
 
 ## Troubleshooting
 
