@@ -108,4 +108,14 @@ if get_option('buildtype') != 'release'
 
     test('libfabric_provider_test', libfabric_provider_test_bin)
 
+    libfabric_verbs_test_bin = executable('libfabric_verbs_test',
+               'libfabric_verbs_test.cpp',
+               dependencies: libfabric_utils_dep + [ hwloc_dep ],
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               link_with: libfabric_utils_lib,
+               cpp_args: libfabric_test_cpp_args,
+               install: true)
+
+    test('libfabric_verbs_test', libfabric_verbs_test_bin)
+
 endif

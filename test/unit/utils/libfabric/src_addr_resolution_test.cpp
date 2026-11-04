@@ -358,7 +358,8 @@ testWriteRemoteCqData() {
                 "the mock provider (efa) has the target count writes");
 
     for (const bool cq_data : {true, false}) {
-        nixlLibfabricRail rail("efa_0", "efa", 90, FI_HMEM_SYSTEM, cq_data);
+        nixlLibfabricRail rail(
+            "efa_0", "efa", 90, FI_HMEM_SYSTEM, /*auto_progress=*/false, cq_data);
         nixlLibfabricReq *req = rail.allocateDataRequest(nixlLibfabricReq::WRITE, 1);
         TEST_ASSERT(req != nullptr, "allocated a data request");
         char buf[64] = {};
