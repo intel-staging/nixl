@@ -361,6 +361,15 @@ else
     cuda_wheel_dir = 'nixl_cu12'
 endif
 
+# Level Zero (Intel GPU) support in the libfabric backend. Headers only: libze_loader is
+# dlopen'd at runtime.
+have_ze = cpp.has_header('level_zero/ze_api.h')
+if have_ze
+    message('Found Level Zero headers, libfabric backend will build with FI_HMEM_ZE support')
+else
+    message('Level Zero headers not found, libfabric backend will build without FI_HMEM_ZE support')
+endif
+
 # Allow callers (e.g. ROCm CI/Dockerfile) to override the wheel variant suffix
 # without otherwise affecting the build. Non-empty value wins over the
 # autodetected CUDA-major value above: e.g. -Dwheel_variant=rocm -> nixl_rocm.

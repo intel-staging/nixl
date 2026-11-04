@@ -19,6 +19,7 @@
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_TOPOLOGY_H
 
 #include "libfabric_common.h"
+#include "libfabric_accel.h"
 #include "nixl.h"
 #include <hwloc.h>
 #include <unordered_map>
@@ -48,6 +49,7 @@ private:
     int num_aws_accel; // AWS Trainium accelerators
     int num_nvidia_accel; // NVIDIA GPU accelerators
     int num_amd_accel; // AMD GPU accelerators
+    int num_intel_accel; // Discrete Intel GPUs enumerated by Level Zero
     int num_numa_nodes;
     int num_devices;
 
@@ -181,6 +183,8 @@ private:
     isNeuronAccel(hwloc_obj_t obj) const;
     bool
     isAmdAccel(hwloc_obj_t obj) const;
+    bool
+    isIntelAccel(hwloc_obj_t obj) const;
 
     // retrieves line speed of NIC from map
     size_t
@@ -271,6 +275,11 @@ public:
     int
     getNumAmdAccel() const {
         return num_amd_accel;
+    }
+
+    int
+    getNumIntelAccel() const {
+        return num_intel_accel;
     }
 
     const std::vector<std::string> &

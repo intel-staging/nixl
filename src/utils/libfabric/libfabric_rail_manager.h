@@ -196,6 +196,11 @@ public:
                        std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs_out,
                        std::vector<char *> &ep_names_out);
 
+    /** Whether the rails can carry device memory. All rails share one provider. */
+    bool
+    canCarryDeviceMemory() const {
+        return !rails_.empty() && rails_[0]->canCarryDeviceMemory();
+    }
 
     /** Whether every rail must be progressed. See providerNeedsAllRailProgress(). */
     bool
