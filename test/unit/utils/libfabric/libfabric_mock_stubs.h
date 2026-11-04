@@ -197,6 +197,22 @@ static fi_ops_msg fi_ep_msg_ops_stub{
     .recvmsg = fi_ep_recvmsg_stub,
 };
 
+// fi_writemsg calls, recorded so a test can check the flags a rail posts writes with.
+[[maybe_unused]] static size_t mock_writemsg_calls = 0;
+[[maybe_unused]] static uint64_t mock_writemsg_last_flags = 0;
+
+static ssize_t
+fi_ep_writemsg_stub(struct fid_ep *ep, const struct fi_msg_rma *msg, uint64_t flags) {
+    mock_writemsg_calls++;
+    mock_writemsg_last_flags = flags;
+    return 0;
+}
+
+static fi_ops_rma fi_ep_rma_ops_stub{
+    .size = sizeof(fi_ops_rma),
+    .writemsg = fi_ep_writemsg_stub,
+};
+
 static int
 fi_endpoint_stub(struct fid_domain *domain,
                  struct fi_info *info,
@@ -207,6 +223,7 @@ fi_endpoint_stub(struct fid_domain *domain,
     (*ep)->fid.ops = &fi_ep_fid_ops_stub;
     (*ep)->cm = &fi_ep_cm_ops_stub;
     (*ep)->msg = &fi_ep_msg_ops_stub;
+    (*ep)->rma = &fi_ep_rma_ops_stub;
     return 0;
 }
 

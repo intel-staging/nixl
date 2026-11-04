@@ -192,6 +192,14 @@ public:
                        uint32_t agent_idx,
                        std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs_out,
                        std::vector<char *> &ep_names_out);
+
+
+    /** Whether a WRITE's notification waits for the WRITE to complete locally. See
+     *  providerNotifiesAfterCompletion(). Valid once the rails are created; the rails post writes
+     *  without remote CQ data exactly when it is true. */
+    bool
+    notifiesAfterCompletion() const;
+
     /** Clean up connection resources for rails
      * @param fi_addrs_to_remove Libfabric addresses to remove
      * @return NIXL_SUCCESS on success, error code on failure
@@ -395,6 +403,14 @@ private:
 
     // System runtime type (determined once at initialization)
     fi_hmem_iface runtime_;
+
+    // See notifiesAfterCompletion(). Set in createRails(), before any transfer.
+    bool notify_after_completion_ = false;
+
+    // Immediate data for one write of transfer xfer_id: a fresh SEQ_ID, or 0 when writes carry
+    // no remote CQ data.
+    uint64_t
+    writeImmData(uint16_t xfer_id) const;
 
     // Rail allocation
     std::vector<std::unique_ptr<nixlLibfabricRail>> rails_;

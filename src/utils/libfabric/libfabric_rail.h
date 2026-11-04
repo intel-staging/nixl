@@ -402,11 +402,35 @@ public:
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
     struct fid_ep *endpoint; ///< Libfabric endpoint handle
 
-    /** Initialize libfabric rail with all resources */
+    /** Initialize libfabric rail with all resources
+     * @param write_remote_cq_data Post writes with FI_REMOTE_CQ_DATA, so the target gets a
+     *        completion for each one. The rail manager clears it when the provider notifies after
+     *        completion (providerNotifiesAfterCompletion()). */
     nixlLibfabricRail(const std::string &device,
                       const std::string &provider,
                       uint16_t id,
-                      enum fi_hmem_iface runtime);
+                      enum fi_hmem_iface runtime,
+                      bool write_remote_cq_data = true);
+
+    /**
+     * @brief While alive, a post refused with -FI_EAGAIN on this thread progresses the rail's CQ
+     * itself before retrying, even with a progress thread.
+     *
+     * With a progress thread a post normally just retries and leaves the CQ to that thread. The
+     * progress thread itself must not do that when it posts, or it waits on itself; it holds one
+     * of these while it sends (never inside CQ processing).
+     */
+    class ProgressOnEagainScope {
+    public:
+        ProgressOnEagainScope();
+        ~ProgressOnEagainScope();
+        ProgressOnEagainScope(const ProgressOnEagainScope &) = delete;
+        ProgressOnEagainScope &
+        operator=(const ProgressOnEagainScope &) = delete;
+
+    private:
+        bool previous_;
+    };
 
     /** Destroy rail and cleanup all libfabric resources */
     ~nixlLibfabricRail();
@@ -469,6 +493,7 @@ public:
      *  kUnknownAgentIdx if it is FI_ADDR_NOTAVAIL or unmapped; callers must then drop it. */
     [[nodiscard]] uint32_t
     resolveSourceAddress(fi_addr_t src_addr) const;
+
 
     // Memory descriptor helper methods
     /** Get libfabric memory descriptor for MR */
@@ -639,6 +664,9 @@ private:
     mutable std::vector<uint32_t> src_addr_to_agent_;
     mutable std::shared_mutex src_addr_mutex_;
 
+    // Remote writes dropped as unattributable, for log rate limiting.
+    mutable std::atomic<uint64_t> dropped_remote_writes_{0};
+
     // Separate request pools for optimal performance
     ControlRequestPool control_request_pool_;
     DataRequestPool data_request_pool_;
@@ -648,6 +676,20 @@ private:
 
     // System runtime type (CUDA, NEURON, or SYSTEM) this rail was created for
     enum fi_hmem_iface runtime_;
+
+    // Whether writes carry remote CQ data (imm_data), so the target gets a completion for each
+    // one. False when the provider notifies after completion (providerNotifiesAfterCompletion()):
+    // the target then counts nothing, and a plain RDMA write costs it no CQ entry.
+    const bool write_remote_cq_data_;
+
+    uint64_t
+    writeCqDataFlag() const {
+        return write_remote_cq_data_ ? FI_REMOTE_CQ_DATA : 0;
+    }
+
+    // Whether a post refused with -FI_EAGAIN progresses the CQ before retrying.
+    bool
+    progressesOnEagain() const;
 
     void
     pollForCompletions();

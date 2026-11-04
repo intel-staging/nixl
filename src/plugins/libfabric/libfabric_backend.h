@@ -126,6 +126,8 @@ private:
     std::atomic<nixl_status_t> error_status_; // Error status from CQ failures
     std::atomic<size_t> successful_requests_; // Requests that completed without an error
     std::atomic<bool> xfer_error_sent_; // Target already told about the failure
+    // Whoever sends this post's after-completion notification has claimed it. Reset per post.
+    std::atomic<bool> completion_notif_claimed_{false};
 
 public:
     uint16_t post_xfer_id;
@@ -147,12 +149,25 @@ public:
     void
     init_request_tracking(size_t num_requests);
 
-    /** Record completion of one request (with status).
-     *  Stores error and bumps successful_requests_ before incrementing the counter so that
-     *  is_completed() observers always see the error_status_ that caused the transition and the
-     *  final successful count. */
+    /** Record completion of one request (with status): record_request_status() then
+     *  count_request_completed(). */
     void
     complete_request(nixl_status_t status);
+
+    /** First half of complete_request(): stores an error, or bumps successful_requests_, before
+     *  the completion is counted, so is_completed() observers always see the error_status_ that
+     *  caused the transition and the final successful count.
+     *  @return true if counting this completion will complete the transfer. Exact when one thread
+     *          reaps this transfer's completions (the progress thread, when enabled). It is false
+     *          for a last completion that arrives before adjust_total_submitted_requests(), so
+     *          postXfer() also checks is_completed() after posting. */
+    bool
+    record_request_status(nixl_status_t status);
+
+    /** Second half of complete_request(): counts the completion, publishing it to
+     *  is_completed(). */
+    void
+    count_request_completed();
 
     /** Get current count of requests completed as part of this transfer */
     size_t
@@ -181,6 +196,13 @@ public:
      *         delivery is best effort. */
     bool
     claim_xfer_error_send();
+
+    /** Claim the right to send this post's notification once the transfer has completed (see
+     *  nixlLibfabricEngine::notifiesOnCompletion()). The progress thread, postXfer() and
+     *  checkXfer() may all see the completion; only the first caller sends.
+     * @return true for the first caller after init_request_tracking(). */
+    bool
+    claim_completion_notif();
 };
 
 class nixlLibfabricEngine : public nixlBackendEngine {
@@ -210,6 +232,23 @@ private:
     // <remoteAgent, <connection>>
     mutable std::unordered_map<std::string, std::shared_ptr<nixlLibfabricConnection>> connections_;
     mutable std::vector<std::string> agent_names_; // List of agent names for easy access
+
+    // Whether a WRITE's notification waits for the WRITE to complete locally, instead of the
+    // target counting its writes. Set once in the constructor, before any thread runs.
+    bool notify_after_completion_ = false;
+
+    // Notifications due once a transfer completes, queued by the progress thread's completion
+    // callback and sent by the progress thread after it has drained the CQs. A copy, so the
+    // application may release or repost the handle meanwhile.
+    struct CompletionNotif {
+        std::string remote_agent;
+        std::vector<BinaryNotification> fragments;
+        uint32_t total_len;
+        uint16_t xfer_id;
+    };
+
+    mutable std::mutex completion_notifs_mutex_;
+    mutable std::vector<CompletionNotif> completion_notifs_;
 
     // Threading infrastructure - remaining members
     // Connection Management (CM) thread: sends re-establishment replies queued by the
@@ -292,6 +331,25 @@ private:
     createAgentConnection(const std::string &agent_name,
                           const std::vector<std::array<char, 56>> &data_rail_endpoints);
 
+    // Whether handle's notification is sent once the transfer completes locally, rather than
+    // right after posting.
+    bool
+    notifiesOnCompletion(const nixlLibfabricBackendH &handle) const;
+
+    // Sends handle's after-completion notification if it has one, the transfer succeeded and
+    // nobody has sent it yet. For postXfer() and checkXfer().
+    nixl_status_t
+    sendCompletionNotif(nixlLibfabricBackendH &handle) const;
+
+    // Completion callback of a transfer's last request. With the progress thread, queues the
+    // after-completion notification so it goes out without waiting for checkXfer().
+    void
+    onXferComplete(nixlLibfabricBackendH &handle) const;
+
+    // Progress thread: sends the notifications onXferComplete() queued.
+    void
+    sendQueuedCompletionNotifs();
+
     // Private notification implementation with unified binary notification system
     nixl_status_t
     notifSendPriv(const std::string &remote_agent,
@@ -312,8 +370,9 @@ private:
     handleXferError(uint16_t notif_xfer_id, uint32_t sender_peer_idx, uint32_t final_completions);
 
     // Tell the target once that this transfer failed, so it stops waiting for writes that never
-    // went out. Called only from checkXfer: an asynchronous post failure must not turn postXfer
-    // into an error.
+    // went out. With notify-after-completion, also sends the notification it was still owed.
+    // Called only from checkXfer: an asynchronous post failure must not turn postXfer into an
+    // error.
     void
     notifXferFailure(nixlLibfabricBackendH *backend_handle, nixl_status_t error_status) const;
 

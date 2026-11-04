@@ -57,6 +57,7 @@ namespace {
         // Left to the provider: a key size here changes which fi_info entries cxi returns.
         /*mr_key_size=*/0,
         /*needs_full_topology=*/true,
+        /*notify_after_completion=*/false,
         /*single_domain=*/false,
     };
 
@@ -67,6 +68,7 @@ namespace {
         /*mr_mode=*/k_mr_mode_rdma,
         /*mr_key_size=*/2,
         /*needs_full_topology=*/true,
+        /*notify_after_completion=*/false,
         /*single_domain=*/false,
     };
 
@@ -77,6 +79,7 @@ namespace {
         /*mr_mode=*/k_mr_mode_basic,
         /*mr_key_size=*/0,
         /*needs_full_topology=*/false,
+        /*notify_after_completion=*/false,
         /*single_domain=*/true,
     };
 
@@ -87,6 +90,7 @@ namespace {
         /*mr_mode=*/k_mr_mode_basic,
         /*mr_key_size=*/0,
         /*needs_full_topology=*/false,
+        /*notify_after_completion=*/false,
         /*single_domain=*/true,
     };
 
@@ -140,6 +144,12 @@ findProviderInfo(const std::string &prov_name) {
 const nixlLibfabricProviderInfo &
 defaultProviderInfo() {
     return k_efa_provider;
+}
+
+bool
+providerNotifiesAfterCompletion(const std::string &prov_name) {
+    const nixlLibfabricProviderInfo *provider = findProviderInfo(prov_name);
+    return (provider != nullptr) && provider->notify_after_completion;
 }
 
 bool

@@ -139,6 +139,11 @@ testProviderTable() {
     }
 
     // The flag helpers used by the rest of the plugin.
+    check(!LibfabricUtils::providerNotifiesAfterCompletion("efa") &&
+              !LibfabricUtils::providerNotifiesAfterCompletion("cxi") &&
+              !LibfabricUtils::providerNotifiesAfterCompletion("tcp") &&
+              !LibfabricUtils::providerNotifiesAfterCompletion("psm3"),
+          "every provider here has the target count a WRITE's writes");
     check(LibfabricUtils::providerNeedsFullTopology("efa") &&
               LibfabricUtils::providerNeedsFullTopology("cxi"),
           "providerNeedsFullTopology() is true for every RDMA provider");
