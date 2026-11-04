@@ -175,6 +175,15 @@ testProviderTable() {
     }
 
     // The flag helpers used by the rest of the plugin.
+    bool any_notifies_after_completion = false;
+    for (const auto *provider : providers) {
+        any_notifies_after_completion |=
+            LibfabricUtils::providerNotifiesAfterCompletion(provider->name);
+    }
+    check(!any_notifies_after_completion,
+          "every listed provider has the target count a WRITE's writes");
+    check(!LibfabricUtils::providerNotifiesAfterCompletion("psm3"),
+          "an unlisted provider has the target count a WRITE's writes");
     check(LibfabricUtils::providerNeedsFullTopology("efa") &&
               LibfabricUtils::providerNeedsFullTopology("cxi"),
           "providerNeedsFullTopology() is true for every RDMA provider");
