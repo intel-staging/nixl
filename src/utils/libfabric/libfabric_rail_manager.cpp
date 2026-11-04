@@ -374,13 +374,20 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
     efa_device_to_rail_map.reserve(num_rails_);
     clearActiveRails();
 
+    // Decided once here for the rails and the engine (notifiesAfterCompletion()).
+    notify_after_completion_ = LibfabricUtils::providerNotifiesAfterCompletion(provider_name);
+
     try {
         rails_.clear();
         rails_.reserve(num_rails_);
 
         for (size_t i = 0; i < num_rails_; ++i) {
             rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i), runtime_));
+                efa_devices[i],
+                provider_name,
+                static_cast<uint16_t>(i),
+                runtime_,
+                /*write_remote_cq_data=*/!notify_after_completion_));
 
             // Initialize EFA device mapping
             efa_device_to_rail_map[efa_devices[i]] = i;
@@ -488,9 +495,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
             status = NIXL_SUCCESS;
         } else if (op_type == nixlLibfabricReq::WRITE) {
             // Direct post (PT OFF path)
-            // Generate next SEQ_ID for this specific write operation
-            uint8_t seq_id = LibfabricUtils::getNextSeqId();
-            uint64_t imm_data = NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, seq_id);
+            const uint64_t imm_data = writeImmData(xfer_id);
             status = rails_[rail_id]->postWrite(req->local_addr,
                                                 req->chunk_size,
                                                 fi_mr_desc(req->local_mr),
@@ -582,10 +587,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                      req);
                 status = NIXL_SUCCESS;
             } else if (op_type == nixlLibfabricReq::WRITE) {
-                // Generate next SEQ_ID for this specific transfer operation
-                uint8_t seq_id = LibfabricUtils::getNextSeqId();
-                uint64_t imm_data =
-                    NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, seq_id);
+                const uint64_t imm_data = writeImmData(xfer_id);
                 status = rails_[rail_id]->postWrite(req->local_addr,
                                                     req->chunk_size,
                                                     fi_mr_desc(req->local_mr),
@@ -634,10 +636,7 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
                                                bool is_cuda_vram,
                                                size_t rail_id,
                                                nixlLibfabricReq *req) {
-    uint8_t seq_id = (op_type == nixlLibfabricReq::WRITE) ? LibfabricUtils::getNextSeqId() : 0;
-    uint64_t imm_data = (op_type == nixlLibfabricReq::WRITE) ?
-        NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, seq_id) :
-        0;
+    const uint64_t imm_data = (op_type == nixlLibfabricReq::WRITE) ? writeImmData(xfer_id) : 0;
     nixlLibfabricPostRequest pr{};
     pr.type = (op_type == nixlLibfabricReq::WRITE) ? nixlLibfabricPostRequest::WRITE :
                                                      nixlLibfabricPostRequest::READ;
@@ -1182,6 +1181,21 @@ nixlLibfabricRailManager::progressActiveRails() {
         return first_error;
     }
     return any_completions ? NIXL_SUCCESS : NIXL_IN_PROG;
+}
+
+bool
+nixlLibfabricRailManager::notifiesAfterCompletion() const {
+    return notify_after_completion_;
+}
+
+uint64_t
+nixlLibfabricRailManager::writeImmData(uint16_t xfer_id) const {
+    // Rails of a provider that notifies after completion post writes without remote CQ data, so
+    // the immediate data would be dropped; skip the shared SEQ_ID counter for it.
+    if (notify_after_completion_) {
+        return 0;
+    }
+    return NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, LibfabricUtils::getNextSeqId());
 }
 
 nixl_status_t

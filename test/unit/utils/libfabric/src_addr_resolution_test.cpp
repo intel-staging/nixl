@@ -348,6 +348,43 @@ testRemoteWriteCompletionAttribution(nixlLibfabricRailManager &mgr) {
     return 0;
 }
 
+// A rail of a provider that notifies after completion posts writes without remote CQ data, so the
+// target gets no completion to count; any other rail posts them with it. The rail manager decides
+// per provider; here both rails are mock efa rails, so only the rail's own flag is tested.
+static int
+testWriteRemoteCqData() {
+    NIXL_INFO << "  testWriteRemoteCqData";
+    TEST_ASSERT(!LibfabricUtils::providerNotifiesAfterCompletion("efa"),
+                "the mock provider (efa) has the target count writes");
+
+    for (const bool cq_data : {true, false}) {
+        nixlLibfabricRail rail("efa_0", "efa", 90, FI_HMEM_SYSTEM, cq_data);
+        nixlLibfabricReq *req = rail.allocateDataRequest(nixlLibfabricReq::WRITE, 1);
+        TEST_ASSERT(req != nullptr, "allocated a data request");
+        char buf[64] = {};
+        mock_writemsg_calls = 0;
+        mock_writemsg_last_flags = 0;
+        const nixl_status_t st =
+            rail.postWrite(buf,
+                           sizeof(buf),
+                           nullptr,
+                           NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, 7, 1),
+                           0,
+                           0x1000,
+                           0x42,
+                           req,
+                           FI_MORE);
+        TEST_ASSERT(st == NIXL_SUCCESS, "postWrite succeeded");
+        TEST_ASSERT(mock_writemsg_calls == 1, "postWrite posted one fi_writemsg");
+        TEST_ASSERT((mock_writemsg_last_flags & FI_MORE) != 0, "caller's flags are kept");
+        TEST_ASSERT(((mock_writemsg_last_flags & FI_REMOTE_CQ_DATA) != 0) == cq_data,
+                    cq_data ? "a counting provider's write carries remote CQ data" :
+                              "a notify-after-completion rail's write carries no remote CQ data");
+        rail.releaseRequest(req);
+    }
+    return 0;
+}
+
 static int
 testRecvCompletionAttribution(nixlLibfabricRailManager &mgr) {
     NIXL_INFO << "  testRecvCompletionAttribution";
@@ -499,6 +536,9 @@ main() {
         return res;
     }
     if ((res = testRecvCompletionAttribution(mgr)) != 0) {
+        return res;
+    }
+    if ((res = testWriteRemoteCqData()) != 0) {
         return res;
     }
     if ((res = testFiSourceRequested()) != 0) {
