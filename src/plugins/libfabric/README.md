@@ -165,6 +165,29 @@ The following table summarizes briefly the plugin's runtime configuration:
 - **`nixlLibfabricTopology`** - Hardware topology discovery for optimal GPU-to-EFA and NUMA-to-EFA mapping
 - **`nixlLibfabricBackendH`** - Request handle for tracking multi-request transfer completion with atomic counters
 - **`nixlLibfabricConnection`** - Multi-rail connection metadata for remote agents with state management
+- **`nixlLibfabricProviderInfo`** - Table entry describing one core libfabric provider (declared in `src/utils/libfabric/libfabric_common.h`, table in `libfabric_common.cpp`); holds the provider's rail and memory-registration settings
+
+### Adding a provider
+
+A provider's rail and memory-registration settings live in the table returned by
+`knownProviders()` in `src/utils/libfabric/libfabric_common.cpp`. Adding a provider starts with
+one entry:
+
+- `name` / `description` -- the core provider name (what appears before any `;` in a libfabric
+  `prov_name`) and its label in the discovery log line.
+- `extra_caps`, `mr_mode`, `mr_key_size` -- what a rail asks `fi_getinfo` for.
+- `mr_access` -- the access flags of every memory registration. Without `FI_MR_PROV_KEY` in
+  `mr_mode`, each registration also requests a unique key (the buffer address).
+- `needs_full_topology` -- set for an RDMA provider that should get hwloc discovery and
+  accelerator-to-NIC proximity grouping; clear for a host-stack provider.
+- `single_domain` -- set when one rail reaches every peer, so extra rails would only add host
+  copies.
+
+Table order is the preference order, and only listed providers are selected. Some
+EFA-specific behaviour is still keyed on the provider name outside the table: the
+`FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV` and `FI_OPT_EFA_RNR_RETRY` endpoint options and
+`FI_MR_DMABUF` registration in `libfabric_rail.cpp`, and the Neuron/EFA preflight checks in
+`libfabric_topology.cpp`.
 
 ## Troubleshooting
 
