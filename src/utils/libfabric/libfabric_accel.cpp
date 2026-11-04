@@ -27,6 +27,50 @@
 
 namespace {
 
+/** @brief Whether @p obj is a PCI device of @p vendor_id in the display controller class. */
+bool
+isDisplayClassPciDev(hwloc_obj_t obj, uint16_t vendor_id) {
+    if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE || obj->attr->pcidev.vendor_id != vendor_id) {
+        return false;
+    }
+    // 0x300-0x3ff are display controllers; 0x302 is a 3D controller (compute GPU)
+    const uint16_t class_id = obj->attr->pcidev.class_id;
+    return (class_id >= 0x300 && class_id < 0x400);
+}
+
+bool
+isNvidiaAccel(hwloc_obj_t obj) {
+    return isDisplayClassPciDev(obj, 0x10de);
+}
+
+bool
+isAmdAccel(hwloc_obj_t obj) {
+    if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE || obj->attr->pcidev.vendor_id != 0x1002) {
+        return false;
+    }
+    // MI300X uses class 0x1200 (processing accelerator), consumer GPUs use 0x300-0x3ff
+    const uint16_t class_id = obj->attr->pcidev.class_id;
+    return (class_id >= 0x300 && class_id < 0x400) || (class_id >= 0x1200 && class_id < 0x1300);
+}
+
+bool
+isNeuronAccel(hwloc_obj_t obj) {
+    // Amazon vendor ID is 0x1d0f
+    if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE || obj->attr->pcidev.vendor_id != 0x1d0f) {
+        return false;
+    }
+    static const uint16_t NEURON_DEVICE_IDS[] = {
+        0x7264, // INF2
+        0x7164, // TRN1
+        0x7364, // TRN2
+        0x7564, // TRN3_DEVICE_0
+        0x7565, // TRN3_DEVICE_1
+    };
+    return std::find(std::begin(NEURON_DEVICE_IDS),
+                     std::end(NEURON_DEVICE_IDS),
+                     obj->attr->pcidev.device_id) != std::end(NEURON_DEVICE_IDS);
+}
+
 // Discrete-GPU addresses from the Level Zero driver, in hwloc's format. Cached: the driver's
 // device list does not change, and the caller queries it for every PCI device in the topology.
 const std::set<std::string> &
@@ -116,4 +160,34 @@ accelIsLevelZeroDevice(hwloc_obj_t obj) {
     bus.func = static_cast<uint8_t>(obj->attr->pcidev.func);
 
     return enumerated.count(accelBusIdString(bus, NFI_HMEM_BUS_ACCELERATOR)) > 0;
+}
+
+const std::vector<enum fi_hmem_iface> &
+accelHwlocIfaces() {
+    static const std::vector<enum fi_hmem_iface> ifaces = {
+        FI_HMEM_CUDA, FI_HMEM_ROCR, FI_HMEM_ZE, FI_HMEM_NEURON};
+
+    return ifaces;
+}
+
+enum fi_hmem_iface
+accelIfaceOfHwlocObj(hwloc_obj_t obj) {
+    if (isNvidiaAccel(obj)) {
+        return FI_HMEM_CUDA;
+    }
+    if (isAmdAccel(obj)) {
+        return FI_HMEM_ROCR;
+    }
+    if (isNeuronAccel(obj)) {
+        return FI_HMEM_NEURON;
+    }
+    if (accelIsLevelZeroDevice(obj)) {
+        return FI_HMEM_ZE;
+    }
+    return FI_HMEM_SYSTEM;
+}
+
+bool
+accelIfaceIsGroupable(enum fi_hmem_iface iface) {
+    return iface == FI_HMEM_CUDA || iface == FI_HMEM_ROCR || iface == FI_HMEM_ZE;
 }

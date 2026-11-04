@@ -22,6 +22,7 @@
 
 #include <hwloc.h>
 #include <string>
+#include <vector>
 
 /*
  * nixl-side helpers around nfi_hmem.h: matching accelerator devices against the hwloc topology and
@@ -52,5 +53,27 @@ accelBusIdString(const struct nfi_hmem_info &info);
  */
 bool
 accelIsLevelZeroDevice(hwloc_obj_t obj);
+
+/** @brief The interfaces @ref accelIfaceOfHwlocObj can attribute a device to. */
+const std::vector<enum fi_hmem_iface> &
+accelHwlocIfaces();
+
+/**
+ * @brief The interface of the accelerator vendor that owns @p obj, or FI_HMEM_SYSTEM if none.
+ *
+ * NVIDIA and AMD GPUs are matched by PCI vendor and class, Neuron devices by vendor and device ID,
+ * and Intel GPUs by @ref accelIsLevelZeroDevice.
+ */
+enum fi_hmem_iface
+accelIfaceOfHwlocObj(hwloc_obj_t obj);
+
+/**
+ * @brief Whether @p iface's devices take part in PCIe-proximity NIC grouping.
+ *
+ * False for Neuron: a Trainium card carries its own EFA NIC, so Neuron memory is mapped to NICs
+ * through the NIC's address instead.
+ */
+bool
+accelIfaceIsGroupable(enum fi_hmem_iface iface);
 
 #endif // NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_ACCEL_H
