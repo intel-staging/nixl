@@ -420,6 +420,25 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 
 // Rail Class Implementation
 
+namespace {
+
+// The table entry for a rail's provider; an unlisted provider gets the defaults.
+const LibfabricUtils::nixlLibfabricProviderInfo &
+railProviderInfo(const std::string &provider) {
+    const LibfabricUtils::nixlLibfabricProviderInfo *prov_info =
+        LibfabricUtils::findProviderInfo(provider);
+    if (prov_info != nullptr) {
+        return *prov_info;
+    }
+    const LibfabricUtils::nixlLibfabricProviderInfo &defaults =
+        LibfabricUtils::defaultProviderInfo();
+    NIXL_DEBUG << "Provider " << provider << " has no table entry, using defaults from "
+               << defaults.name;
+    return defaults;
+}
+
+} // namespace
+
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
                                      uint16_t id,
@@ -430,6 +449,7 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
       control_request_pool_(NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL, id),
       data_request_pool_(NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL, id),
       provider_supports_hmem_(false),
+      provider_info_(railProviderInfo(provider)),
       runtime_(runtime) {
     // Initialize all pointers to nullptr
     info = nullptr;
@@ -456,21 +476,8 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
     hints->caps |= FI_SOURCE;
     hints->mode = FI_CONTEXT;
     hints->ep_attr->type = FI_EP_RDM;
-    // Configure memory registration mode based on provider capabilities
-    if (provider == "tcp" || provider == "sockets") {
-        // TCP provider doesn't support FI_MR_PROV_KEY or FI_MR_VIRT_ADDR, use basic mode
-        hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED;
-        hints->domain_attr->mr_key_size = 0; // Let provider decide
-    } else if (provider == "cxi") {
-        hints->caps |= FI_RMA_EVENT;
-        hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED |
-            FI_MR_PROV_KEY | FI_MR_ENDPOINT;
-    } else {
-        // EFA and other providers support advanced memory registration
-        hints->domain_attr->mr_mode =
-            FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-        hints->domain_attr->mr_key_size = 2;
-    }
+    // Capabilities and memory registration mode from the provider table
+    LibfabricUtils::applyProviderRailHints(provider_info_, hints);
     hints->domain_attr->name = strdup(device_name.c_str());
     hints->domain_attr->threading = FI_THREAD_COMPLETION;
 
@@ -497,10 +504,12 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             NIXL_INFO << "No provider found with FI_HMEM capability for rail " << rail_id
                       << ", retrying without FI_HMEM";
 
-            // Retry without FI_HMEM
+            // Retry without FI_HMEM, keeping the provider's own caps (FI_RMA_EVENT for cxi,
+            // which its registrations request)
             hints->caps = FI_MSG | FI_RMA;
             hints->caps |= FI_LOCAL_COMM | FI_REMOTE_COMM;
             hints->caps |= FI_SOURCE;
+            LibfabricUtils::applyProviderRailHints(provider_info_, hints);
 
             ret = fi_getinfo(requested_api_version, NULL, NULL, 0, hints, &info);
             if (ret) {
@@ -1688,26 +1697,15 @@ nixlLibfabricRail::registerMemory(void *buffer,
         return NIXL_ERR_BACKEND;
     }
 
-    // Determine access flags based on provider capabilities
-    uint64_t provider_access_flags;
-    if (provider_name == "tcp" || provider_name == "sockets") {
-        // TCP provider has more limited memory registration capabilities
-        // Use basic flags that are commonly supported
-        provider_access_flags = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
-    } else if (provider_name == "cxi") {
-        // CXI requires FI_RMA_EVENT to allow fi_writedata/fi_writemsg with target events.
-        provider_access_flags = FI_REMOTE_WRITE | FI_REMOTE_READ | FI_RMA_EVENT;
-    } else {
-        // EFA and other providers use standard remote access flags
-        provider_access_flags = FI_REMOTE_WRITE | FI_REMOTE_READ;
-    }
+    // Access flags and key handling come from the provider table entry
+    const uint64_t provider_access_flags = provider_info_.mr_access;
 
     struct fid_mr *mr;
 
     uint64_t requested_key = 0;
-    if (provider_name == "tcp" || provider_name == "sockets") {
-        // For providers that lack FI_MR_PROV_KEY, use a unique key to avoid conflicts.
-        // Under FI_MR_PROV_KEY, requested_key param will be ignored; otherwise, not.
+    if (LibfabricUtils::providerRequestsMrKey(provider_info_)) {
+        // Without FI_MR_PROV_KEY the provider uses the requested key, so make it unique per
+        // registration to avoid conflicts. Under FI_MR_PROV_KEY it is ignored.
         requested_key = reinterpret_cast<uint64_t>(buffer);
 
         NIXL_DEBUG << provider_name << " provider=using requested key " << requested_key << " ("
