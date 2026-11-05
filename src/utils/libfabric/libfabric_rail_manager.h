@@ -18,6 +18,7 @@
 #ifndef NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_MANAGER_H
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_MANAGER_H
 
+#include <algorithm>
 #include <vector>
 #include <memory>
 #include <unordered_map>
@@ -195,6 +196,15 @@ public:
                        uint32_t agent_idx,
                        std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs_out,
                        std::vector<char *> &ep_names_out);
+
+    /** Whether every rail can carry device memory. Rails share one provider but negotiate
+     *  FI_HMEM each on its own domain, and a VRAM buffer may be mapped to any of them. */
+    bool
+    canCarryDeviceMemory() const {
+        return !rails_.empty() && std::all_of(rails_.begin(), rails_.end(), [](const auto &rail) {
+            return rail->canCarryDeviceMemory();
+        });
+    }
 
     /** Whether every rail must be progressed. See providerNeedsAllRailProgress(). Valid once the
      *  rails are created. */

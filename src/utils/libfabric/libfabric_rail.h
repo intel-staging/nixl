@@ -477,6 +477,13 @@ public:
     bool
     canRegisterWithDmabuf(nixl_mem_t mem_type, enum fi_hmem_iface iface) const;
 
+    /** Whether this rail can carry the runtime's device memory. Level Zero memory needs FI_HMEM
+     *  and a provider that carries it (not efa): Intel has no NIC peer-memory module. Other
+     *  runtimes always can: without FI_HMEM their device memory is registered as host memory, as
+     *  before Level Zero support. */
+    bool
+    canCarryDeviceMemory() const;
+
     /** Deregister memory from libfabric */
     nixl_status_t
     deregisterMemory(struct fid_mr *mr) const;
@@ -677,7 +684,7 @@ private:
     // Provider table entry the rail was created with (defaultProviderInfo() if unlisted)
     const LibfabricUtils::nixlLibfabricProviderInfo &provider_info_;
 
-    // System runtime type (CUDA, NEURON, or SYSTEM) this rail was created for
+    // System runtime type (CUDA, ROCR, NEURON, ZE or SYSTEM) this rail was created for
     enum fi_hmem_iface runtime_;
 
     // Whether writes carry remote CQ data (imm_data), so the target gets a completion for each

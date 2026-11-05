@@ -376,6 +376,9 @@ struct nixlLibfabricProviderInfo {
     bool single_domain;
     /** @brief Provider-specific domain selection, or nullptr for @ref selectDomainsGeneric. */
     std::vector<std::string> (*select_domains)(const nixlProviderDeviceMap &);
+    /** @brief The provider can carry Level Zero (FI_HMEM_ZE) memory given FI_HMEM: by RDMA (cxi,
+     *  verbs) or through libfabric's own device copies (tcp). */
+    bool carries_ze;
 };
 
 /** @brief The provider table, in preference order (highest first). */
