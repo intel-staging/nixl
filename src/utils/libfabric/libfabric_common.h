@@ -374,6 +374,15 @@ struct nixlLibfabricProviderInfo {
     bool single_domain;
     /** @brief Provider-specific domain selection, or nullptr for @ref selectDomainsGeneric. */
     std::vector<std::string> (*select_domains)(const nixlProviderDeviceMap &);
+    /**
+     * @brief Device memory needs FI_HMEM: without it the provider copies through the kernel and
+     * fails on a device pointer (tcp, sockets). Clear for an RDMA provider, which can register
+     * device memory as host memory when the NIC has peer-memory support (NVIDIA only).
+     */
+    bool device_memory_needs_hmem;
+    /** @brief The provider can carry Level Zero (FI_HMEM_ZE) memory given FI_HMEM: by RDMA (cxi,
+     *  verbs) or through libfabric's own device copies (tcp). */
+    bool carries_ze;
 };
 
 /** @brief The provider table, in preference order (highest first). */

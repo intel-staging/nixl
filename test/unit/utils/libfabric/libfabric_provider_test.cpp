@@ -184,7 +184,18 @@ testProviderTable() {
         check(provider->needs_full_topology == !is_host_stack,
               std::string(provider->name) +
                   (is_host_stack ? " skips hwloc grouping" : " does PCIe-proximity grouping"));
+        check(provider->device_memory_needs_hmem == is_host_stack,
+              std::string(provider->name) +
+                  (is_host_stack ? " needs FI_HMEM for device memory" :
+                                   " may carry device memory without FI_HMEM"));
+        const std::string name = provider->name;
+        check(provider->carries_ze == (name == "cxi" || name == "verbs" || name == "tcp"),
+              name +
+                  (provider->carries_ze ? " carries Level Zero memory" :
+                                          " does not carry Level Zero memory"));
     }
+    check(!LibfabricUtils::defaultProviderInfo().carries_ze,
+          "an unlisted provider gets efa's defaults, which do not carry Level Zero memory");
 
     // The flag helpers used by the rest of the plugin.
     check(LibfabricUtils::providerNeedsAllRailProgress("verbs;ofi_rxm"),
