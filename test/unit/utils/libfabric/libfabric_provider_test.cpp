@@ -19,7 +19,8 @@
 /*
  * Tests for libfabric provider handling: baseProviderName(), the provider table, the rail hint
  * and registration-key helpers, selectProvider() and selectNetworkDevices(), using synthetic
- * prov_name -> domain maps and synthetic fi_getinfo() lists.
+ * prov_name -> domain maps and synthetic fi_getinfo() lists. The verbs-specific tests are in
+ * libfabric_verbs_test.cpp.
  */
 
 #include "libfabric/libfabric_common.h"
@@ -96,14 +97,14 @@ testProviderTable() {
         order.push_back(provider->name);
     }
     NIXL_INFO << "   preference order: [" << join(order) << "]";
-    check(order == std::vector<std::string>({"cxi", "efa", "tcp", "sockets"}),
+    check(order == std::vector<std::string>({"cxi", "efa", "verbs", "tcp", "sockets"}),
           "providers are in the documented preference order, RDMA before host-stack");
 
     // Lookup accepts a layered prov_name.
-    check(LibfabricUtils::findProviderInfo("efa;ofi_rxd") != nullptr,
+    check(LibfabricUtils::findProviderInfo("verbs;ofi_rxm") != nullptr,
           "findProviderInfo() resolves a layered prov_name");
-    check(LibfabricUtils::findProviderInfo("efa;ofi_rxd") ==
-              LibfabricUtils::findProviderInfo("efa"),
+    check(LibfabricUtils::findProviderInfo("verbs;ofi_rxm") ==
+              LibfabricUtils::findProviderInfo("verbs"),
           "the layered and core names resolve to the same entry");
     check(LibfabricUtils::findProviderInfo("psm3") == nullptr,
           "an unlisted provider has no table entry");
@@ -114,11 +115,20 @@ testProviderTable() {
     check((fallback.mr_mode & FI_MR_HMEM) != 0,
           "the fallback entry requests FI_MR_HMEM, so device memory still works on an unlisted "
           "provider");
+    check(!fallback.needs_prov_name_hint,
+          "the fallback entry does not pin hints to one provider name");
 
+    const auto *verbs = LibfabricUtils::findProviderInfo("verbs");
     const auto *cxi = LibfabricUtils::findProviderInfo("cxi");
     const auto *tcp = LibfabricUtils::findProviderInfo("tcp");
 
     // Per-provider flags.
+    check(verbs != nullptr && verbs->needs_prov_name_hint,
+          "verbs names itself in rail hints, so psm3 cannot claim the same domain");
+    check(verbs != nullptr && verbs->needs_all_rail_progress,
+          "verbs progresses every rail, so the passive side accepts lazy connections");
+    check(cxi != nullptr && !cxi->needs_all_rail_progress,
+          "a connectionless RDM provider keeps the cheaper active-rails-only progress");
     check(cxi != nullptr && (cxi->extra_caps & FI_RMA_EVENT) != 0, "cxi requests FI_RMA_EVENT");
     check(cxi != nullptr && (cxi->mr_mode & FI_MR_ENDPOINT) != 0,
           "cxi requests FI_MR_ENDPOINT in its mr_mode");
@@ -144,6 +154,8 @@ testProviderTable() {
          0,
          FI_REMOTE_WRITE | FI_REMOTE_READ | FI_RMA_EVENT},
         {"efa", 0, rdma_mode, 2, FI_REMOTE_WRITE | FI_REMOTE_READ},
+        // New with the verbs provider; same settings as efa.
+        {"verbs", 0, rdma_mode, 2, FI_REMOTE_WRITE | FI_REMOTE_READ},
         {"tcp", 0, FI_MR_LOCAL | FI_MR_ALLOCATED, 0, basic_access},
         {"sockets", 0, FI_MR_LOCAL | FI_MR_ALLOCATED, 0, basic_access},
     };
@@ -175,17 +187,22 @@ testProviderTable() {
     }
 
     // The flag helpers used by the rest of the plugin.
-    bool any_notifies_after_completion = false;
-    for (const auto *provider : providers) {
-        any_notifies_after_completion |=
-            LibfabricUtils::providerNotifiesAfterCompletion(provider->name);
-    }
-    check(!any_notifies_after_completion,
-          "every listed provider has the target count a WRITE's writes");
-    check(!LibfabricUtils::providerNotifiesAfterCompletion("psm3"),
-          "an unlisted provider has the target count a WRITE's writes");
+    check(LibfabricUtils::providerNeedsAllRailProgress("verbs;ofi_rxm"),
+          "providerNeedsAllRailProgress() accepts the layered name it will really be given");
+    check(!LibfabricUtils::providerNeedsAllRailProgress("efa"),
+          "providerNeedsAllRailProgress() is false for efa");
+    check(!LibfabricUtils::providerNeedsAllRailProgress("psm3"),
+          "an unlisted provider does not get all-rail progress");
+    check(LibfabricUtils::providerNotifiesAfterCompletion("verbs;ofi_rxm"),
+          "verbs sends a WRITE's notification after its writes complete");
+    check(!LibfabricUtils::providerNotifiesAfterCompletion("efa") &&
+              !LibfabricUtils::providerNotifiesAfterCompletion("cxi") &&
+              !LibfabricUtils::providerNotifiesAfterCompletion("tcp") &&
+              !LibfabricUtils::providerNotifiesAfterCompletion("psm3"),
+          "every other provider has the target count a WRITE's writes");
     check(LibfabricUtils::providerNeedsFullTopology("efa") &&
-              LibfabricUtils::providerNeedsFullTopology("cxi"),
+              LibfabricUtils::providerNeedsFullTopology("cxi") &&
+              LibfabricUtils::providerNeedsFullTopology("verbs"),
           "providerNeedsFullTopology() is true for every RDMA provider");
     check(!LibfabricUtils::providerNeedsFullTopology("tcp") &&
               !LibfabricUtils::providerNeedsFullTopology("sockets"),
@@ -236,7 +253,7 @@ testRailHelpers() {
         check(info != nullptr && LibfabricUtils::providerRequestsMrKey(*info),
               std::string(name) + " registrations request a unique key (no FI_MR_PROV_KEY)");
     }
-    for (const char *name : {"cxi", "efa"}) {
+    for (const char *name : {"cxi", "efa", "verbs"}) {
         const auto *info = LibfabricUtils::findProviderInfo(name);
         check(info != nullptr && !LibfabricUtils::providerRequestsMrKey(*info),
               std::string(name) + " registrations leave the key to the provider");
@@ -255,14 +272,27 @@ testProviderSelection() {
 
     auto select = [](const ProviderMap &map) { return LibfabricUtils::selectProvider(map); };
 
-    // efa is preferred over tcp and uses the generic rule.
+    // verbs is preferred over tcp.
+    const auto roce = select({
+        {"verbs;ofi_rxm", {"rocep153s0f0", "rocep153s0f1"}},
+        {"verbs;ofi_rxd", {"rocep153s0f0-dgram"}},
+        {"tcp", {"ens1f0np0", "lo"}},
+        {"psm3", {"rocep153s0f0"}},
+    });
+    check(roce.first == "verbs", "verbs is preferred over tcp on a RoCE host");
+    check(roce.second == std::vector<std::string>({"rocep153s0f0", "rocep153s0f1"}),
+          "the verbs hook's filtered domain list is the one used");
+
+    // efa is preferred over verbs and uses the generic rule.
     const auto efa = select({
         {"efa", {"rdmap16s27-rdm", "rdmap32s27-rdm"}},
+        {"verbs;ofi_rxm", {"mlx5_0"}},
         {"tcp", {"lo"}},
     });
-    check(efa.first == "efa", "efa outranks tcp");
-    check(efa.second == std::vector<std::string>({"rdmap16s27-rdm", "rdmap32s27-rdm"}),
-          "selection preserves fi_getinfo order, so existing efa rail numbering is unchanged");
+    check(efa.first == "efa", "efa outranks verbs");
+    check(
+        efa.second == std::vector<std::string>({"rdmap16s27-rdm", "rdmap32s27-rdm"}),
+        "the generic rule preserves fi_getinfo order, so existing efa rail numbering is unchanged");
 
     check(select({{"cxi", {"cxi0"}}, {"efa", {"rdmap16s27-rdm"}}}).first == "cxi",
           "cxi outranks efa");
@@ -424,6 +454,20 @@ testDeviceMetadataPerProvider() {
     check(!tcp_devices.empty() && tcp_devices[0].domain_name == "ens1f0np0" &&
               tcp_devices[0].pcie_address == "0:17:00.0" && tcp_devices[0].link_speed == 100,
           "the tcp rail is the first domain, with its own PCIe address and link speed");
+
+    // verbs is only listed under layered names; rails run on the ofi_rxm stack, so its entry
+    // wins over psm3's and the ofi_rxd stack's for the same domain.
+    FakeInfoList verbs;
+    verbs.add("psm3", "mlx5_0", 0xaa, 100);
+    verbs.add("verbs;ofi_rxd", "mlx5_0", 0xcc, 50);
+    verbs.add("verbs;ofi_rxm", "mlx5_0", 0x42, 400);
+    verbs.add("verbs;ofi_rxm", "mlx5_0-xrc", 0x43, 400);
+    const auto [verbs_provider, verbs_devices] = LibfabricUtils::selectNetworkDevices(verbs.head());
+    check(verbs_provider == "verbs" && verbs_devices.size() == 1,
+          "verbs is selected with one rail, the -xrc variant dropped");
+    check(!verbs_devices.empty() && verbs_devices[0].pcie_address == "0:42:00.0" &&
+              verbs_devices[0].link_speed == 400,
+          "a verbs rail takes the ofi_rxm stack's metadata, not psm3's or ofi_rxd's");
 
     check(LibfabricUtils::selectNetworkDevices(nullptr).first == "none",
           "an empty fi_getinfo() list selects no provider");
