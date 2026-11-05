@@ -111,7 +111,7 @@ public:
     // Rail management
     /** Create rails for high-bandwidth transfers (one per EFA device)
      * @param efa_devices List of EFA device names to create rails on
-     * @param provider_name Provider name ("efa" or "efa-direct")
+     * @param provider_name Core provider name (e.g. "efa", "cxi", "tcp")
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t

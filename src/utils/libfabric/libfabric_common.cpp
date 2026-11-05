@@ -19,10 +19,14 @@
 #include "libfabric_common.h"
 #include "common/nixl_log.h"
 
+#include <array>
 #include <iomanip>
 #include <sstream>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
@@ -31,13 +35,275 @@
 
 namespace LibfabricUtils {
 
+std::string
+baseProviderName(const std::string &prov_name) {
+    const size_t layered = prov_name.find(';');
+    return (layered == std::string::npos) ? prov_name : prov_name.substr(0, layered);
+}
+
+/****************************************
+ * Provider table
+ *****************************************/
+
+namespace {
+
+    constexpr uint64_t k_mr_mode_rdma =
+        FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+    // tcp and sockets support neither FI_MR_PROV_KEY nor FI_MR_VIRT_ADDR.
+    constexpr uint64_t k_mr_mode_basic = FI_MR_LOCAL | FI_MR_ALLOCATED;
+    // Host-stack providers additionally request local FI_READ/FI_WRITE access.
+    constexpr uint64_t k_mr_access_basic = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+
+    const nixlLibfabricProviderInfo k_cxi_provider = {
+        /*name=*/"cxi",
+        /*description=*/"CXI",
+        /*extra_caps=*/FI_RMA_EVENT,
+        /*mr_mode=*/k_mr_mode_rdma | FI_MR_ENDPOINT,
+        // Left to the provider: a key size here changes which fi_info entries cxi returns.
+        /*mr_key_size=*/0,
+        // FI_RMA_EVENT lets fi_writedata/fi_writemsg raise target events on the registration.
+        /*mr_access=*/FI_REMOTE_WRITE | FI_REMOTE_READ | FI_RMA_EVENT,
+        /*needs_full_topology=*/true,
+        /*single_domain=*/false,
+    };
+
+    const nixlLibfabricProviderInfo k_efa_provider = {
+        /*name=*/"efa",
+        /*description=*/"EFA",
+        /*extra_caps=*/0,
+        /*mr_mode=*/k_mr_mode_rdma,
+        /*mr_key_size=*/2,
+        /*mr_access=*/FI_REMOTE_WRITE | FI_REMOTE_READ,
+        /*needs_full_topology=*/true,
+        /*single_domain=*/false,
+    };
+
+    const nixlLibfabricProviderInfo k_tcp_provider = {
+        /*name=*/"tcp",
+        /*description=*/"tcp",
+        /*extra_caps=*/0,
+        /*mr_mode=*/k_mr_mode_basic,
+        /*mr_key_size=*/0,
+        /*mr_access=*/k_mr_access_basic,
+        /*needs_full_topology=*/false,
+        /*single_domain=*/true,
+    };
+
+    const nixlLibfabricProviderInfo k_sockets_provider = {
+        /*name=*/"sockets",
+        /*description=*/"sockets",
+        /*extra_caps=*/0,
+        /*mr_mode=*/k_mr_mode_basic,
+        /*mr_key_size=*/0,
+        /*mr_access=*/k_mr_access_basic,
+        /*needs_full_topology=*/false,
+        /*single_domain=*/true,
+    };
+
+    /*
+     * Preference order, highest first. Use FI_PROVIDER to restrict the choice.
+     *
+     * Every entry is a constant-initialised, trivially destructible object, so the table stays
+     * valid while exit() runs static destructors and the progress thread may still read it.
+     */
+    constexpr std::array<const nixlLibfabricProviderInfo *, 4> k_known_providers = {
+        &k_cxi_provider,
+        &k_efa_provider,
+        &k_tcp_provider,
+        &k_sockets_provider,
+    };
+
+} // namespace
+
+std::vector<std::string>
+selectDomainsGeneric(const nixlProviderDeviceMap &provider_device_map, const std::string &name) {
+    std::vector<std::string> domains;
+    std::unordered_set<std::string> seen;
+
+    const auto it = provider_device_map.find(name);
+    if (it == provider_device_map.end()) {
+        return domains;
+    }
+    for (const auto &domain : it->second) {
+        if (seen.insert(domain).second) {
+            domains.push_back(domain);
+        }
+    }
+    return domains;
+}
+
+std::span<const nixlLibfabricProviderInfo *const>
+knownProviders() {
+    return k_known_providers;
+}
+
+const nixlLibfabricProviderInfo *
+findProviderInfo(const std::string &prov_name) {
+    const std::string core = baseProviderName(prov_name);
+    for (const nixlLibfabricProviderInfo *provider : knownProviders()) {
+        if (core == provider->name) {
+            return provider;
+        }
+    }
+    return nullptr;
+}
+
+const nixlLibfabricProviderInfo &
+defaultProviderInfo() {
+    return k_efa_provider;
+}
+
+void
+applyProviderRailHints(const nixlLibfabricProviderInfo &provider, struct fi_info *hints) {
+    hints->caps |= provider.extra_caps;
+    hints->domain_attr->mr_mode = provider.mr_mode;
+    hints->domain_attr->mr_key_size = provider.mr_key_size;
+}
+
+bool
+providerRequestsMrKey(const nixlLibfabricProviderInfo &provider) {
+    return (provider.mr_mode & FI_MR_PROV_KEY) == 0;
+}
+
+bool
+providerNeedsFullTopology(const std::string &prov_name) {
+    const nixlLibfabricProviderInfo *provider = findProviderInfo(prov_name);
+    return (provider != nullptr) && provider->needs_full_topology;
+}
 
 std::pair<std::string, std::vector<std::string>>
-getAvailableNetworkDevices() {
-    std::vector<std::string> all_devices;
-    std::string provider_name;
+selectProvider(const nixlProviderDeviceMap &provider_device_map) {
+    // First table entry with usable domains wins.
+    for (const nixlLibfabricProviderInfo *provider : knownProviders()) {
+        std::vector<std::string> domains =
+            selectDomainsGeneric(provider_device_map, provider->name);
+        if (domains.empty()) {
+            continue;
+        }
+        if (provider->single_domain && domains.size() > 1) {
+            domains.resize(1);
+        }
+        return {provider->name, domains};
+    }
+    return {"none", {}};
+}
 
-    std::unordered_map<std::string, std::vector<std::string>> provider_device_map;
+std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
+selectNetworkDevices(const struct fi_info *info) {
+    nixlProviderDeviceMap provider_device_map;
+    // Bus address and link speed per prov_name and domain name. Several providers can report the
+    // same domain name (verbs and psm3) for different NICs or with different metadata, so a
+    // domain's metadata is only taken from the selected provider's own entries. Within one
+    // prov_name the first non-empty value is kept.
+    std::unordered_map<std::string, std::unordered_map<std::string, nixlLibfabricDeviceInfo>>
+        device_info;
+
+    for (const struct fi_info *cur = info; cur; cur = cur->next) {
+        if (cur->domain_attr && cur->domain_attr->name && cur->fabric_attr &&
+            cur->fabric_attr->prov_name) {
+
+            std::string device_name = cur->domain_attr->name;
+            std::string provider_name = cur->fabric_attr->prov_name;
+
+            NIXL_TRACE << "Found device - domain: " << device_name << ", provider=" << provider_name
+                       << ", ep_type=" << (cur->ep_attr ? cur->ep_attr->type : FI_EP_UNSPEC)
+                       << ", caps=" << std::hex << cur->caps << std::dec;
+
+            provider_device_map[provider_name].push_back(device_name);
+
+            nixlLibfabricDeviceInfo &dev = device_info[provider_name][device_name];
+            dev.domain_name = device_name;
+
+            if (cur->nic == nullptr) {
+                continue;
+            }
+            if (dev.pcie_address.empty() && cur->nic->bus_attr != nullptr &&
+                cur->nic->bus_attr->bus_type == FI_BUS_PCI) {
+                char pcie_addr[32];
+                snprintf(pcie_addr,
+                         sizeof(pcie_addr),
+                         "%x:%02x:%02x.%x",
+                         cur->nic->bus_attr->attr.pci.domain_id,
+                         cur->nic->bus_attr->attr.pci.bus_id,
+                         cur->nic->bus_attr->attr.pci.device_id,
+                         cur->nic->bus_attr->attr.pci.function_id);
+                dev.pcie_address = pcie_addr;
+            }
+            if (dev.link_speed == 0 && cur->nic->link_attr != nullptr) {
+                dev.link_speed = cur->nic->link_attr->speed;
+            }
+        }
+    }
+
+    for (const auto &device_list : provider_device_map) {
+        for (const auto &device : device_list.second) {
+            NIXL_TRACE << "provider=" << device_list.first << ", device=" << device;
+        }
+    }
+
+    // Named references rather than a structured binding: the lambda below captures them, which
+    // Clang before 16 rejects for structured bindings.
+    const auto selected = selectProvider(provider_device_map);
+    const std::string &provider_name = selected.first;
+    const std::vector<std::string> &domains = selected.second;
+    if (provider_name == "none") {
+        return {"none", {}};
+    }
+
+    // selectProvider() names the core provider, while the entries are keyed by full prov_name.
+    // Take a domain's metadata from the entry domain selection itself uses: the exact core name
+    // (selectDomainsGeneric()), else an ofi_rxm-layered stack of it, else another stack of the
+    // same core provider. Never from another provider. Every provider in the table today selects
+    // its domains by exact name, so the exact entry always exists; the ranking is for a provider
+    // whose rails run on a layered stack. Equal ranks go to the smallest prov_name, so the choice
+    // does not depend on hash order.
+    constexpr int k_rank_exact = 3;
+    constexpr int k_rank_rxm_layered = 2;
+    constexpr int k_rank_other_stack = 1;
+    const auto metadataFor = [&](const std::string &domain) {
+        const nixlLibfabricDeviceInfo *found = nullptr;
+        const std::string *found_prov = nullptr;
+        int found_rank = 0;
+        for (const auto &[prov_name, domains_info] : device_info) {
+            if (baseProviderName(prov_name) != provider_name) {
+                continue;
+            }
+            const auto it = domains_info.find(domain);
+            if (it == domains_info.end()) {
+                continue;
+            }
+            const int rank = (prov_name == provider_name)        ? k_rank_exact :
+                (prov_name.find("ofi_rxm") != std::string::npos) ? k_rank_rxm_layered :
+                                                                   k_rank_other_stack;
+            if (rank > found_rank || (rank == found_rank && prov_name < *found_prov)) {
+                found = &it->second;
+                found_prov = &prov_name;
+                found_rank = rank;
+            }
+        }
+        if (found != nullptr) {
+            return *found;
+        }
+        nixlLibfabricDeviceInfo dev;
+        dev.domain_name = domain;
+        return dev;
+    };
+
+    std::vector<nixlLibfabricDeviceInfo> devices;
+    devices.reserve(domains.size());
+    for (const auto &domain : domains) {
+        devices.push_back(metadataFor(domain));
+        NIXL_TRACE << "Selected " << provider_name << " domain " << devices.back().domain_name
+                   << " pcie="
+                   << (devices.back().pcie_address.empty() ? "unknown" :
+                                                             devices.back().pcie_address)
+                   << " link_speed=" << devices.back().link_speed;
+    }
+    return {provider_name, devices};
+}
+
+std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
+getAvailableNetworkDevices() {
     struct fi_info *hints, *info;
     hints = fi_allocinfo();
     if (!hints) {
@@ -70,42 +336,13 @@ getAvailableNetworkDevices() {
         return {"none", {}};
     }
 
-    // Process devices for this provider
-    for (struct fi_info *cur = info; cur; cur = cur->next) {
-        if (cur->domain_attr && cur->domain_attr->name && cur->fabric_attr &&
-            cur->fabric_attr->name) {
-
-            std::string device_name = cur->domain_attr->name;
-            std::string provider_name = cur->fabric_attr->prov_name;
-
-            NIXL_TRACE << "Found device - domain: " << device_name << ", provider=" << provider_name
-                       << ", ep_type=" << cur->ep_attr->type << ", caps=" << std::hex << cur->caps
-                       << std::dec;
-
-            if (provider_device_map.find(provider_name) == provider_device_map.end()) {
-                provider_device_map[provider_name] = {};
-            }
-            provider_device_map[provider_name].push_back(device_name);
-        }
-    }
+    auto result = selectNetworkDevices(info);
 
     fi_freeinfo(info);
     fi_freeinfo(hints);
 
-    for (auto device_list : provider_device_map) {
-        for (auto device : device_list.second) {
-            NIXL_TRACE << "provider=" << device_list.first << ", device=" << device;
-        }
-    }
-
-    if (provider_device_map.find("cxi") != provider_device_map.end()) {
-        return {"cxi", provider_device_map["cxi"]};
-    } else if (provider_device_map.find("efa") != provider_device_map.end()) {
-        return {"efa", provider_device_map["efa"]};
-    } else if (provider_device_map.find("tcp") != provider_device_map.end()) {
-        return {"tcp", {provider_device_map["tcp"][0]}};
-    } else if (provider_device_map.find("sockets") != provider_device_map.end()) {
-        return {"sockets", {provider_device_map["sockets"][0]}};
+    if (result.first != "none") {
+        return result;
     }
 
     NIXL_ERROR << "No network devices found with any provider";
