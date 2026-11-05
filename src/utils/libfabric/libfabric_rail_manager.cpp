@@ -295,7 +295,7 @@ nixlLibfabricRailManager::init(const nixl_b_params_t &custom_params) {
     // 1 - limit is within a single NUMA node bound --> use numa-aware policy
     // 2 - limit exceeds NUMA node capacity, but not machine capacity --> use numa-aware policy
     // 3 - limit exceeds entire machine capcaity --> use default (all) policy
-    // in case no EFA device is found, we use default policy
+    // in case no NIC is found, we use default policy
     // in case machine is "regular" (no NUMA nodes) it is regarded as a single NUMA node machine
     // NOTE: in non-uniform topology, the selection policy should have been per NUMA node, but that
     // is not a use case we relate to for now
@@ -323,12 +323,12 @@ nixlLibfabricRailManager::init(const nixl_b_params_t &custom_params) {
                          "previous errors";
             dram_rail_selection_policy_ = std::make_unique<nixlLibfabricAllRailSelectionPolicy>();
         } else if (topology->getAllDevices().size() == 1) {
-            // system has only 1 EFA, so use default policy (don't issue warning)
+            // system has only 1 NIC, so use default policy (don't issue warning)
             dram_rail_selection_policy_ = std::make_unique<nixlLibfabricAllRailSelectionPolicy>();
         }
         // NOTE: from this point onward we regard only rails that are attached to a PCIe switch
         // because these are the only ones that matter for avoiding PCIe congestion (the instance
-        // types we deal with have either all rails connected to PCIe switches, or have only one EFA
+        // types we deal with have either all rails connected to PCIe switches, or have only one NIC
         // that is either not attached to a NUMA node, as in C-series, or not attached to a PCIe
         // switch, as in G-series), so we test rail count against topology->getTotalNicCount()
         // (which represents the total number of "usable" rails, i.e. that are attached to a PCIe
@@ -381,9 +381,9 @@ nixlLibfabricRailManager::init(const nixl_b_params_t &custom_params) {
 }
 
 nixl_status_t
-nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_devices,
+nixlLibfabricRailManager::createRails(const std::vector<std::string> &nic_devices,
                                       const std::string &provider_name) {
-    num_rails_ = efa_devices.size();
+    num_rails_ = nic_devices.size();
     if (num_rails_ == 0) {
         NIXL_ERROR << "No network devices discovered; cannot create rails";
         return NIXL_ERR_BACKEND;
@@ -391,9 +391,9 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
     // Pre-allocate to ensure contiguous memory allocation
     rails_.reserve(num_rails_);
 
-    // Build EFA device to rail index mapping for O(1) lookup
-    efa_device_to_rail_map.clear();
-    efa_device_to_rail_map.reserve(num_rails_);
+    // Build NIC to rail index mapping for O(1) lookup
+    nic_device_to_rail_map.clear();
+    nic_device_to_rail_map.reserve(num_rails_);
     clearActiveRails();
 
     // Decided once here for progressActiveRails() and the rails. Without a progress thread,
@@ -412,17 +412,17 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
 
         for (size_t i = 0; i < num_rails_; ++i) {
             rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i],
+                nic_devices[i],
                 provider_name,
                 static_cast<uint16_t>(i),
                 runtime_,
                 /*write_remote_cq_data=*/!notify_after_completion_,
                 auto_progress));
 
-            // Initialize EFA device mapping
-            efa_device_to_rail_map[efa_devices[i]] = i;
+            // Initialize NIC mapping
+            nic_device_to_rail_map[nic_devices[i]] = i;
 
-            NIXL_DEBUG << "Created rail " << i << " (device=" << efa_devices[i]
+            NIXL_DEBUG << "Created rail " << i << " (device=" << nic_devices[i]
                        << ", provider=" << provider_name << ")";
         }
     }
@@ -689,40 +689,39 @@ nixlLibfabricRailManager::getDramRailLimit(const nixl_b_params_t &custom_params,
                                            size_t &max_bw,
                                            size_t &max_rails,
                                            size_t &recommended_rails) {
-    // trivial case: no EFA devices
+    // trivial case: no NICs
     if (topology->getAllDevices().empty()) {
         max_rails = 0;
-        NIXL_WARN << "Could not find EFA devices, rail selection for DRAM memory type aborted";
-        // this is unexpected, we except to find at least one EFA
+        NIXL_WARN << "Could not find NICs, rail selection for DRAM memory type aborted";
+        // this is unexpected, we except to find at least one NIC
         return false;
     }
 
-    // trivial case: only one EFA device
+    // trivial case: only one NIC
     if (topology->getAllDevices().size() == 1) {
         max_rails = 1;
-        NIXL_INFO << "NUMA-aware rail selection disabled when system has only one EFA device";
+        NIXL_INFO << "NUMA-aware rail selection disabled when system has only one NIC";
         // this could happen (e.g. C-series instance types)
         return true;
     }
 
-    // first make sure there are any usable EFA devices
+    // first make sure there are any usable NICs
     if (topology->getTotalNicCount() == 0) {
-        NIXL_WARN
-            << "Could not find EFA devices connected to any PCIe switch, NUMA-aware rail selection "
-               "for DRAM memory type aborted";
+        NIXL_WARN << "Could not find NICs connected to any PCIe switch, NUMA-aware rail selection "
+                     "for DRAM memory type aborted";
         return false;
     }
 
     // verify a few more computed values before continuing (avoid division by zero)
     size_t nic_speed = topology->getAvgNicBandwidth();
     if (nic_speed == 0) {
-        NIXL_WARN << "Could not deduce average EFA device line bandwidth, NUMA-aware rail "
+        NIXL_WARN << "Could not deduce average NIC line bandwidth, NUMA-aware rail "
                      "selection for DRAM memory type aborted";
         return false;
     }
     size_t nic_upstream_speed = topology->getAvgNicUpstreamBandwidth();
     if (nic_upstream_speed == 0) {
-        NIXL_WARN << "Could not deduce average EFA device upstream link bandwidth, NUMA-aware "
+        NIXL_WARN << "Could not deduce average NIC upstream link bandwidth, NUMA-aware "
                      "rail selection for DRAM memory type aborted";
         return false;
     }
@@ -796,36 +795,35 @@ nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr,
             return {}; // Return empty vector to indicate failure
         }
 
-        // Get EFA devices for this PCI bus ID
-        std::vector<std::string> device_efa_devices =
-            topology->getEfaDevicesForPci(device_pci_bus_id);
-        if (device_efa_devices.empty()) {
-            NIXL_ERROR << "No EFA devices found for PCI " << device_pci_bus_id;
+        // Get NICs for this PCI bus ID
+        std::vector<std::string> device_nics = topology->getNicsForPci(device_pci_bus_id);
+        if (device_nics.empty()) {
+            NIXL_ERROR << "No NICs found for PCI " << device_pci_bus_id;
             return {}; // Return empty vector to indicate failure
         }
         std::vector<size_t> device_rails;
-        for (const std::string &efa_device : device_efa_devices) {
-            auto it = efa_device_to_rail_map.find(efa_device);
-            if (it != efa_device_to_rail_map.end()) {
+        for (const std::string &nic_device : device_nics) {
+            auto it = nic_device_to_rail_map.find(nic_device);
+            if (it != nic_device_to_rail_map.end()) {
                 // Bounds check: ensure rail index is valid
                 if (it->second < rails_.size()) {
                     device_rails.push_back(it->second);
                     NIXL_DEBUG << "VRAM memory " << mem_addr << " on device PCI "
                                << device_pci_bus_id << " mapped to rail " << it->second
-                               << " (EFA device=" << efa_device << ")";
+                               << " (NIC=" << nic_device << ")";
                 } else {
-                    NIXL_WARN << "EFA device " << efa_device << " maps to rail " << it->second
+                    NIXL_WARN << "NIC " << nic_device << " maps to rail " << it->second
                               << " but only " << rails_.size() << " rails available";
                 }
             } else {
-                NIXL_WARN << "EFA device " << efa_device
-                          << " not found in rail mapping for device PCI " << device_pci_bus_id;
+                NIXL_WARN << "NIC " << nic_device << " not found in rail mapping for device PCI "
+                          << device_pci_bus_id;
             }
         }
 
         if (device_rails.empty()) {
             NIXL_ERROR << "No valid rail mapping found for device PCI " << device_pci_bus_id
-                       << " (checked " << device_efa_devices.size() << " EFA devices)";
+                       << " (checked " << device_nics.size() << " NICs)";
             return {};
         }
 

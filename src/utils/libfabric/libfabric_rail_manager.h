@@ -113,13 +113,13 @@ public:
     init(const nixl_b_params_t &custom_params);
 
     // Rail management
-    /** Create rails for high-bandwidth transfers (one per EFA device)
-     * @param efa_devices List of EFA device names to create rails on
+    /** Create rails for high-bandwidth transfers (one per NIC)
+     * @param nic_devices List of libfabric domain names to create rails on
      * @param provider_name Core provider name (e.g. "efa", "cxi", "tcp")
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
-    createRails(const std::vector<std::string> &efa_devices, const std::string &provider_name);
+    createRails(const std::vector<std::string> &nic_devices, const std::string &provider_name);
 
     // Access rails
     /** Get reference to rail by ID */
@@ -440,8 +440,8 @@ private:
 
     std::unique_ptr<nixlLibfabricTopology> topology;
 
-    // EFA device to rail mapping
-    std::unordered_map<std::string, size_t> efa_device_to_rail_map;
+    // NIC domain name to rail mapping
+    std::unordered_map<std::string, size_t> nic_device_to_rail_map;
 
     // active rails with reference counting (always positive)
     std::unordered_map<size_t, size_t> active_rails_;
