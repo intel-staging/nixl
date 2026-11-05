@@ -32,6 +32,8 @@ endif
 libfabric_utils_sources = [
     libfabric_rail_src,
     'libfabric_common.cpp',
+    'libfabric_accel.cpp',
+    'nfi_hmem.cpp',
     # Kept out of the hipify step below: it calls the CUDA driver API directly and
     # compiles to stubs unless NIXL_HAVE_CUDA_DRIVER_API is set.
     'libfabric_cuda_dmabuf.cpp',
@@ -44,6 +46,8 @@ libfabric_utils_headers = files(
     'libfabric_rail.h',
     'libfabric_rail_manager.h',
     'libfabric_common.h',
+    'libfabric_accel.h',
+    'nfi_hmem.h',
     'libfabric_cuda_dmabuf.h',
     'libfabric_topology.h',
 )
@@ -60,9 +64,15 @@ libfabric_utils_deps = [
     hwloc_dep,
     numa_dep,
     absl_log_dep,
+    dl_dep, # dlopen/dlsym for nfi_hmem.cpp, from the top-level meson.build
 ]
 
 libfabric_utils_cpp_args = []
+
+# Level Zero (Intel GPU), headers only
+if have_ze
+    libfabric_utils_cpp_args += ['-DHAVE_ZE']
+endif
 
 # Detect optional libfabric features at compile time to enable/disable
 # functionality based on the installed libfabric version

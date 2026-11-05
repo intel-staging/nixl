@@ -20,6 +20,7 @@
 #include "serdes/serdes.h"
 #include "common/configuration.h"
 #include "common/nixl_log.h"
+#include "libfabric/libfabric_accel.h"
 
 #include <cstdint>
 #include <dlfcn.h>
@@ -32,6 +33,7 @@
 #include <iomanip>
 #include <numeric>
 #include <optional>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
@@ -178,6 +180,61 @@ nrtQueryAddr(const void *va, std::string *efa_bdf) {
     }
 
     return -1;
+}
+
+/**
+ * @brief Looks up a Level Zero VRAM_SEG buffer's GPU PCI address and ZE device ordinal.
+ *
+ * @param[out] pci_bus_id GPU PCI address, or "" to use every rail.
+ * @param[out] device_id fi_mr_attr::device.ze value, encoded as fi_hmem_ze_device(0, ordinal).
+ */
+nixl_status_t
+zeQueryVram(const nixlBlobDesc &mem, std::string &pci_bus_id, int &device_id) {
+    struct nfi_hmem_info info;
+    if (nfi_hmem_query_ptr((void *)mem.addr, &info) != 0) {
+        NIXL_ERROR << "Failed to query device from memory " << (void *)mem.addr;
+        return NIXL_ERR_BACKEND;
+    }
+
+    if (info.iface != FI_HMEM_ZE) {
+        // libfabric's Level Zero support also sees only driver 0, so it could not register the
+        // buffer as ZE either: host memory, or another driver's or vendor's allocation.
+        NIXL_ERROR << "Cannot register VRAM buffer " << (void *)mem.addr << " (device " << mem.devId
+                   << "): Level Zero driver 0 does not own it, or its device is not one driver 0 "
+                   << "lists. Register host memory "
+                   << "as DRAM_SEG, and allocate device memory with zeMemAllocDevice() on the "
+                   << "GPU driver";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    if (info.pooled_dmabuf_size != 0) {
+        // libfabric would register a pooled allocation at the wrong offset into the pool.
+        NIXL_ERROR << "Cannot register VRAM buffer " << (void *)mem.addr << ": its "
+                   << info.alloc_size << "-byte allocation is part of a " << info.pooled_dmabuf_size
+                   << "-byte pooled Level Zero buffer object, which the NIC would address at the "
+                   << "wrong offset. Allocate memory for NIXL with zeMemAllocDevice() and a "
+                   << "chained ze_external_memory_export_desc_t "
+                   << "(ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF); that also keeps it "
+                   << "uncompressed, which the NIC needs as well";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    if (info.pooled_check_skipped) {
+        static std::once_flag warned;
+        std::call_once(warned, [&]() {
+            NIXL_WARN << "Could not check whether Level Zero VRAM buffer " << (void *)mem.addr
+                      << " is a slice of a pooled allocation, which the NIC would address at the "
+                      << "wrong offset; registering it anyway. Allocate NIXL buffers with "
+                      << "zeMemAllocDevice() and a chained ze_external_memory_export_desc_t to be "
+                      << "safe. Reported once.";
+        });
+    }
+
+    pci_bus_id = accelBusIdString(info);
+    device_id = static_cast<int>(info.device);
+    NIXL_DEBUG << "Queried PCI bus ID: " << pci_bus_id << " (ZE device " << info.device
+               << ") for device " << mem.devId;
+    return NIXL_SUCCESS;
 }
 
 } // namespace
@@ -522,6 +579,7 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
               << (runtime_ == FI_HMEM_CUDA       ? "CUDA" :
                       runtime_ == FI_HMEM_ROCR   ? "ROCr" :
                       runtime_ == FI_HMEM_NEURON ? "NEURON" :
+                      runtime_ == FI_HMEM_ZE     ? "ZE" :
                                                    "SYSTEM");
 
 #ifdef HAVE_CUDA
@@ -1023,6 +1081,11 @@ nixl_mem_list_t
 nixlLibfabricEngine::getSupportedMems() const {
     nixl_mem_list_t mems;
     mems.push_back(DRAM_SEG);
+    if (!rail_manager_.canCarryDeviceMemory()) {
+        // E.g. tcp without FI_HMEM, where transfers of device memory would fail.
+        NIXL_DEBUG << "Provider cannot carry device memory, skipping VRAM support";
+        return mems;
+    }
 #ifdef HAVE_CUDA
     if (runtime_ == FI_HMEM_CUDA || runtime_ == FI_HMEM_ROCR) {
         NIXL_DEBUG << (runtime_ == FI_HMEM_CUDA ? "CUDA" : "ROCr")
@@ -1030,8 +1093,9 @@ nixlLibfabricEngine::getSupportedMems() const {
         mems.push_back(VRAM_SEG);
     } else
 #endif
-        if (runtime_ == FI_HMEM_NEURON) {
-        NIXL_DEBUG << "Neuron runtime detected, adding VRAM support";
+        if (runtime_ == FI_HMEM_NEURON || runtime_ == FI_HMEM_ZE) {
+        NIXL_DEBUG << (runtime_ == FI_HMEM_ZE ? "Level Zero" : "Neuron")
+                   << " runtime detected, adding VRAM support";
         mems.push_back(VRAM_SEG);
     } else {
         NIXL_DEBUG << "No accelerator runtime, skipping VRAM support";
@@ -1056,6 +1120,9 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
     priv->device_id_ = mem.devId; // Store device ID
 
     std::string pci_bus_id = "";
+    // Device ordinal for the rail manager: the nixl device index, or the driver's ordinal for
+    // Level Zero.
+    int reg_device_id = mem.devId;
 
     // Use system runtime type to determine device-specific operations
     if (nixl_mem == VRAM_SEG) {
@@ -1121,6 +1188,12 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
             NIXL_DEBUG << "Queried PCI bus ID: " << pci_bus_id << " for Neuron device "
                        << mem.devId;
         }
+        if (runtime_ == FI_HMEM_ZE) {
+            nixl_status_t ze_status = zeQueryVram(mem, pci_bus_id, reg_device_id);
+            if (ze_status != NIXL_SUCCESS) {
+                return ze_status;
+            }
+        }
     }
 
     // Initialize vectors to accommodate all possible rails (for indexing consistency)
@@ -1143,7 +1216,7 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
     nixl_status_t status = rail_manager_.registerMemory((void *)mem.addr,
                                                         mem.len,
                                                         nixl_mem,
-                                                        mem.devId,
+                                                        reg_device_id,
                                                         pci_bus_id,
                                                         priv->rail_mr_list_,
                                                         priv->rail_key_list_,
