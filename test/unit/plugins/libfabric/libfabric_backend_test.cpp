@@ -16,13 +16,16 @@
  */
 
 // Regression test: a peer that still holds a connection entry must answer a
-// re-establishing side's handshake (vllm#62144).
+// re-establishing side's handshake (vllm#62144). Also checks the unclaimed-VRAM policy.
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "libfabric_backend.h"
+#include "libfabric/nfi_hmem.h"
 #include "test_utils.h"
 
 using namespace std;
@@ -47,9 +50,41 @@ createEngine(const string &name) {
     return engine;
 }
 
+// Host memory offered as VRAM_SEG is owned by no runtime, so it is refused with
+// NIXL_ERR_INVALID_PARAM, never registered as some runtime's memory. Neuron, whose query can miss
+// its own memory, registers such a buffer on every rail instead.
+static void
+testUnclaimedVram(nixlLibfabricEngine *engine) {
+    const nixl_mem_list_t mems = engine->getSupportedMems();
+    if (std::find(mems.begin(), mems.end(), VRAM_SEG) == mems.end()) {
+        cout << "libfabric_backend_test SKIP: unclaimed VRAM (VRAM_SEG not offered)" << endl;
+        return;
+    }
+    if (nfi_hmem_iface_available(FI_HMEM_NEURON)) {
+        cout << "libfabric_backend_test SKIP: unclaimed VRAM (Neuron registers it)" << endl;
+        return;
+    }
+
+    std::vector<char> host(4096);
+    nixlBlobDesc desc;
+    desc.addr = reinterpret_cast<uintptr_t>(host.data());
+    desc.len = host.size();
+    desc.devId = 0;
+    nixlBackendMD *md = nullptr;
+    const nixl_status_t status = engine->registerMem(desc, VRAM_SEG, md);
+    if (status == NIXL_SUCCESS) {
+        engine->deregisterMem(md);
+    }
+    nixl_exit_on_failure(status == NIXL_ERR_INVALID_PARAM,
+                         "registering host memory as VRAM_SEG returned " + std::to_string(status) +
+                             ", expected NIXL_ERR_INVALID_PARAM");
+    cout << "libfabric_backend_test OK: unclaimed VRAM refused" << endl;
+}
+
 int
 main() {
     auto *a = createEngine("AgentA");
+    testUnclaimedVram(a);
     auto *b = createEngine("AgentB");
 
     string conn_a, conn_b;

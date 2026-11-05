@@ -215,10 +215,8 @@ accelUnclaimedVramIface() {
     if (nfi_hmem_iface_available(FI_HMEM_CUDA) || nfi_hmem_iface_available(FI_HMEM_ROCR)) {
         return FI_HMEM_SYSTEM;
     }
-    for (const auto iface : {FI_HMEM_NEURON, FI_HMEM_ZE}) {
-        if (nfi_hmem_iface_available(iface)) {
-            return iface;
-        }
-    }
-    return FI_HMEM_SYSTEM;
+    // Neuron's query is libnrt's EFA-NIC lookup; memory it misses is still registered as Neuron,
+    // on every rail, as before. Level Zero's misses are errors: libfabric sees only driver 0 too,
+    // so it could not register them as ZE either.
+    return nfi_hmem_iface_available(FI_HMEM_NEURON) ? FI_HMEM_NEURON : FI_HMEM_SYSTEM;
 }

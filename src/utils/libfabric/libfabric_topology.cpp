@@ -29,14 +29,6 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
 
-#ifdef HAVE_CUDA
-#ifdef __HIP_PLATFORM_AMD__
-#include <hip/hip_runtime.h>
-#else
-#include <cuda_runtime.h>
-#endif
-#endif
-
 nixlLibfabricTopology::nixlLibfabricTopology()
     : num_numa_nodes(0),
       num_devices(0),
@@ -122,9 +114,8 @@ nixlLibfabricTopology::discoverTopology() {
         neuronEfaPreflightForNonEfaProvider();
 
         // Set basic values without hwloc discovery
-        // TCP doesn't need accelerator topology. The AMD count is kept, as before: a ROCm build
-        // selects the ROCr runtime from it, and getMrAttrIface() takes AMD memory's iface from
-        // it. Level Zero's eligibility stays in intel_accel_eligible_.
+        // TCP doesn't need accelerator topology. Past this point only logs read the counts (each
+        // buffer's runtime comes from its pointer), so they are cleared as before: all but AMD's.
         accel_counts.erase(FI_HMEM_CUDA);
         accel_counts.erase(FI_HMEM_NEURON);
         accel_counts.erase(FI_HMEM_ZE);
@@ -927,10 +918,10 @@ nixlLibfabricTopology::getTotalNumAccel() const {
 
 bool
 nixlLibfabricTopology::intelAccelCanDecideRuntime() const {
-    // Mirrors the runtime order in nixlLibfabricRailManager: CUDA and ROCm builds (both define
+    // Follows the runtime order of nfi_hmem_primary_iface(): CUDA and ROCm builds (both define
     // HAVE_CUDA) register NVIDIA and AMD memory, and Neuron comes before Level Zero. Intel GPUs
-    // that cannot become the runtime must not anchor NIC groups, or the GPUs that do get fewer
-    // rails.
+    // that cannot become the process runtime must not anchor NIC groups, or the GPUs that do get
+    // fewer rails; their buffers, which each buffer's own runtime still registers, use every rail.
 #ifdef HAVE_CUDA
     if (getNumNvidiaAccel() > 0 || getNumAmdAccel() > 0) {
         return false;

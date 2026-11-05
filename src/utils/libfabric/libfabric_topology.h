@@ -301,16 +301,6 @@ public:
         return getNumAccel(FI_HMEM_ZE);
     }
 
-    /**
-     * @brief Whether Level Zero may become the system runtime: no NVIDIA or AMD GPU a GPU build
-     * can register, and no Neuron device. Taken from the accelerator inventory, which is made for
-     * every provider, so it holds also where tcp/sockets reset the counts.
-     */
-    bool
-    intelAccelCanBeRuntime() const {
-        return intel_accel_eligible_;
-    }
-
     const std::vector<std::string> &
     getAllDevices() const {
         return all_devices;
@@ -329,17 +319,6 @@ public:
 
     bool
     isValidDevice(const std::string &nic_device) const;
-
-    enum fi_hmem_iface
-    getMrAttrIface(int device_id) const {
-        if (device_id < getNumNvidiaAccel()) {
-            return FI_HMEM_CUDA;
-        } else if (device_id < getNumNvidiaAccel() + getNumAmdAccel()) {
-            return FI_HMEM_ROCR;
-        } else {
-            return FI_HMEM_NEURON;
-        }
-    }
 
     /** @brief Invalid NUMA node id constant. */
     static const uint16_t INVALID_NUMA_NODE_ID = UINT16_MAX;
