@@ -459,7 +459,8 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
                                      uint16_t id,
                                      enum fi_hmem_iface runtime,
-                                     bool write_remote_cq_data)
+                                     bool write_remote_cq_data,
+                                     bool auto_progress)
     : rail_id(id),
       device_name(device),
       provider_name(provider),
@@ -496,8 +497,25 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
     hints->ep_attr->type = FI_EP_RDM;
     // Capabilities and memory registration mode from the provider table
     LibfabricUtils::applyProviderRailHints(provider_info_, hints);
+    if (provider_info_.needs_prov_name_hint) {
+        hints->fabric_attr->prov_name = strdup(provider_info_.name);
+    }
     hints->domain_attr->name = strdup(device_name.c_str());
+    if (!hints->domain_attr->name ||
+        (provider_info_.needs_prov_name_hint && !hints->fabric_attr->prov_name)) {
+        fi_freeinfo(hints);
+        NIXL_ERROR << "strdup failed while building fi_getinfo hints for rail " << rail_id;
+        throw std::runtime_error("Failed to allocate fi_info hints for rail " +
+                                 std::to_string(rail_id));
+    }
     hints->domain_attr->threading = FI_THREAD_COMPLETION;
+    if (auto_progress) {
+        // The provider accepts connections on its own thread. rxm requires FI_THREAD_SAFE for
+        // FI_PROGRESS_AUTO, since that thread shares the endpoint with ours.
+        hints->domain_attr->threading = FI_THREAD_SAFE;
+        hints->domain_attr->control_progress = FI_PROGRESS_AUTO;
+        hints->domain_attr->data_progress = FI_PROGRESS_AUTO;
+    }
 
     // The EFA provider accepts FI_MR_DMABUF from libfabric API 1.20 on, so request 1.20
     // where the library provides it and 1.18 elsewhere. The fabric carries the requested
@@ -512,6 +530,16 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
 #else
     const uint32_t requested_api_version = FI_VERSION(1, 18);
 #endif
+
+    const auto throwAutoProgressNotGranted = [&]() {
+        NIXL_ERROR << "Provider " << provider << " did not grant FI_PROGRESS_AUTO on rail "
+                   << rail_id << "; without it or a progress thread, connection setup would "
+                   << "stall. Enable the progress thread (nixlAgentConfig::useProgThread, or "
+                   << "--enable_pt=1 under nixlbench), or select another provider with "
+                   << "FI_PROVIDER";
+        throw std::runtime_error("FI_PROGRESS_AUTO not granted for rail " +
+                                 std::to_string(rail_id));
+    };
 
     try {
         // Get fabric info for this specific device - first try with FI_HMEM
@@ -530,6 +558,23 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             LibfabricUtils::applyProviderRailHints(provider_info_, hints);
 
             ret = fi_getinfo(requested_api_version, NULL, NULL, 0, hints, &info);
+            if (ret && auto_progress) {
+                // fi_getinfo drops entries that cannot grant FI_PROGRESS_AUTO rather than
+                // returning them with manual progress. Probe once without it to check whether it
+                // caused the failure.
+                hints->domain_attr->threading = FI_THREAD_COMPLETION;
+                hints->domain_attr->control_progress = FI_PROGRESS_UNSPEC;
+                hints->domain_attr->data_progress = FI_PROGRESS_UNSPEC;
+                struct fi_info *probe = nullptr;
+                const int probe_ret =
+                    fi_getinfo(requested_api_version, NULL, NULL, 0, hints, &probe);
+                if (probe) {
+                    fi_freeinfo(probe);
+                }
+                if (probe_ret == 0) {
+                    throwAutoProgressNotGranted();
+                }
+            }
             if (ret) {
                 // A provider that cannot support FI_SOURCE fails fi_getinfo rather than returning
                 // info without it. Probe once without FI_SOURCE to check whether it caused the
@@ -558,6 +603,14 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             // Provider found with FI_HMEM
             provider_supports_hmem_ = true;
             NIXL_INFO << "Using provider with FI_HMEM support for rail " << rail_id;
+        }
+
+        if (auto_progress && info->domain_attr->data_progress != FI_PROGRESS_AUTO) {
+            throwAutoProgressNotGranted();
+        }
+        if (auto_progress) {
+            NIXL_INFO << "Rail " << rail_id << ": no progress thread, so " << provider
+                      << " progresses connection setup on its own thread (FI_PROGRESS_AUTO)";
         }
 
         // Create fabric for this rail

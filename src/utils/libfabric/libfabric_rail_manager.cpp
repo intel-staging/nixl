@@ -194,9 +194,11 @@ private:
     buildNumaDistanceMap();
 };
 
-nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
+nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
+                                                   bool progress_thread_enabled)
     : striping_threshold_(striping_threshold),
-      runtime_(FI_HMEM_CUDA) {
+      runtime_(FI_HMEM_CUDA),
+      progress_thread_enabled_(progress_thread_enabled) {
     NIXL_DEBUG << "Creating rail manager with striping threshold: " << striping_threshold_
                << " bytes";
 
@@ -375,6 +377,10 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
     efa_device_to_rail_map.reserve(num_rails_);
     clearActiveRails();
 
+    // Decided once here for progressActiveRails() and the rails. Without a progress thread,
+    // lazily connecting providers progress connections themselves.
+    needs_all_rail_progress_ = LibfabricUtils::providerNeedsAllRailProgress(provider_name);
+    const bool auto_progress = !progress_thread_enabled_ && needs_all_rail_progress_;
     // Decided once here for the rails and the engine (notifiesAfterCompletion()).
     // NIXL_LIBFABRIC_NOTIFY_AFTER_COMPLETION=1 forces it on any provider, e.g. to test it.
     const char *force_notify = std::getenv("NIXL_LIBFABRIC_NOTIFY_AFTER_COMPLETION");
@@ -391,7 +397,8 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &efa_device
                 provider_name,
                 static_cast<uint16_t>(i),
                 runtime_,
-                /*write_remote_cq_data=*/!notify_after_completion_));
+                /*write_remote_cq_data=*/!notify_after_completion_,
+                auto_progress));
 
             // Initialize EFA device mapping
             efa_device_to_rail_map[efa_devices[i]] = i;
@@ -1144,47 +1151,65 @@ nixlLibfabricRailManager::postControlMessage(
 
 nixl_status_t
 nixlLibfabricRailManager::progressActiveRails() {
-    std::unordered_set<size_t> rails_to_process;
-
-    // Copy active rails under lock to avoid iterator invalidation
-    {
-        std::lock_guard<std::mutex> lock(active_rails_mutex_);
-        // Always progress rail 0 for notifications (SEND/RECV)
-        rails_to_process.insert(0);
-        for (const auto &[rail_id, refcount] : active_rails_) {
-            rails_to_process.insert(rail_id);
-        }
-    }
-
-    // Process rails without holding the lock
     bool any_completions = false;
     nixl_status_t first_error = NIXL_SUCCESS;
-    for (size_t rail_id : rails_to_process) {
+    size_t rails_processed = 0;
+
+    const auto progress_rail = [&](size_t rail_id) {
         if (rail_id >= rails_.size()) {
             NIXL_ERROR << "Invalid rail ID: " << rail_id;
-            continue;
+            return;
         }
+        ++rails_processed;
         // Process completions on rails
         nixl_status_t status = rails_[rail_id]->progressCompletionQueue();
         if (status == NIXL_SUCCESS) {
             any_completions = true;
             NIXL_DEBUG << "Processed completions on rail " << rail_id;
-        } else if (status != NIXL_IN_PROG && status != NIXL_SUCCESS) {
+        } else if (status != NIXL_IN_PROG) {
             NIXL_ERROR << "Failed to process completions on rail " << rail_id;
             // Continue processing other rails even if one fails
             if (first_error == NIXL_SUCCESS) {
                 first_error = status;
             }
         }
+    };
+
+    if (needs_all_rail_progress_) {
+        // Lazily connecting providers accept a peer's connection only on a progressed rail, so
+        // progress every rail, not just the active ones.
+        for (size_t rail_id = 0; rail_id < rails_.size(); ++rail_id) {
+            progress_rail(rail_id);
+        }
+    } else {
+        std::unordered_set<size_t> rails_to_process;
+        {
+            // Copy active rails under lock to avoid iterator invalidation
+            std::lock_guard<std::mutex> lock(active_rails_mutex_);
+            // Always progress rail 0 for notifications (SEND/RECV)
+            rails_to_process.insert(0);
+            for (const auto &[rail_id, refcount] : active_rails_) {
+                rails_to_process.insert(rail_id);
+            }
+        }
+        // Process rails without holding the lock
+        for (size_t rail_id : rails_to_process) {
+            progress_rail(rail_id);
+        }
     }
 
     if (any_completions) {
-        NIXL_TRACE << "Processed " << rails_to_process.size() << " rails, completions found";
+        NIXL_TRACE << "Processed " << rails_processed << " rails, completions found";
     }
     if (first_error != NIXL_SUCCESS) {
         return first_error;
     }
     return any_completions ? NIXL_SUCCESS : NIXL_IN_PROG;
+}
+
+bool
+nixlLibfabricRailManager::needsAllRailProgress() const {
+    return needs_all_rail_progress_;
 }
 
 bool
