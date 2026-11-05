@@ -398,19 +398,23 @@ class nixlLibfabricRail {
 public:
     uint16_t rail_id; ///< Unique rail identifier
     std::string device_name; ///< Libfabric domain name for this rail
-    std::string provider_name; ///< Core provider name (e.g., "efa", "cxi", "tcp")
+    std::string provider_name; ///< Core provider name (e.g., "efa", "cxi", "verbs")
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
     struct fid_ep *endpoint; ///< Libfabric endpoint handle
 
     /** Initialize libfabric rail with all resources
      * @param write_remote_cq_data Post writes with FI_REMOTE_CQ_DATA, so the target gets a
      *        completion for each one. The rail manager clears it when the provider notifies after
-     *        completion (providerNotifiesAfterCompletion()). */
+     *        completion (providerNotifiesAfterCompletion()).
+     * @param auto_progress Request FI_PROGRESS_AUTO (with FI_THREAD_SAFE) so the provider accepts
+     *        connections on its own thread. Used for lazily connecting providers when the backend
+     *        runs no progress thread. Throws if the provider does not grant it. */
     nixlLibfabricRail(const std::string &device,
                       const std::string &provider,
                       uint16_t id,
                       enum fi_hmem_iface runtime,
-                      bool write_remote_cq_data = true);
+                      bool write_remote_cq_data = true,
+                      bool auto_progress = false);
 
     /**
      * @brief While alive, a post refused with -FI_EAGAIN on this thread progresses the rail's CQ
