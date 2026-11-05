@@ -21,9 +21,11 @@
  * @brief Heterogeneous-memory helpers that libfabric uses internally but does not export.
  *
  * Identifies which accelerator runtime owns a pointer and fills fi_mr_attr::iface and
- * fi_mr_attr::device for fi_mr_regattr(). The interface is C-compatible and depends only on
- * libfabric's public headers; vendor runtimes are loaded with dlopen. All functions are
- * thread-safe, and each vendor is initialised once, on first use.
+ * fi_mr_attr::device for fi_mr_regattr(), and binds a thread to a device for runtimes that keep
+ * thread-current state. The interface is C-compatible and depends only on libfabric's public
+ * headers. The Level Zero and Neuron runtimes are loaded with dlopen; CUDA and ROCr use the runtime
+ * the build links. All functions are thread-safe, and each vendor is initialised once, on first
+ * use.
  */
 
 #ifndef NFI_HMEM_H
@@ -94,6 +96,13 @@ struct nfi_hmem_info {
     bool pooled_check_skipped;
 };
 
+/** @brief A pushed accelerator context, popped on the same thread. Zero-initialise it. */
+struct nfi_hmem_scope {
+    enum fi_hmem_iface iface;
+    uint64_t saved;
+    int pushed;
+};
+
 /** @brief Diagnostic severity. */
 enum nfi_hmem_log_level {
     NFI_HMEM_LOG_ERROR = 0,
@@ -121,7 +130,8 @@ nfi_hmem_set_log_fn(nfi_hmem_log_fn fn);
  * @brief Identifies which accelerator runtime owns @p addr.
  *
  * Vendors are probed in the same order as libfabric's ofi_get_hmem_iface(), so this and a provider
- * that derives the iface itself (cxi, rxm, opx) agree about a pointer. Host memory is reported as
+ * that derives the iface itself (cxi, rxm, opx) agree about a ZE, ROCr or CUDA pointer. libfabric
+ * never reports Neuron; that answer is nixl's own. Host memory is reported as
  * FI_HMEM_SYSTEM with a success return. Talks to the vendor runtime: call once per registration.
  *
  * @param addr Pointer to identify.
@@ -152,7 +162,10 @@ nfi_hmem_available(void);
 bool
 nfi_hmem_iface_available(enum fi_hmem_iface iface);
 
-/** @brief First usable runtime in probe order, or FI_HMEM_SYSTEM if there is none. */
+/**
+ * @brief The usable runtime a process should prefer: CUDA, then ROCr, Neuron and Level Zero, as
+ * the rail manager orders them. FI_HMEM_SYSTEM if none is usable. Not the per-pointer probe order.
+ */
 enum fi_hmem_iface
 nfi_hmem_primary_iface(void);
 
@@ -201,6 +214,32 @@ nfi_hmem_device_bdfs(enum fi_hmem_iface iface, struct nfi_hmem_bus_id *out, size
  */
 bool
 nfi_hmem_ze_is_pooled_slice(uint64_t alloc_size, uint64_t dmabuf_size);
+
+/**
+ * @brief Whether @p iface keeps thread-current state that must be set before use.
+ *
+ * True for CUDA, whose context is per thread. When false, the scope calls are no-ops.
+ */
+bool
+nfi_hmem_needs_scope(enum fi_hmem_iface iface);
+
+/**
+ * @brief Makes @p device of @p iface current on the calling thread until the matching pop.
+ *
+ * Binds the device's primary context, and restores the previous binding on pop. A no-op when
+ * @ref nfi_hmem_needs_scope is false. Cheap enough to call per descriptor.
+ *
+ * @param iface Interface owning @p device.
+ * @param device Ordinal as reported in @ref nfi_hmem_info::device.
+ * @param[out] scope State for @ref nfi_hmem_scope_pop. Safe to pop even if the push failed.
+ * @return 0 on success, -EINVAL if @p scope is NULL, or a negative errno from the runtime.
+ */
+int
+nfi_hmem_scope_push(enum fi_hmem_iface iface, uint64_t device, struct nfi_hmem_scope *scope);
+
+/** @brief Undoes @ref nfi_hmem_scope_push on the same thread. Safe to call twice. */
+void
+nfi_hmem_scope_pop(struct nfi_hmem_scope *scope);
 
 #ifdef __cplusplus
 } /* extern "C" */
