@@ -66,18 +66,23 @@ bool
 nfi_cuda_query(const void *addr, struct nfi_hmem_info *info) {
     CUmemorytype mem_type = CU_MEMORYTYPE_HOST;
     CUdevice dev = 0;
-    CUpointer_attribute attrs[2] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
-                                    CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL};
-    void *data[2] = {&mem_type, &dev};
+    CUcontext ctx = nullptr;
+    CUpointer_attribute attrs[3] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                    CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                                    CU_POINTER_ATTRIBUTE_CONTEXT};
+    void *data[3] = {&mem_type, &dev, &ctx};
 
     /* Works without a current context: UVA lets the driver attribute any allocation. */
-    if (cuPointerGetAttributes(2, attrs, data, (CUdeviceptr)addr) != CUDA_SUCCESS ||
+    if (cuPointerGetAttributes(3, attrs, data, (CUdeviceptr)addr) != CUDA_SUCCESS ||
         mem_type != CU_MEMORYTYPE_DEVICE) {
         return false;
     }
 
     info->iface = FI_HMEM_CUDA;
     info->device = static_cast<uint64_t>(dev);
+    /* The allocating context: the primary one for the runtime API, or the application's own
+     * (cuCtxCreate, green contexts). Null for virtual-memory (cuMemCreate) allocations. */
+    info->context = reinterpret_cast<uint64_t>(ctx);
     nfi_cuda_fill_bus(info, dev);
     return true;
 }
@@ -164,16 +169,30 @@ nfi_cuda_primary_ctx_inactive(CUdevice dev) {
     return cuDevicePrimaryCtxGetState(dev, &flags, &active) == CUDA_SUCCESS && !active;
 }
 
-/* *saved holds the device, with the top bit set when its retain belongs to the cache. */
+/* *saved holds the device, with the top bit set when pop has no retain to release (the cache
+ * owns it, or the context is the allocation's own). */
 #define NFI_CUDA_SAVED_CACHED (1ULL << 63)
 
 int
-nfi_cuda_scope_push(uint64_t device, uint64_t *saved) {
+nfi_cuda_scope_push(uint64_t device, uint64_t context, uint64_t *saved) {
     /* An ordinal, as nfi_cuda_query() reports it; one past INT_MAX cannot be a CUdevice. */
     if (device > static_cast<uint64_t>(INT_MAX)) {
         return -EINVAL;
     }
     CUdevice dev = static_cast<CUdevice>(device);
+
+    /* The allocation's own context, which the application keeps alive while the memory is
+     * registered: pushed as is, with no retain to drop on pop. */
+    if (context != 0) {
+        if (cuCtxPushCurrent(reinterpret_cast<CUcontext>(context)) != CUDA_SUCCESS) {
+            nfi_log(NFI_HMEM_LOG_ERROR,
+                    "cuCtxPushCurrent failed for the owning context of CUDA device %d",
+                    static_cast<int>(dev));
+            return -EIO;
+        }
+        *saved = device | NFI_CUDA_SAVED_CACHED;
+        return 0;
+    }
     bool cached = false;
     CUcontext primary = nfi_cuda_primary_ctx(dev, &cached, nullptr);
     if (!primary) {
