@@ -207,3 +207,18 @@ bool
 accelIfaceIsGroupable(enum fi_hmem_iface iface) {
     return iface == FI_HMEM_CUDA || iface == FI_HMEM_ROCR || iface == FI_HMEM_ZE;
 }
+
+enum fi_hmem_iface
+accelUnclaimedVramIface() {
+    // CUDA and ROCr (HSA) attribute every device allocation of theirs, so a pointer neither claims
+    // is not VRAM.
+    if (nfi_hmem_iface_available(FI_HMEM_CUDA) || nfi_hmem_iface_available(FI_HMEM_ROCR)) {
+        return FI_HMEM_SYSTEM;
+    }
+    for (const auto iface : {FI_HMEM_NEURON, FI_HMEM_ZE}) {
+        if (nfi_hmem_iface_available(iface)) {
+            return iface;
+        }
+    }
+    return FI_HMEM_SYSTEM;
+}

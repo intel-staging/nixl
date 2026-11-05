@@ -32,17 +32,17 @@ The Libfabric plugin provides a high-performance RDMA communication backend with
 | Accelerator | Build dependency | Runtime library | HMEM interface |
 |---|---|---|---|
 | NVIDIA GPU | CUDA toolkit | `libcuda.so.1` | `FI_HMEM_CUDA` |
-| AMD GPU | ROCm (`-Drocm_path=...`) | `libamdhip64.so` | `FI_HMEM_ROCR` |
+| AMD GPU | ROCm (`-Drocm_path=...`) | `libamdhip64.so`, `libhsa-runtime64.so` | `FI_HMEM_ROCR` |
 | Intel GPU (Xe / Arc / Data Center GPU) | `level_zero/ze_api.h` (`libze-dev`, or oneAPI's `include` directory on the include path) | `libze_loader.so.1` | `FI_HMEM_ZE` |
 | AWS Trainium / Inferentia | none | `libnrt.so.1` | `FI_HMEM_NEURON` |
 
-Level Zero and Neuron are needed only at build time as headers (Neuron not even that): their runtime
-libraries are `dlopen`'d, so one binary works on hosts with and without the driver. Meson reports
-what it found -- look for `Found Level Zero headers, libfabric backend will build with FI_HMEM_ZE
-support` in the configure output. `-Dlevel_zero=disabled` builds without Level Zero even when the
-headers are installed, and `-Dlevel_zero=enabled` makes missing or too-old headers an error. At
-startup the plugin logs the accelerators it found per vendor (`Topology: ... CUDA=0 ROCR=0 ZE=3
-NEURON=0`) and the runtime it selected (`System runtime: ZE`).
+The Level Zero and Neuron runtime libraries are `dlopen`'d, so one binary works on hosts with and
+without their drivers. CUDA and ROCm builds link their runtime, and so need it at load time. Meson
+reports what it found -- look for `Found Level Zero headers, libfabric backend will build with
+FI_HMEM_ZE support` in the configure output. `-Dlevel_zero=disabled` builds without Level Zero even when the headers are
+installed, and `-Dlevel_zero=enabled` makes missing or too-old headers an error. At startup the
+plugin logs the accelerators it found per vendor (`Topology: ... CUDA=0 ROCR=0 ZE=3 NEURON=0`)
+and the runtime it selected (`System runtime: ZE`).
 
 Notes specific to Intel GPUs:
 
@@ -265,9 +265,26 @@ The following table summarizes briefly the plugin's runtime configuration:
 - **`nixlLibfabricTopology`** - Hardware topology discovery for optimal accelerator-to-NIC and NUMA-to-NIC mapping
 - **`nixlLibfabricBackendH`** - Request handle for tracking multi-request transfer completion with atomic counters
 - **`nixlLibfabricConnection`** - Multi-rail connection metadata for remote agents with state management
-- **`nfi_hmem.{h,cpp}`** - Heterogeneous-memory helpers libfabric has internally but does not export: which runtime owns a pointer, which `fi_mr_attr::device` arm to fill, which devices a runtime enumerated. A C-compatible interface with no nixl dependencies. Level Zero is its only vendor so far
-- **`libfabric_accel.{h,cpp}`** - nixl's side of that boundary: matching the runtime's devices against the hwloc topology, and routing the shim's diagnostics into the NIXL log
+- **`nfi_hmem.{h,cpp}`** - Heterogeneous-memory helpers libfabric has internally but does not export: which runtime owns a pointer, which `fi_mr_attr::device` arm to fill, which devices a runtime enumerated. Covers CUDA, ROCr, Level Zero and Neuron through one vendor table (Level Zero in `nfi_hmem.cpp`, the others in `nfi_hmem_{cuda,rocr,neuron}.cpp`), and binds a thread to a device for runtimes with thread-current state (CUDA). A C-compatible interface with no nixl dependencies
+- **`libfabric_accel.{h,cpp}`** - nixl's side of that boundary: attributing hwloc devices to vendors, the grouping and unclaimed-VRAM policy, the `nixlAccelScope` RAII guard, and routing the shim's diagnostics into the NIXL log
 - **`nixlLibfabricProviderInfo`** - Table entry describing one core libfabric provider (declared in `src/utils/libfabric/libfabric_common.h`, table in `libfabric_common.cpp`); holds the provider's rail and memory-registration settings
+
+### Adding an accelerator vendor
+
+Vendor-specific code belongs behind `nfi_hmem.h` and `libfabric_accel.h`, so that backend, rail
+manager and topology code need not name vendors. A new vendor needs:
+
+1. Its hooks in a file of its own, `nfi_hmem_<vendor>.cpp`, declared in `nfi_hmem_vendor.h`: an
+   `init` hook, a `query` hook that attributes a pointer, and optionally `device_bdfs` and
+   `scope_push`/`scope_pop`. Load an optional runtime with `dlopen()` so a build with its headers
+   still runs without it, and guard the file with the build's define for that SDK.
+2. An `nfi_vendors[]` entry in `nfi_hmem.cpp` pointing at those hooks. Keep the table in
+   descending `fi_hmem_iface` order, as libfabric's `ofi_get_hmem_iface()` probes.
+3. Its `fi_mr_attr::device` arm in `nfi_hmem_fill_mr_attr()`.
+4. A branch in `accelIfaceOfHwlocObj()` and a decision in `accelIfaceIsGroupable()` in
+   `libfabric_accel.cpp`, and its place in `accelUnclaimedVramIface()`: a usable runtime whose
+   query attributes every allocation made through it makes an unclaimed pointer an error, and one
+   whose query can miss its own memory becomes a fallback.
 
 ### Adding a provider
 
