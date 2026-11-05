@@ -398,19 +398,17 @@ void
 testUnclaimedVramPolicy() {
     NIXL_INFO << "8. Testing the unclaimed-VRAM policy";
 
-    // An error where CUDA or ROCr is usable, otherwise Neuron, then Level Zero.
+    // An error where CUDA or ROCr is usable, otherwise a Neuron fallback. Never Level Zero.
     const enum fi_hmem_iface fallback = accelUnclaimedVramIface();
+    check(fallback != FI_HMEM_ZE, "Level Zero is never the unclaimed-VRAM fallback");
     if (nfi_hmem_iface_available(FI_HMEM_CUDA) || nfi_hmem_iface_available(FI_HMEM_ROCR)) {
         check(fallback == FI_HMEM_SYSTEM,
               "an unclaimed VRAM pointer is an error where CUDA or ROCr is usable");
     } else if (nfi_hmem_iface_available(FI_HMEM_NEURON)) {
         check(fallback == FI_HMEM_NEURON,
-              "without CUDA or ROCr, unclaimed VRAM falls back to Neuron first");
-    } else if (nfi_hmem_iface_available(FI_HMEM_ZE)) {
-        check(fallback == FI_HMEM_ZE,
-              "without CUDA, ROCr or Neuron, unclaimed VRAM falls back to ZE");
+              "without CUDA or ROCr, unclaimed VRAM falls back to Neuron");
     } else {
-        check(fallback == FI_HMEM_SYSTEM, "with no fallback runtime, unclaimed VRAM is an error");
+        check(fallback == FI_HMEM_SYSTEM, "without Neuron, unclaimed VRAM is an error");
     }
 }
 
@@ -441,6 +439,23 @@ testScope() {
         const nixlAccelScope guard(FI_HMEM_SYSTEM, 0);
         check(guard.ok(), "nixlAccelScope reports success when there is nothing to bind");
     }
+
+    // A binding compares iface, device and owning context; a scope holds only what it bound
+    {
+        const nixlAccelBinding host(FI_HMEM_SYSTEM, 0);
+        const nixlAccelScope guard(host);
+        check(guard.holds(host), "a scope holds the binding it was made for");
+        check(!guard.holds(nixlAccelBinding(FI_HMEM_SYSTEM, 0, 0x1000)),
+              "a scope does not hold a binding with another owning context");
+        struct nfi_hmem_info info = {};
+        info.iface = FI_HMEM_SYSTEM;
+        check(guard.holds(info), "a binding built from an nfi_hmem_info compares equal");
+    }
+
+    struct nfi_hmem_scope ctx_scope;
+    check(nfi_hmem_scope_push_ctx(FI_HMEM_SYSTEM, 0, 0, &ctx_scope) == 0 && !ctx_scope.pushed,
+          "a context push for host memory is a no-op");
+    nfi_hmem_scope_pop(&ctx_scope);
 
     if (!nfi_hmem_iface_available(FI_HMEM_CUDA)) {
         NIXL_INFO << "   SKIP: CUDA unavailable, cannot test real context push/pop";
@@ -487,6 +502,33 @@ testScope() {
     check(nfi_hmem_scope_push(FI_HMEM_CUDA, 1ULL << 32, &bad) == -EINVAL && !bad.pushed,
           "a device ordinal past INT_MAX is refused");
     nfi_hmem_scope_pop(&bad);
+
+    // An owning context is bound as given, and its pop releases nothing. A retained primary
+    // context stands in for the application's (cuCtxCreate's signature differs across CUDA 12
+    // and 13).
+    CUdevice dev0 = 0;
+    CUcontext own = nullptr;
+    if (cuDeviceGet(&dev0, 0) == CUDA_SUCCESS &&
+        cuDevicePrimaryCtxRetain(&own, dev0) == CUDA_SUCCESS) {
+        {
+            const nixlAccelScope guard(
+                nixlAccelBinding(FI_HMEM_CUDA, 0, reinterpret_cast<uint64_t>(own)));
+            CUcontext bound = nullptr;
+            check(guard.ok() && cuCtxGetCurrent(&bound) == CUDA_SUCCESS && bound == own,
+                  "a scope with an owning context binds that context");
+        }
+        CUcontext after_own = nullptr;
+        (void)cuCtxGetCurrent(&after_own);
+        check(after_own == after, "the owning-context scope restores the previous binding");
+        unsigned int flags = 0;
+        int active = 0;
+        check(cuDevicePrimaryCtxGetState(dev0, &flags, &active) == CUDA_SUCCESS && active,
+              "the owning-context pop released no reference of the caller's");
+        (void)cuDevicePrimaryCtxRelease(dev0);
+    } else {
+        NIXL_INFO << "   SKIP: could not retain a CUDA context for the owning-context check";
+    }
+
     CUcontext final_ctx = nullptr;
     (void)cuCtxGetCurrent(&final_ctx);
     check(final_ctx == after, "nested scopes unwind to the original binding");

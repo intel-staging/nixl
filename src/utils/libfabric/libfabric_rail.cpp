@@ -20,12 +20,10 @@
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
 #include "libfabric_common.h"
-
-#ifdef HAVE_CUDA
-#include <cuda_runtime.h>
-#endif
+#include "libfabric_accel.h"
 
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <stack>
 
@@ -423,6 +421,14 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 namespace {
 // Set by nixlLibfabricRail::ProgressOnEagainScope on the thread holding one.
 thread_local bool t_progress_on_eagain = false;
+
+// The progress thread's accelerator binding: the device of the last request it posted that needed
+// one; host, ZE, ROCr and Neuron requests leave it as it is. Kept between drains instead of
+// popped, so the provider's CQ progress, which may copy device memory (efa's emulated writes, tcp
+// with FI_HMEM), runs with that device current, as the old CUDA context workaround left it. Only
+// the progress thread drains the post queue, so this never sits on an application thread's context
+// stack; it is popped when the thread exits.
+thread_local std::optional<nixlAccelScope> t_pt_accel_scope;
 
 // The table entry for a rail's provider; an unlisted provider gets the defaults.
 const LibfabricUtils::nixlLibfabricProviderInfo &
@@ -1407,10 +1413,8 @@ nixl_status_t
 nixlLibfabricRail::drainPostQueue() {
     nixlLibfabricPostRequest pr;
     int posted = 0;
-#if HAVE_CUDA
-    bool use_cuda_addr_wa = false;
-    int current_cuda_device = -1;
-#endif
+    // Kept across requests and drains on the same device, and rebound when the device changes
+    std::optional<nixlAccelScope> &accel_scope = t_pt_accel_scope;
 
     // drain the queue up to configured limit,
     // to ensure requests from other rails do not wait too much time
@@ -1419,51 +1423,29 @@ nixlLibfabricRail::drainPostQueue() {
         ++post_req_count;
         int ret = -FI_EAGAIN;
 
-#if HAVE_CUDA
-        if (pr.is_cuda_vram) {
-            // NOTE: for now we do not call engine to try to set context in work-around mode - this
-            // is postponsed to another PR, which requires substantial refactoring - instead we
-            // directly call cudaSetDevice() when needed
-            use_cuda_addr_wa = false;
-            nixl_status_t status = LibfabricUtils::cudaSetCtx(use_cuda_addr_wa);
-            if (status != NIXL_SUCCESS) {
-                // completion is notified also for failed requests
-                // (otherwise counters would never match)
-                if (pr.req && pr.req->completion_callback) {
-                    pr.req->completion_callback(status);
-                }
-                if (pr.req) {
-                    releaseRequest(pr.req);
-                }
-
-                // defrred request cannot be executed, continue to the next
-                NIXL_ERROR << "Failed to set CUDA context, while posting deferred descriptor";
-                continue;
-            }
-
-            // other-wise set cuda device before call if needed
-            if (!use_cuda_addr_wa && pr.device_id != current_cuda_device) {
-                cudaError_t cuda_ret = cudaSetDevice(pr.device_id);
-                if (cuda_ret != cudaSuccess) {
-                    // completion is notified also for failed requests
-                    // (otherwise counters would never match)
-                    if (pr.req && pr.req->completion_callback) {
-                        pr.req->completion_callback(NIXL_ERR_BACKEND);
-                    }
-                    if (pr.req) {
-                        releaseRequest(pr.req);
-                    }
-
-                    // defrred request cannot be executed, continue to the next
-                    NIXL_ERROR << "Failed to set CUDA device " << pr.device_id
-                               << " while posting deferred descriptor: "
-                               << cudaGetErrorString(cuda_ret);
-                    continue;
-                }
-                current_cuda_device = pr.device_id;
-            }
+        // Bind the device of the request's buffer. A request whose runtime keeps no
+        // thread-current state (host memory, ZE, ROCr, Neuron) needs no binding and leaves the
+        // current one, which completions of earlier device posts may still need, in place.
+        const bool needs_binding = nfi_hmem_needs_scope(pr.accel.iface);
+        if (needs_binding && !(accel_scope && accel_scope->holds(pr.accel))) {
+            accel_scope.reset();
+            accel_scope.emplace(pr.accel);
         }
-#endif
+        if (needs_binding && !accel_scope->ok()) {
+            // completion is notified also for failed requests
+            // (otherwise counters would never match)
+            if (pr.req && pr.req->completion_callback) {
+                pr.req->completion_callback(NIXL_ERR_BACKEND);
+            }
+            if (pr.req) {
+                releaseRequest(pr.req);
+            }
+
+            // deferred request cannot be executed, continue to the next
+            NIXL_ERROR << "Failed to bind accelerator device " << pr.accel.device
+                       << " while posting deferred descriptor";
+            continue;
+        }
 
         while (ret == -FI_EAGAIN) {
             if (pr.type == nixlLibfabricPostRequest::WRITE) {
@@ -1758,7 +1740,12 @@ nixlLibfabricRail::canRegisterWithDmabuf(nixl_mem_t mem_type, enum fi_hmem_iface
 
 bool
 nixlLibfabricRail::canCarryDeviceMemory() const {
-    if (runtime_ == FI_HMEM_ZE) {
+    return canCarryMemoryOf(runtime_);
+}
+
+bool
+nixlLibfabricRail::canCarryMemoryOf(enum fi_hmem_iface iface) const {
+    if (iface == FI_HMEM_ZE) {
         // Intel has no NIC peer-memory module, so Level Zero memory needs FI_HMEM.
         return provider_supports_hmem_ && provider_info_.carries_ze;
     }
@@ -1769,8 +1756,7 @@ nixl_status_t
 nixlLibfabricRail::registerMemory(void *buffer,
                                   size_t length,
                                   nixl_mem_t mem_type,
-                                  int device_id,
-                                  enum fi_hmem_iface iface,
+                                  const struct nfi_hmem_info &hmem_info,
                                   struct fid_mr **mr_out,
                                   uint64_t *key_out,
                                   const LibfabricUtils::CudaDmabufExport *dmabuf) const {
@@ -1781,6 +1767,14 @@ nixlLibfabricRail::registerMemory(void *buffer,
     if (!domain) {
         NIXL_ERROR << "Domain not initialized on rail " << rail_id;
         return NIXL_ERR_BACKEND;
+    }
+    // The process-wide runtime decided whether VRAM_SEG is offered; a buffer of another runtime
+    // (e.g. Intel GPU memory in a CUDA process) is checked against its own requirements here.
+    if (mem_type == VRAM_SEG && !canCarryMemoryOf(hmem_info.iface)) {
+        NIXL_ERROR << "Rail " << rail_id << " (" << provider_name << ") cannot carry "
+                   << nfi_hmem_iface_name(hmem_info.iface) << " device memory"
+                   << (provider_supports_hmem_ ? "" : " without FI_HMEM") << "; buffer " << buffer;
+        return NIXL_ERR_NOT_SUPPORTED;
     }
 
     // Access flags and key handling come from the provider table entry
@@ -1815,41 +1809,9 @@ nixlLibfabricRail::registerMemory(void *buffer,
     // Set HMEM interface based on memory type and provider capability
     if (mem_type == VRAM_SEG) {
         if (provider_supports_hmem_) {
-            mr_attr.iface = iface;
-            if (iface == FI_HMEM_CUDA) {
-                mr_attr.device.cuda = device_id;
-                NIXL_DEBUG << "CUDA memory registration - iface: FI_HMEM_CUDA, device.cuda: "
-                           << device_id;
-            } else if (iface == FI_HMEM_ROCR) {
-                // AMD ROCr memory registration
-                // ROCr uses HSA agent handles for device identification.
-                // The device_id corresponds to the GPU index (0-based).
-                // The device.rocr union member was added in libfabric v2.5 (v2.3 and
-                // v2.4 do not have it); on older libfabric the union has no rocr member
-                // (and the EFA provider ignores the device handle for ROCr), so the
-                // zero-initialized union is sufficient.
-#if FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION) >= FI_VERSION(2, 5)
-                mr_attr.device.rocr = device_id;
-#endif
-                NIXL_DEBUG << "ROCr memory registration - iface: FI_HMEM_ROCR, device_id: "
-                           << device_id;
-            } else if (iface == FI_HMEM_NEURON) {
-                /*
-                 * Store a sentinel; libfabric requires this to be initialized.
-                 * Libfabric requires the device.neuron field to be set for Neuron HMEM,
-                 * but the EFA provider does not use the value. Store an invalid device id
-                 * sentinel to both follow the Libfabric spec and cause an error if a
-                 * provider uses the value in the future.
-                 */
-                mr_attr.device.neuron = -1;
-                NIXL_DEBUG << "NEURON memory registration - iface: FI_HMEM_NEURON, device_id: "
-                           << device_id;
-            } else if (iface == FI_HMEM_ZE) {
-                // device_id is encoded as fi_hmem_ze_device(0, ordinal) by nfi_hmem_query_ptr().
-                mr_attr.device.ze = device_id;
-                NIXL_DEBUG << "ZE memory registration - iface: FI_HMEM_ZE, device.ze: "
-                           << device_id;
-            }
+            nfi_hmem_fill_mr_attr(&hmem_info, &mr_attr);
+            NIXL_DEBUG << nfi_hmem_iface_name(hmem_info.iface) << " memory registration, device "
+                       << hmem_info.device;
         } else if (canCarryDeviceMemory()) {
             NIXL_WARN << "VRAM memory requested but provider does not support FI_HMEM - falling "
                          "back to system memory registration";
@@ -1870,7 +1832,7 @@ nixlLibfabricRail::registerMemory(void *buffer,
     struct iovec iov;
     uint64_t regattr_flags = 0;
     const bool use_dmabuf =
-        dmabuf != nullptr && dmabuf->fd >= 0 && canRegisterWithDmabuf(mem_type, iface);
+        dmabuf != nullptr && dmabuf->fd >= 0 && canRegisterWithDmabuf(mem_type, hmem_info.iface);
 
 #ifdef FI_MR_DMABUF
     struct fi_mr_dmabuf dmabuf_desc = {};
