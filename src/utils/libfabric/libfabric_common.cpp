@@ -64,6 +64,7 @@ namespace {
         // FI_RMA_EVENT lets fi_writedata/fi_writemsg raise target events on the registration.
         /*mr_access=*/FI_REMOTE_WRITE | FI_REMOTE_READ | FI_RMA_EVENT,
         /*needs_full_topology=*/true,
+        /*notify_after_completion=*/false,
         /*single_domain=*/false,
     };
 
@@ -75,6 +76,7 @@ namespace {
         /*mr_key_size=*/2,
         /*mr_access=*/FI_REMOTE_WRITE | FI_REMOTE_READ,
         /*needs_full_topology=*/true,
+        /*notify_after_completion=*/false,
         /*single_domain=*/false,
     };
 
@@ -86,6 +88,7 @@ namespace {
         /*mr_key_size=*/0,
         /*mr_access=*/k_mr_access_basic,
         /*needs_full_topology=*/false,
+        /*notify_after_completion=*/false,
         /*single_domain=*/true,
     };
 
@@ -97,6 +100,7 @@ namespace {
         /*mr_key_size=*/0,
         /*mr_access=*/k_mr_access_basic,
         /*needs_full_topology=*/false,
+        /*notify_after_completion=*/false,
         /*single_domain=*/true,
     };
 
@@ -163,6 +167,12 @@ applyProviderRailHints(const nixlLibfabricProviderInfo &provider, struct fi_info
 bool
 providerRequestsMrKey(const nixlLibfabricProviderInfo &provider) {
     return (provider.mr_mode & FI_MR_PROV_KEY) == 0;
+}
+
+bool
+providerNotifiesAfterCompletion(const std::string &prov_name) {
+    const nixlLibfabricProviderInfo *provider = findProviderInfo(prov_name);
+    return (provider != nullptr) && provider->notify_after_completion;
 }
 
 bool

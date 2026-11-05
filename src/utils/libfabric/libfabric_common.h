@@ -359,6 +359,8 @@ struct nixlLibfabricProviderInfo {
     uint64_t mr_access;
     /** @brief Whether to do hwloc topology discovery and accelerator-to-NIC grouping. */
     bool needs_full_topology;
+    /** @brief See @ref providerNotifiesAfterCompletion. */
+    bool notify_after_completion;
     /** @brief Use only the first domain: every domain reaches every peer (tcp, sockets). */
     bool single_domain;
 };
@@ -382,6 +384,20 @@ applyProviderRailHints(const nixlLibfabricProviderInfo &provider, struct fi_info
 /** @brief True when @p provider's mr_mode lacks FI_MR_PROV_KEY: registrations pick the key. */
 bool
 providerRequestsMrKey(const nixlLibfabricProviderInfo &provider);
+
+/**
+ * @brief True when a WRITE's notification is sent only after the WRITE completes locally.
+ *
+ * By default the initiator sends a WRITE's notification right after posting the writes, with the
+ * number of writes to expect, and the target releases it once that many remote-write completions
+ * from that peer have arrived. That needs the target to tell which peer each remote write came
+ * from. ofi_rxm leaves src_addr stale or FI_ADDR_NOTAVAIL for remote writes, so for such
+ * providers the initiator instead waits for its writes to complete, which on a reliable-connected
+ * transport means the target NIC has acknowledged them, and then sends the notification with
+ * nothing to count. Writes then carry no remote CQ data at all. This is what the UCX backend does.
+ */
+bool
+providerNotifiesAfterCompletion(const std::string &prov_name);
 
 /** @brief See @ref nixlLibfabricProviderInfo::needs_full_topology. */
 bool

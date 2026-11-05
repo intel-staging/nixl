@@ -34,3 +34,12 @@ libfabric_backend_test = executable('libfabric_backend_test',
         install: true)
 
 test('libfabric_backend_test', libfabric_backend_test, timeout: 180)
+
+libfabric_notif_test = executable('libfabric_notif_test',
+        'libfabric_notif_test.cpp',
+        dependencies: libfabric_backend_test_dep,
+        include_directories: libfabric_test_include_directories,
+        cpp_args: ['-DHAVE_LIBFABRIC'],
+        install: true)
+
+test('libfabric_notif_test', libfabric_notif_test, timeout: 180)
