@@ -585,7 +585,7 @@ testBasicTopology() {
                     continue;
                 }
 
-                auto gpu_devices = topology.getEfaDevicesForPci(pci_bus_id);
+                auto gpu_devices = topology.getNicsForPci(pci_bus_id);
 
                 std::string device_list;
                 for (const auto &device : gpu_devices) {
@@ -1190,6 +1190,19 @@ testNeuronTopology(const NeuronTopologyInfo &topology_info) {
         if (topology.getNumNvidiaAccel() != 0) {
             NIXL_ERROR << "Unexpected NVIDIA accelerator count for " << topology_info.instance_type
                        << ", expected 0, got " << topology.getNumNvidiaAccel();
+            rc = 3;
+        }
+
+        // Neuron outranks Level Zero, so no Intel GPU is counted, and Neuron is the only vendor
+        const std::string expected_counts =
+            "CUDA=0 ROCR=0 ZE=0 NEURON=" + std::to_string(topology_info.expected_num_aws_accel);
+        if (topology.accelCountsString() != expected_counts ||
+            topology.getTotalNumAccel() != topology_info.expected_num_aws_accel) {
+            NIXL_ERROR << "Unexpected accelerator inventory for " << topology_info.instance_type
+                       << ": expected \"" << expected_counts << "\" (total "
+                       << topology_info.expected_num_aws_accel << "), got \""
+                       << topology.accelCountsString() << "\" (total "
+                       << topology.getTotalNumAccel() << ")";
             rc = 3;
         }
 
@@ -1816,7 +1829,7 @@ testDmabufMappingTopology(const DmabufMappingInfo &mapping_info) {
     if (!mapping_info.accel_efa_devices.empty()) {
         std::set<std::string> selectable;
         for (const auto &[accel_pci, expected_efa_devices] : mapping_info.accel_efa_devices) {
-            std::vector<std::string> actual = topology.getEfaDevicesForPci(accel_pci);
+            std::vector<std::string> actual = topology.getNicsForPci(accel_pci);
             std::vector<std::string> expected = expected_efa_devices;
             std::sort(actual.begin(), actual.end());
             std::sort(expected.begin(), expected.end());

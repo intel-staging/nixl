@@ -606,6 +606,74 @@ testLevelZeroMemory() {
 
 #endif // HAVE_ZE
 
+/****************************************
+ * 10. Accelerator classification
+ *****************************************/
+
+/** A PCI device object with the given attributes, for accelIfaceOfHwlocObj(). */
+struct FakePciDev {
+    union hwloc_obj_attr_u attr = {};
+    struct hwloc_obj obj = {};
+
+    FakePciDev(uint16_t vendor_id, uint16_t device_id, uint16_t class_id) {
+        obj.type = HWLOC_OBJ_PCI_DEVICE;
+        obj.attr = &attr;
+        attr.pcidev.vendor_id = vendor_id;
+        attr.pcidev.device_id = device_id;
+        attr.pcidev.class_id = class_id;
+    }
+
+    FakePciDev(const FakePciDev &) = delete;
+    FakePciDev &
+    operator=(const FakePciDev &) = delete;
+
+    enum fi_hmem_iface
+    iface() {
+        return accelIfaceOfHwlocObj(&obj, /*match_ze=*/false);
+    }
+};
+
+void
+testAccelClassification() {
+    NIXL_INFO << "10. Testing accelerator classification";
+
+    check(FakePciDev(0x10de, 0x2330, 0x0302).iface() == FI_HMEM_CUDA,
+          "an NVIDIA 3D controller is CUDA");
+    check(FakePciDev(0x10de, 0x1af1, 0x0680).iface() == FI_HMEM_SYSTEM,
+          "an NVIDIA bridge (NVSwitch) is not an accelerator");
+    check(FakePciDev(0x1002, 0x74a1, 0x1200).iface() == FI_HMEM_ROCR,
+          "an AMD processing accelerator (MI300X) is ROCr");
+    check(FakePciDev(0x1002, 0x744c, 0x0300).iface() == FI_HMEM_ROCR,
+          "an AMD display controller is ROCr");
+    check(FakePciDev(0x1002, 0x1640, 0x0403).iface() == FI_HMEM_SYSTEM,
+          "an AMD audio device is not an accelerator");
+    check(FakePciDev(0x1d0f, 0x7164, 0x0880).iface() == FI_HMEM_NEURON,
+          "a Trainium device is Neuron");
+    check(FakePciDev(0x1d0f, 0xefa1, 0x0200).iface() == FI_HMEM_SYSTEM,
+          "an EFA NIC is not an accelerator");
+    check(FakePciDev(0x8086, 0xe20b, 0x0300).iface() == FI_HMEM_SYSTEM,
+          "an Intel GPU is not matched without match_ze");
+    check(accelIfaceOfHwlocObj(nullptr, /*match_ze=*/true) == FI_HMEM_SYSTEM,
+          "a null object is not an accelerator");
+
+    FakePciDev bridge(0x10de, 0x2330, 0x0302);
+    bridge.obj.type = HWLOC_OBJ_BRIDGE;
+    check(bridge.iface() == FI_HMEM_SYSTEM, "a non-PCI-device object is not an accelerator");
+
+    check(accelIfaceIsGroupable(FI_HMEM_CUDA) && accelIfaceIsGroupable(FI_HMEM_ROCR) &&
+              accelIfaceIsGroupable(FI_HMEM_ZE),
+          "GPUs take part in NIC grouping");
+    check(!accelIfaceIsGroupable(FI_HMEM_NEURON),
+          "Neuron devices, which carry their own NIC, do not take part in NIC grouping");
+    check(!accelIfaceIsGroupable(FI_HMEM_SYSTEM), "system memory does not take part");
+
+    const std::vector<enum fi_hmem_iface> expected = {
+        FI_HMEM_CUDA, FI_HMEM_ROCR, FI_HMEM_ZE, FI_HMEM_NEURON};
+
+    check(accelHwlocIfaces() == expected,
+          "the classifier covers CUDA, ROCr, ZE and Neuron, in that order");
+}
+
 } // namespace
 
 int
@@ -634,6 +702,7 @@ main() {
 #ifdef HAVE_ZE
     testLevelZeroMemory();
 #endif
+    testAccelClassification();
 
     if (failures != 0) {
         NIXL_ERROR << "=== " << failures << " check(s) FAILED ===";
