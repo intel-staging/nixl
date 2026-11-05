@@ -40,8 +40,9 @@ Level Zero and Neuron are needed only at build time as headers (Neuron not even 
 libraries are `dlopen`'d, so one binary works on hosts with and without the driver. Meson reports
 what it found -- look for `Found Level Zero headers, libfabric backend will build with FI_HMEM_ZE
 support` in the configure output. `-Dlevel_zero=disabled` builds without Level Zero even when the
-headers are installed, and `-Dlevel_zero=enabled` makes missing or too-old headers an error. At startup the plugin logs the accelerators it found per vendor
-(`Topology: ... 3 Intel GPUs ...`) and the runtime it selected (`System runtime: ZE`).
+headers are installed, and `-Dlevel_zero=enabled` makes missing or too-old headers an error. At
+startup the plugin logs the accelerators it found per vendor (`Topology: ... CUDA=0 ROCR=0 ZE=3
+NEURON=0`) and the runtime it selected (`System runtime: ZE`).
 
 Notes specific to Intel GPUs:
 
