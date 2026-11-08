@@ -398,21 +398,16 @@ endif
 # is empty, ROCm support is not requested (there is no default path). Defined
 # here in the root meson.build -- ahead of subdir('src') and subdir('test') --
 # so every libfabric subdir (src/utils, src/plugins, test/unit/utils) consumes a
-# single rocm_dep and hipify_src, with no ordering dependency between them. The
-# plugin's CUDA sources are translated to HIP at build time via hipify-perl;
-# rocm_dep supplies the HIP headers and runtime those translated sources compile
-# and link against. __HIP_PLATFORM_AMD__ lets the HIP headers work under a
-# non-hipcc host compiler. Kept separate from cuda_dep.
+# single rocm_dep, with no ordering dependency between them. rocm_dep supplies
+# the HIP headers and runtime; the libfabric sources reach ROCm only through
+# nfi_hmem, so none is translated with hipify. __HIP_PLATFORM_AMD__ lets the HIP
+# headers work under a non-hipcc host compiler. Kept separate from cuda_dep.
 #
-# hipify injects <hip/hip_runtime.h> at the top of each translated source, ahead
-# of the nixl/toml++ headers. HIP defines __noinline__ as a macro, which breaks
-# toml++'s TOML_HAS_ATTR(__noinline__) preprocessor check; TOML_CUDA=1 routes
-# toml++ around that line. HIP also maps some CUDA driver calls onto deprecated
-# HIP APIs, so deprecation is downgraded from error (the tree builds with
-# werror=true) to a warning.
-#
-# hipify-perl ships only with the ROCm/HIP toolchain, so it is required when
-# ROCm is requested and unused (absent) on CUDA-only builds.
+# HIP defines __noinline__ as a macro, which breaks toml++'s
+# TOML_HAS_ATTR(__noinline__) preprocessor check in a source that includes HIP
+# headers ahead of toml++; TOML_CUDA=1 routes toml++ around that line. Some HIP
+# APIs are deprecated, so deprecation is downgraded from error (the tree builds
+# with werror=true) to a warning.
 rocm_path = get_option('rocm_path')
 if rocm_path != ''
     if not fs.exists(rocm_path)
@@ -429,11 +424,6 @@ if rocm_path != ''
         link_args : ['-L' + rocm_path + '/lib', '-lamdhip64', '-lhiprtc'],
     )
     message('ROCm/HIP enabled; toolchain path: ' + rocm_path)
-
-    hipify_cmd = find_program('hipify-perl')
-    hipify_src = generator(hipify_cmd,
-                           output : ['@BASENAME@_hip.cpp'],
-                           arguments : ['@INPUT@', '@EXTRA_ARGS@', '@OUTPUT@'])
 else
     rocm_dep = disabler()
 endif

@@ -198,7 +198,7 @@ private:
 nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
                                                    bool progress_thread_enabled)
     : striping_threshold_(striping_threshold),
-      runtime_(FI_HMEM_CUDA),
+      runtime_(FI_HMEM_SYSTEM),
       progress_thread_enabled_(progress_thread_enabled) {
     NIXL_DEBUG << "Creating rail manager with striping threshold: " << striping_threshold_
                << " bytes";
@@ -209,37 +209,14 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
     // Initialize topology system
     topology = std::make_unique<nixlLibfabricTopology>();
 
-    // Determine system runtime type once at initialization. NVIDIA and AMD GPUs decide it only in
-    // a CUDA or ROCm build (both define HAVE_CUDA); the topology counts Intel GPUs only when they
-    // can (nixlLibfabricTopology::intelAccelCanBeRuntime()).
-    const bool have_cuda_build =
-#ifdef HAVE_CUDA
-        true;
-#else
-        false;
-#endif
-    if (have_cuda_build && topology->getNumNvidiaAccel() > 0) {
-        runtime_ = FI_HMEM_CUDA;
-        NIXL_INFO << "System runtime: CUDA for " << topology->getNumNvidiaAccel()
-                  << " NVIDIA GPU(s)";
-    } else if (have_cuda_build && topology->getNumAmdAccel() > 0) {
-        runtime_ = FI_HMEM_ROCR;
-        NIXL_INFO << "System runtime: ROCr for " << topology->getNumAmdAccel() << " AMD GPU(s)";
-    } else if (topology->getNumAwsAccel() > 0) {
-        runtime_ = FI_HMEM_NEURON;
-        NIXL_INFO << "System runtime: NEURON for " << topology->getNumAwsAccel()
-                  << " AWS Trainium device(s)";
-    } else if (topology->getNumIntelAccel() > 0 ||
-               (topology->intelAccelCanBeRuntime() && nfi_hmem_iface_available(FI_HMEM_ZE))) {
-        // Also asked of Level Zero, where nothing outranks it: tcp/sockets reset the accelerator
-        // counts, and integrated GPUs are not counted.
-        runtime_ = FI_HMEM_ZE;
-        NIXL_INFO << "System runtime: ZE for " << topology->getNumIntelAccel()
-                  << " discrete Intel GPU(s)";
-    } else {
-        runtime_ = FI_HMEM_SYSTEM;
-        NIXL_INFO << "System runtime: SYSTEM (no accelerators)";
-    }
+    // The process-wide runtime: the first usable of CUDA, ROCr, Neuron and Level Zero, as
+    // nfi_hmem_primary_iface() orders them. Each buffer's own runtime is found by
+    // nfi_hmem_query_ptr() at registration; this one decides the rails' shm use and which of
+    // them can carry device memory (Level Zero memory needs a provider that carries FI_HMEM_ZE).
+    runtime_ = nfi_hmem_primary_iface();
+    NIXL_INFO << "System runtime: " << nfi_hmem_iface_name(runtime_)
+              << (runtime_ == FI_HMEM_SYSTEM ? " (no accelerator runtime available)" : "")
+              << ", accelerators found by hwloc: " << topology->accelCountsString();
 
     // Get network devices from topology and create rails automatically
     std::vector<std::string> all_devices = topology->getAllDevices();
@@ -456,8 +433,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     int desc_idx,
     size_t base_offset,
     bool apply_fi_more,
-    int device_id,
-    bool is_cuda_vram) {
+    const struct nfi_hmem_info &hmem_info) {
     // Initialize output parameter
     submitted_count_out = 0;
 
@@ -518,8 +494,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                  xfer_id,
                                  fi_flags,
                                  dest_addrs.at(rail_id)[remote_ep_id],
-                                 device_id,
-                                 is_cuda_vram,
+                                 hmem_info,
                                  rail_id,
                                  req);
             status = NIXL_SUCCESS;
@@ -611,8 +586,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                      xfer_id,
                                      fi_flags,
                                      dest_addrs.at(rail_id)[remote_ep_id],
-                                     device_id,
-                                     is_cuda_vram,
+                                     hmem_info,
                                      rail_id,
                                      req);
                 status = NIXL_SUCCESS;
@@ -662,8 +636,7 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
                                                uint16_t xfer_id,
                                                uint64_t fi_flags,
                                                fi_addr_t dest_addr,
-                                               int device_id,
-                                               bool is_cuda_vram,
+                                               const struct nfi_hmem_info &hmem_info,
                                                size_t rail_id,
                                                nixlLibfabricReq *req) {
     const uint64_t imm_data = (op_type == nixlLibfabricReq::WRITE) ? writeImmData(xfer_id) : 0;
@@ -679,8 +652,7 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
     pr.remote_key = req->remote_key;
     pr.req = req;
     pr.fi_flags = fi_flags;
-    pr.device_id = device_id;
-    pr.is_cuda_vram = is_cuda_vram;
+    pr.accel = nixlAccelBinding(hmem_info);
     rails_[rail_id]->enqueuePost(pr);
 }
 
@@ -857,7 +829,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
                                          size_t length,
                                          nixl_mem_t mem_type,
                                          int device_id,
-                                         const std::string &device_pci_bus_id,
+                                         const struct nfi_hmem_info &hmem_info,
                                          std::vector<struct fid_mr *> &mr_list_out,
                                          std::vector<uint64_t> &key_list_out,
                                          std::vector<size_t> &selected_rails_out) {
@@ -870,17 +842,20 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
     // For VRAM: uses PCI bus ID provided by backend to map to topology-aware rails
     // For DRAM: uses all available rails
     std::vector<size_t> selected_rails =
-        selectRailsForMemory(buffer, mem_type, device_id, device_pci_bus_id);
+        selectRailsForMemory(buffer, mem_type, device_id, accelBusIdString(hmem_info));
     if (selected_rails.empty()) {
         NIXL_ERROR << "No rails selected for memory type " << mem_type;
         return NIXL_ERR_NOT_SUPPORTED;
     }
 
-    enum fi_hmem_iface iface = FI_HMEM_SYSTEM;
-    if (mem_type == VRAM_SEG) {
-        // Level Zero device_id is a driver ordinal, not a nixl device index.
-        iface = (runtime_ == FI_HMEM_ZE) ? FI_HMEM_ZE : topology->getMrAttrIface(device_id);
+    // Registered exactly as the backend resolved it; host memory for anything but VRAM_SEG
+    struct nfi_hmem_info effective_info = hmem_info;
+    if (mem_type != VRAM_SEG) {
+        effective_info = nfi_hmem_info{};
+        effective_info.iface = FI_HMEM_SYSTEM;
     }
+    // The CUDA driver ordinal of the buffer, used for the dmabuf export when iface is CUDA
+    const int cuda_device = static_cast<int>(effective_info.device);
 
     // Dmabufs exported for this registration, indexed by mapping type
     // [0]: platform default mapping, [1]: PCIe (BAR1) mapping
@@ -933,8 +908,8 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
         // registration holds at most two
         const LibfabricUtils::CudaDmabufExport *dmabuf = nullptr;
         if (dmabuf_mapping_mode_ != DmabufMappingMode::Off &&
-            rails_[rail_idx]->canRegisterWithDmabuf(mem_type, iface) &&
-            LibfabricUtils::cudaDmabufExportSupported(device_id)) {
+            rails_[rail_idx]->canRegisterWithDmabuf(mem_type, effective_info.iface) &&
+            LibfabricUtils::cudaDmabufExportSupported(cuda_device)) {
             bool want_pcie_mapping = false;
             switch (dmabuf_mapping_mode_) {
             case DmabufMappingMode::ForcePcie:
@@ -957,7 +932,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
             if (!dmabuf_exports.attempted[slot]) {
                 dmabuf_exports.attempted[slot] = true;
                 LibfabricUtils::cudaDmabufExportRange(
-                    buffer, length, device_id, want_pcie_mapping, dmabuf_exports.entries[slot]);
+                    buffer, length, cuda_device, want_pcie_mapping, dmabuf_exports.entries[slot]);
             }
             // A PCIe mapping the platform refused leaves the export carrying the one window
             // that platform offers, which is the window a virtual-address registration
@@ -970,9 +945,8 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
             }
         }
 
-        // Pass device_id parameter to individual rail's registerMemory calls
         nixl_status_t status = rails_[rail_idx]->registerMemory(
-            buffer, length, mem_type, device_id, iface, &mr, &key, dmabuf);
+            buffer, length, mem_type, effective_info, &mr, &key, dmabuf);
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "Failed to register memory on rail " << rail_idx;
             // Cleanup already registered MRs
@@ -1486,11 +1460,6 @@ nixlLibfabricRailManager::getActiveRailCount() const {
 }
 
 // System accelerator type getter
-fi_hmem_iface
-nixlLibfabricRailManager::getRuntime() const {
-    return runtime_;
-}
-
 bool
 getMemNumaNode(void *buffer, size_t &numa_node_id) {
     int node_id = -1;

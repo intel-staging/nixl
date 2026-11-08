@@ -34,6 +34,8 @@
 #include "backend/backend_aux.h"
 #include "libfabric/libfabric_common.h"
 #include "libfabric/libfabric_cuda_dmabuf.h"
+#include "libfabric/libfabric_accel_scope.h"
+#include "libfabric/nfi_hmem.h"
 
 // Forward declarations
 class nixlLibfabricConnection;
@@ -389,8 +391,9 @@ struct nixlLibfabricPostRequest {
     uint64_t remote_key;
     nixlLibfabricReq *req;
     uint64_t fi_flags;
-    int device_id; // CUDA device ordinal for cudaSetDevice in PT
-    bool is_cuda_vram;
+    // Local buffer's device and owning context, from registration; the progress thread binds it
+    // before posting
+    nixlAccelBinding accel;
 };
 
 /** Individual libfabric rail managing fabric, domain, endpoint, CQ, and AV */
@@ -459,13 +462,14 @@ public:
     /** Register memory buffer with libfabric.
      *  The rail registers the region with FI_MR_DMABUF when dmabuf carries an fd and
      *  canRegisterWithDmabuf() holds for this registration, and by virtual address
-     *  otherwise. A FI_MR_DMABUF registration that fails retries by virtual address. */
+     *  otherwise. A FI_MR_DMABUF registration that fails retries by virtual address.
+     *  @param hmem_info Runtime, device ordinal and PCI address of @p buffer from
+     *         nfi_hmem_query_ptr(); passed to nfi_hmem_fill_mr_attr(). */
     nixl_status_t
     registerMemory(void *buffer,
                    size_t length,
                    nixl_mem_t mem_type,
-                   int device_id,
-                   enum fi_hmem_iface iface,
+                   const struct nfi_hmem_info &hmem_info,
                    struct fid_mr **mr_out,
                    uint64_t *key_out,
                    const LibfabricUtils::CudaDmabufExport *dmabuf = nullptr) const;
@@ -483,6 +487,10 @@ public:
      *  memory always needs FI_HMEM and a provider that carries it (not efa). */
     bool
     canCarryDeviceMemory() const;
+
+    /** @brief Whether this rail can carry device memory of @p iface; see canCarryDeviceMemory(). */
+    bool
+    canCarryMemoryOf(enum fi_hmem_iface iface) const;
 
     /** Deregister memory from libfabric */
     nixl_status_t
