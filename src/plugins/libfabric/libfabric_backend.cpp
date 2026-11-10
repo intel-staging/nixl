@@ -700,6 +700,8 @@ nixlLibfabricEngine::createAgentConnection(
         live_senders_.insert(agent_idx);
     }
 
+    conn->peer_fabric_ids_ = rail_manager_.peerFabricIds(data_rail_endpoints);
+
     for (size_t i = 0; i < agent_names_.size(); ++i) {
         NIXL_DEBUG << "Index " << i << ": " << agent_names_[i];
     }
@@ -1237,6 +1239,7 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
             local_md->rail_mr_list_,
             remote_md->rail_remote_key_list_,
             remote_md->remote_selected_endpoints_,
+            conn->peer_fabric_ids_,
             conn->rail_remote_addr_list_,
             // Only a notified WRITE's writes are matched by the target; see NIXL_UNTRACKED_XFER_ID
             (backend_handle->has_notif && op_type == nixlLibfabricReq::WRITE) ?

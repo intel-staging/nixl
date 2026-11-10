@@ -34,6 +34,12 @@
 
 #include <numa.h>
 
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 namespace LibfabricUtils {
 
 namespace {
@@ -93,6 +99,106 @@ selectVerbsDomains(const nixlProviderDeviceMap &provider_device_map) {
     // Sorted so rail indices do not depend on the unordered map's iteration order.
     std::sort(domains.begin(), domains.end());
     return domains;
+}
+
+/****************************************
+ * Fabric identity
+ *****************************************/
+
+nixlLibfabricFabricId
+fabricIdFromEpName(uint32_t addr_format, const void *ep_name, size_t len) {
+    nixlLibfabricFabricId id;
+
+    // Only a sockaddr name has a family to check; any other format could look like one by chance.
+    // Within the sockaddr formats the family decides, so an IPv6 name is simply unreadable.
+    const bool sockaddr_format = addr_format == FI_SOCKADDR || addr_format == FI_SOCKADDR_IN ||
+        addr_format == FI_SOCKADDR_IN6;
+    struct sockaddr_in sin;
+    if (ep_name == nullptr || !sockaddr_format || len < sizeof(sin)) {
+        return id;
+    }
+    memcpy(&sin, ep_name, sizeof(sin));
+    if (sin.sin_family != AF_INET) {
+        return id;
+    }
+    id.valid = true;
+    id.addr = sin.sin_addr.s_addr;
+    return id;
+}
+
+void
+resolveLocalFabricMask(nixlLibfabricFabricId &id, const struct ifaddrs *ifa_list) {
+    if (!id.valid) {
+        return;
+    }
+    for (const struct ifaddrs *ifa = ifa_list; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET ||
+            ifa->ifa_netmask == nullptr || (ifa->ifa_flags & IFF_LOOPBACK) != 0) {
+            continue;
+        }
+        const auto *sin = reinterpret_cast<const struct sockaddr_in *>(ifa->ifa_addr);
+        if (sin->sin_addr.s_addr != id.addr) {
+            continue;
+        }
+        const auto *mask = reinterpret_cast<const struct sockaddr_in *>(ifa->ifa_netmask);
+        id.mask = mask->sin_addr.s_addr;
+        return;
+    }
+}
+
+bool
+sameFabric(const nixlLibfabricFabricId &local, const nixlLibfabricFabricId &peer) {
+    if (!local.valid || !peer.valid) {
+        return false;
+    }
+    // Without a netmask only an exact match can be trusted.
+    if (local.mask == 0) {
+        return local.addr == peer.addr;
+    }
+    return (local.addr & local.mask) == (peer.addr & local.mask);
+}
+
+size_t
+pickPeerRail(const std::vector<size_t> &selected_rails,
+             size_t pos,
+             size_t round,
+             const std::vector<size_t> &registered,
+             const nixlLibfabricFabricIds &local_ids,
+             const nixlLibfabricFabricIds &peer_ids) {
+    const size_t fallback = registered[(round * selected_rails.size() + pos) % registered.size()];
+    const size_t rail_id = selected_rails[pos];
+    if (peer_ids.empty() || rail_id >= local_ids.size() || !local_ids[rail_id].valid) {
+        return fallback;
+    }
+    const nixlLibfabricFabricId &local = local_ids[rail_id];
+    const auto on_subnet = [&](size_t peer) {
+        return peer < peer_ids.size() && sameFabric(local, peer_ids[peer]);
+    };
+    const auto matches =
+        static_cast<size_t>(std::count_if(registered.begin(), registered.end(), on_subnet));
+    if (matches == 0) {
+        return fallback;
+    }
+
+    // Rank of the posting rail among the selected rails on its local subnet
+    size_t rank = 0;
+    size_t same_subnet = 0;
+    for (size_t i = 0; i < selected_rails.size(); ++i) {
+        const size_t other = selected_rails[i];
+        const bool same = other < local_ids.size() && local_ids[other].valid &&
+            local_ids[other].mask == local.mask && sameFabric(local, local_ids[other]);
+        if (same) {
+            rank += (i < pos) ? 1 : 0;
+            ++same_subnet;
+        }
+    }
+    size_t nth = (rank + round * same_subnet) % matches;
+    for (const size_t peer : registered) {
+        if (on_subnet(peer) && nth-- == 0) {
+            return peer;
+        }
+    }
+    return fallback; // not reached: nth < matches
 }
 
 /****************************************

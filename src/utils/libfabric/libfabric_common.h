@@ -28,6 +28,8 @@
 
 #include "nixl.h"
 
+struct ifaddrs;
+
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
@@ -434,6 +436,72 @@ providerNeedsAllRailProgress(const std::string &prov_name);
  */
 bool
 providerNotifiesAfterCompletion(const std::string &prov_name);
+
+/**
+ * @brief A rail's IPv4 address and, for a local rail, its netmask: which subnet the rail is on.
+ *
+ * Read from the endpoint name each side already exchanges, so nothing new goes on the wire.
+ */
+struct nixlLibfabricFabricId {
+    /** @brief Whether @ref addr holds a usable identity. */
+    bool valid = false;
+    /** @brief IPv4 address of the rail's NIC, network byte order. */
+    uint32_t addr = 0;
+    /** @brief Netmask of the local interface owning @ref addr; 0 if unknown or for a peer. */
+    uint32_t mask = 0;
+};
+
+/** @brief Fabric ids of a peer's rails, by peer rail id. */
+using nixlLibfabricFabricIds = std::vector<nixlLibfabricFabricId>;
+
+/**
+ * @brief Reads a @ref nixlLibfabricFabricId from a libfabric endpoint name.
+ *
+ * Only IPv4 sockaddr names can be read. Any other format (efa, cxi) or address family yields an
+ * invalid id, and posts then choose the peer rail as if there were no subnet information.
+ */
+nixlLibfabricFabricId
+fabricIdFromEpName(uint32_t addr_format, const void *ep_name, size_t len);
+
+/**
+ * @brief Fills in the netmask of a local rail's @p id from a getifaddrs() list.
+ *
+ * Takes the first non-loopback interface carrying the address (an address also held by lo as a
+ * /32 must not shrink the rail's subnet). Leaves the mask 0 when no interface carries it, which
+ * makes @ref sameFabric compare exact addresses.
+ */
+void
+resolveLocalFabricMask(nixlLibfabricFabricId &id, const struct ifaddrs *ifa_list);
+
+/** @brief Whether peer rail @p peer is on local rail @p local's subnet. Both must be valid. */
+bool
+sameFabric(const nixlLibfabricFabricId &local, const nixlLibfabricFabricId &peer);
+
+/**
+ * @brief The peer rail a post goes to: one of @p registered, preferring those on the posting
+ * rail's subnet.
+ *
+ * The posting rail is @p selected_rails[@p pos], chosen by round @p round of the caller's
+ * round-robin (counter = round * selected_rails.size() + pos). Without a registered peer rail on
+ * its subnet the post round-robins over all of @p registered with that counter, as before. With
+ * some, each selected rail on the subnet takes slot rank + round * n among them, where rank is its
+ * place among the n selected rails on that local subnet: same-subnet rails spread over different
+ * peer rails within a round, and each rotates through them over rounds. A subnet match is
+ * preferred, never required, since a rail with no peer rail on its subnet may be routed.
+ * @param selected_rails Local rails of the buffer
+ * @param pos Index into @p selected_rails of the posting rail
+ * @param round Round of the round-robin; 0 for a striped post
+ * @param registered Peer rails the remote buffer is registered on; must not be empty
+ * @param local_ids Fabric ids of the local rails, by rail id
+ * @param peer_ids Fabric ids of the peer's rails, by peer rail id; empty when unknown or disabled
+ */
+size_t
+pickPeerRail(const std::vector<size_t> &selected_rails,
+             size_t pos,
+             size_t round,
+             const std::vector<size_t> &registered,
+             const nixlLibfabricFabricIds &local_ids,
+             const nixlLibfabricFabricIds &peer_ids);
 
 /** @brief See @ref nixlLibfabricProviderInfo::needs_full_topology. */
 bool

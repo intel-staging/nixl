@@ -137,10 +137,15 @@ public:
      * The FI_MORE flush precompute and the rail selection must agree, so both call this. */
     static size_t
     railSelectionIndex(size_t base_offset, int desc_idx, bool batch_write, size_t count) {
-        const size_t rr_idx = batch_write ?
+        return railSelectionCounter(base_offset, desc_idx, batch_write) % count;
+    }
+
+    /** The round-robin counter railSelectionIndex() reduces modulo its count. */
+    static size_t
+    railSelectionCounter(size_t base_offset, int desc_idx, bool batch_write) {
+        return batch_write ?
             (base_offset + static_cast<size_t>(desc_idx) / NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE) :
             (base_offset + static_cast<size_t>(desc_idx));
-        return rr_idx % count;
     }
 
     // Memory registration management
@@ -175,6 +180,14 @@ public:
                      const std::vector<struct fid_mr *> &mr_list);
 
     // Connection Management APIs
+    /** Fabric ids of the peer's rails, read from their endpoint names, for
+     *  LibfabricUtils::pickPeerRail().
+     * @param endpoints The peer's rail endpoint names, in the peer's rail order
+     * @return One id per entry of @p endpoints; empty when no local or no peer rail has an IPv4
+     *         address or NIXL_LIBFABRIC_PEER_RAIL_BY_SUBNET=0, so posts round-robin as before */
+    LibfabricUtils::nixlLibfabricFabricIds
+    peerFabricIds(const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints) const;
+
     /** Insert addresses into address vectors for all rails
      * @param endpoints Remote endpoint addresses to insert
      * @param agent_idx Local index of the agent owning these endpoints, for sender lookup
@@ -229,6 +242,8 @@ public:
      * @param local_mrs Local memory registrations
      * @param remote_keys Remote access keys
      * @param remote_selected_endpoints Selected remote endpoints, where remote keys are registered
+     * @param peer_fabric_ids peerFabricIds() of the remote agent, to prefer peer rails on each
+     *        local rail's subnet
      * @param dest_addrs Destination addresses for each rail
      * @param xfer_id Transfer ID for tracking
      * @param completion_callback Callback for completion notification
@@ -253,6 +268,7 @@ public:
                              const std::vector<struct fid_mr *> &local_mrs,
                              const std::vector<uint64_t> &remote_keys,
                              const std::vector<size_t> &remote_selected_endpoints,
+                             const LibfabricUtils::nixlLibfabricFabricIds &peer_fabric_ids,
                              const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
                              uint16_t xfer_id,
                              std::function<void(nixl_status_t)> completion_callback,
@@ -397,6 +413,16 @@ public:
 
 private:
     size_t striping_threshold_;
+
+    /** Fills in each rail's netmask from one getifaddrs() call into local_fabric_ids_, and reads
+     *  NIXL_LIBFABRIC_PEER_RAIL_BY_SUBNET. */
+    void
+    resolveRailFabricMasks();
+
+    /** Fabric id of each rail, by rail id, for LibfabricUtils::pickPeerRail(). */
+    LibfabricUtils::nixlLibfabricFabricIds local_fabric_ids_;
+    /** False when NIXL_LIBFABRIC_PEER_RAIL_BY_SUBNET=0: peerFabricIds() returns nothing. */
+    bool peer_rail_by_subnet_ = true;
 
     /** Mapping type that a VRAM registration requests when it exports a CUDA dmabuf. Auto
      * takes a per-NIC verdict from the PCIe-path topology; ForcePcie and ForceDefault request

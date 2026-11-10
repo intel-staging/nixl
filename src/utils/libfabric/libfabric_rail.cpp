@@ -751,6 +751,7 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             NIXL_ERROR << "fi_getname failed for rail " << rail_id << ": " << fi_strerror(-ret);
             throw std::runtime_error("fi_getname failed for rail " + std::to_string(rail_id));
         }
+        fabric_id = LibfabricUtils::fabricIdFromEpName(info->addr_format, ep_name, ep_name_len);
 
         // Initialize control request pool with buffers
         nixl_status_t status = control_request_pool_.initialize(domain);
