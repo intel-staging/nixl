@@ -249,6 +249,18 @@ nodes are selected first), while keeping the same effort to avoid saturating top
 - If user override exceeds total capacity of all EFA devices on the machine, then all rails will be
 used for DRAM_SEG memory type
 
+### NIXL_LIBFABRIC_PENDING_NOTIF_TIMEOUT and NIXL_LIBFABRIC_PENDING_WRITES_TIMEOUT
+
+A target tracks each notified WRITE until its notification and all its writes have arrived. An
+entry that makes no progress (no write completion, notification fragment or failure report) is
+dropped with a warning after NIXL_LIBFABRIC_PENDING_NOTIF_TIMEOUT seconds (default 60) if its sender
+has disconnected or its notification is incomplete, and after NIXL_LIBFABRIC_PENDING_WRITES_TIMEOUT
+seconds (default 600) if it has its notification and still waits for writes from a connected
+sender; raise the latter if one write can take longer. 0 never drops one; at most 604800 (7 days).
+Both can also be passed as backend parameters, `pending_notif_timeout` and
+`pending_writes_timeout`. Sweeps run every 5 s (or every NIXL_LIBFABRIC_PENDING_NOTIF_TIMEOUT, if
+shorter) once a progress pass finds the completion queues empty, or after four intervals regardless.
+
 ### Summary
 
 The following table summarizes briefly the plugin's runtime configuration:
@@ -256,6 +268,8 @@ The following table summarizes briefly the plugin's runtime configuration:
 | Name | Effect | Configuration Source | Values | Examples | Notes |
 |--|--|--|--|--|--|
 | max_bw_per_dram_seg | Controls the bandwidth limit on DRAM_SEG memory type buffers per NUMA node | Backend init param or `NIXL_LIBFABRIC_MAX_BW_PER_DRAM_SEG` environment variable | integer | 100, 200 | Units are Gbps (Gigabits per second), auto-computed by PCIe topology, normally does not require user override |
+| pending_notif_timeout | Drops a target's pending notification this long without progress, if its sender is gone or its notification incomplete | Backend init param or `NIXL_LIBFABRIC_PENDING_NOTIF_TIMEOUT` environment variable | integer | 60, 0 | Seconds, default 60, at most 604800; 0 never drops one |
+| pending_writes_timeout | Drops a connected sender's complete notification this long without its writes | Backend init param or `NIXL_LIBFABRIC_PENDING_WRITES_TIMEOUT` environment variable | integer | 600, 0 | Seconds, default 600, at most 604800; 0 never drops one |
 | num_threads | Enables a thread pool for parallel descriptor posting in postXfer | Backend init param | integer | 4, 8 | Default 0 keeps the serial posting path |
 | split_batch_size | Minimum descriptor count before postXfer uses the posting thread pool | Backend init param | integer | 1024, 4096 | Default 1024; only applies when num_threads is greater than 0 |
 | dmabuf_mapping | Selects the CUDA dmabuf mapping type a VRAM_SEG registration exports for an EFA rail | Backend init param or `NIXL_LIBFABRIC_DMABUF_MAPPING` environment variable | auto, pcie, default, off | auto, off | Default auto takes a per-NIC verdict from the PCIe-path topology; pcie and default force the GPU's PCIe aperture (BAR1) or the platform default mapping on every device; off registers by virtual address. Only applies to CUDA device memory on an EFA provider whose fabric carries libfabric API 1.20 or newer |

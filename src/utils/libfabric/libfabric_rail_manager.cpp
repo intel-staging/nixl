@@ -22,6 +22,7 @@
 #include "libfabric/nfi_hmem.h"
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
+#include <tuple>
 #include <sstream>
 #include <algorithm>
 #include <cctype>
@@ -509,7 +510,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                                 req->remote_addr,
                                                 req->remote_key,
                                                 req,
-                                                fi_flags);
+                                                fi_flags,
+                                                xfer_id != NIXL_UNTRACKED_XFER_ID);
         } else {
             status = rails_[rail_id]->postRead(req->local_addr,
                                                req->chunk_size,
@@ -600,7 +602,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                                     req->remote_addr,
                                                     req->remote_key,
                                                     req,
-                                                    fi_flags);
+                                                    fi_flags,
+                                                    xfer_id != NIXL_UNTRACKED_XFER_ID);
             } else {
                 status = rails_[rail_id]->postRead(req->local_addr,
                                                    req->chunk_size,
@@ -647,6 +650,7 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
     pr.length = req->chunk_size;
     pr.local_desc = fi_mr_desc(req->local_mr);
     pr.immediate_data = imm_data;
+    pr.remote_cq_data = xfer_id != NIXL_UNTRACKED_XFER_ID;
     pr.dest_addr = dest_addr;
     pr.remote_addr = req->remote_addr;
     pr.remote_key = req->remote_key;
@@ -1018,24 +1022,33 @@ nixlLibfabricRailManager::insertAllAddresses(
     const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,
     uint32_t agent_idx,
     std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs_out,
-    std::vector<char *> &ep_names_out) {
+    std::vector<char *> &ep_names_out,
+    uint32_t replaces_agent_idx) {
     auto &rails = rails_;
 
     fi_addrs_out.clear();
     ep_names_out.clear();
     ep_names_out.reserve(rails.size());
 
+    // Each address mapped so far and its previous index, to hand them back if a later one fails
+    std::vector<std::tuple<size_t, fi_addr_t, uint32_t>> mapped;
+
     // Process all rails in one operation
     for (size_t rail_id = 0; rail_id < rails.size(); ++rail_id) {
         fi_addrs_out[rail_id].reserve(endpoints.size());
         for (const auto &endpoint : endpoints) {
             fi_addr_t fi_addr;
-            nixl_status_t status =
-                rails[rail_id]->insertAddress(endpoint.data(), agent_idx, &fi_addr);
+            uint32_t prev = nixlLibfabricRail::kUnknownAgentIdx;
+            nixl_status_t status = rails[rail_id]->insertAddress(
+                endpoint.data(), agent_idx, &fi_addr, replaces_agent_idx, &prev);
             if (status != NIXL_SUCCESS) {
                 NIXL_ERROR << "Failed for rail " << rail_id;
+                for (const auto &[mapped_rail, mapped_addr, mapped_prev] : mapped) {
+                    rails[mapped_rail]->remapSourceAddress(mapped_addr, agent_idx, mapped_prev);
+                }
                 return status;
             }
+            mapped.emplace_back(rail_id, fi_addr, prev);
             fi_addrs_out[rail_id].push_back(fi_addr);
             NIXL_DEBUG << "Processed rail " << rail_id << " (fi_addr=" << fi_addr << ")";
         }
@@ -1212,8 +1225,9 @@ nixlLibfabricRailManager::notifiesAfterCompletion() const {
 uint64_t
 nixlLibfabricRailManager::writeImmData(uint16_t xfer_id) const {
     // Rails of a provider that notifies after completion post writes without remote CQ data, so
-    // the immediate data would be dropped; skip the shared SEQ_ID counter for it.
-    if (notify_after_completion_) {
+    // the immediate data would be dropped; skip the shared SEQ_ID counter for it. So are the
+    // writes of a transfer without a notification (NIXL_UNTRACKED_XFER_ID).
+    if (notify_after_completion_ || xfer_id == NIXL_UNTRACKED_XFER_ID) {
         return 0;
     }
     return NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, LibfabricUtils::getNextSeqId());

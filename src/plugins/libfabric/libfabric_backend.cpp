@@ -330,6 +330,23 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
                          "writes complete, and writes carry no remote CQ data";
         }
 
+        // NIXL_LIBFABRIC_PENDING_{NOTIF,WRITES}_TIMEOUT, or the backend parameters of that name
+        for (auto [key, age] : {std::pair{"pending_notif_timeout", &stale_pending_age_},
+                                std::pair{"pending_writes_timeout", &stale_writes_age_}}) {
+            size_t secs = static_cast<size_t>(age->count());
+            if (LibfabricUtils::getCustomIntParam(getCustomParams(), key, secs) != NIXL_SUCCESS) {
+                continue;
+            }
+            if (secs > static_cast<size_t>(kMaxStaleAge.count())) {
+                NIXL_WARN << key << " " << secs << " s exceeds the maximum " << kMaxStaleAge.count()
+                          << " s; using " << age->count() << " s";
+                continue;
+            }
+            *age = std::chrono::seconds(secs);
+            NIXL_INFO << key << ": "
+                      << (secs == 0 ? std::string("never") : std::to_string(secs) + " s");
+        }
+
         // Create self-connection
         std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> data_endpoints(
             rail_manager_.getNumRails());
@@ -571,6 +588,14 @@ nixlLibfabricEngine::disconnect(const std::string &remote_agent) {
     }
 
     nixl_status_t status = it->second->disconnect();
+    // The source addresses stay mapped: an invalidation is unordered against the fabric, so the
+    // peer's last writes and notification may still be arriving.
+    const uint32_t agent_idx = static_cast<uint32_t>(it->second->agent_index_);
+    disconnected_agent_idx_[remote_agent] = agent_idx;
+    {
+        const std::lock_guard<std::mutex> tracking_lock(receiver_tracking_mutex_);
+        live_senders_.erase(agent_idx);
+    }
     connections_.erase(it);
     // Drop queued replies for this peer so teardown never posts toward it from the CM thread.
     {
@@ -617,19 +642,36 @@ nixlLibfabricEngine::createAgentConnection(
     // next peer. The dead name a failure leaves is harmless: agent_names_ is used for its size.
     agent_names_.push_back(agent_name);
 
+    // A reconnect may get the old index's fi_addrs back from the address vector; take them over
+    const auto disconnected = disconnected_agent_idx_.find(agent_name);
+    const uint32_t replaces_agent_idx = disconnected != disconnected_agent_idx_.end() ?
+        disconnected->second :
+        nixlLibfabricRail::kUnknownAgentIdx;
+
     conn->rail_remote_addr_list_.reserve(rail_manager_.getNumRails());
 
     // Process all rails in one operation
     // The AV insert must happen before sendHandshakeTo() further down the call chain:
     // the peer treats our handshake as proof that we can attribute its traffic.
-    nixl_status_t data_status =
-        rail_manager_.insertAllAddresses(data_rail_endpoints,
-                                         static_cast<uint32_t>(conn->agent_index_),
-                                         conn->rail_remote_addr_list_,
-                                         conn->src_ep_names_);
+    // Entries stay with the old index, which ages them out: the same address back does not prove
+    // the same process, and a restarted one's XFER_IDs would merge with its predecessor's.
+    const uint32_t agent_idx = static_cast<uint32_t>(conn->agent_index_);
+    nixl_status_t data_status = rail_manager_.insertAllAddresses(data_rail_endpoints,
+                                                                 agent_idx,
+                                                                 conn->rail_remote_addr_list_,
+                                                                 conn->src_ep_names_,
+                                                                 replaces_agent_idx);
     if (data_status != NIXL_SUCCESS) {
+        // The index never becomes live, so anything credited to it meanwhile ages out
         NIXL_ERROR << "insertAllAddresses failed for rails with status: " << data_status;
         return data_status;
+    }
+    if (disconnected != disconnected_agent_idx_.end()) {
+        disconnected_agent_idx_.erase(disconnected);
+    }
+    {
+        const std::lock_guard<std::mutex> tracking_lock(receiver_tracking_mutex_);
+        live_senders_.insert(agent_idx);
     }
 
     for (size_t i = 0; i < agent_names_.size(); ++i) {
@@ -1170,7 +1212,10 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
             remote_md->rail_remote_key_list_,
             remote_md->remote_selected_endpoints_,
             conn->rail_remote_addr_list_,
-            backend_handle->post_xfer_id,
+            // Only a notified WRITE's writes are matched by the target; see NIXL_UNTRACKED_XFER_ID
+            (backend_handle->has_notif && op_type == nixlLibfabricReq::WRITE) ?
+                backend_handle->post_xfer_id :
+                static_cast<uint16_t>(NIXL_UNTRACKED_XFER_ID),
             [this, backend_handle](nixl_status_t status) {
                 completion_callbacks_started_.fetch_add(1);
                 // Queue the notification before the completion is counted: once it is, the
@@ -1253,8 +1298,10 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
         backend_handle->total_notif_msg_len = 0;
     }
 
-    // Allocate xfer_id once in prepXfer
-    backend_handle->post_xfer_id = LibfabricUtils::getNextXferId();
+    // Only a transfer with a notification puts an XFER_ID on the wire
+    backend_handle->post_xfer_id = backend_handle->has_notif ?
+        LibfabricUtils::getNextXferId() :
+        static_cast<uint16_t>(NIXL_UNTRACKED_XFER_ID);
 
     nixlLibfabricReq::OpType op_type;
     int desc_count = local.descCount();
@@ -1926,16 +1973,21 @@ nixlLibfabricEngine::genNotif(const std::string &remote_agent, const std::string
 
 nixl_status_t
 nixlLibfabricEngine::getNotifs(notif_list_t &notif_list) {
+    // Without a progress thread (which sweeps itself), this call sweeps; drained if the pass
+    // found the CQs empty
+    bool drained = false;
     if (!progress_thread_enabled_) {
         nixl_status_t progress_status = rail_manager_.progressActiveRails();
         if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
             NIXL_ERROR << "Failed to progress rails in getNotifs";
             return progress_status;
         }
+        drained = progress_status == NIXL_IN_PROG;
     }
 
     // Then check for available notifications after processing completions
     // Thread-safe access to internal notification list
+    bool retrieved = false;
     {
         std::lock_guard<std::mutex> lock(notif_mutex_);
 
@@ -1944,16 +1996,19 @@ nixlLibfabricEngine::getNotifs(notif_list_t &notif_list) {
 
         if (!notifMainList_.empty()) {
             NIXL_DEBUG << "Retrieved " << notifMainList_.size() << " notifications";
-            // Clear the internal list after copying
-            notifMainList_.clear();
-            return NIXL_SUCCESS;
+            retrieved = true;
         }
 
         // Clear the internal list after copying (even if empty)
         notifMainList_.clear();
     }
 
-    return NIXL_IN_PROG;
+    // After the notifications are out, so a sweep never delays one
+    if (!progress_thread_enabled_) {
+        maybeReapStalePendingNotifications(drained);
+    }
+
+    return retrieved ? NIXL_SUCCESS : NIXL_IN_PROG;
 }
 
 /****************************************
@@ -1977,6 +2032,8 @@ nixlLibfabricEngine::progressThread() {
             // Don't return error, continue for robustness
         }
         sendQueuedCompletionNotifs();
+        // An error pass is not drained: completions may be queued behind the error
+        maybeReapStalePendingNotifications(status == NIXL_IN_PROG);
         if (!any_completions) {
             std::this_thread::sleep_for(progress_thread_delay_);
         }
@@ -2029,6 +2086,7 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif,
         std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
 
         auto [it, inserted] = pending_notifications_.try_emplace(key, notif_xfer_id);
+        it->second.last_activity = std::chrono::steady_clock::now();
 
         if (inserted) {
             NIXL_DEBUG << "Created pending notification"
@@ -2094,6 +2152,7 @@ nixlLibfabricEngine::handleXferError(uint16_t notif_xfer_id,
         std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
 
         auto [it, inserted] = pending_notifications_.try_emplace(key, notif_xfer_id);
+        it->second.last_activity = std::chrono::steady_clock::now();
 
         if (inserted) {
             it->second.remote_agent = "";
@@ -2128,6 +2187,7 @@ nixlLibfabricEngine::addReceivedXferId(uint16_t xfer_id, uint32_t sender_peer_id
         std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
 
         auto [it, inserted] = pending_notifications_.try_emplace(key, xfer_id);
+        it->second.last_activity = std::chrono::steady_clock::now();
 
         if (inserted) {
             // Set placeholder values for write-arrived-first case
@@ -2153,6 +2213,66 @@ nixlLibfabricEngine::addReceivedXferId(uint16_t xfer_id, uint32_t sender_peer_id
 /****************************************
  * Notification Queuing Helper Methods
  *****************************************/
+
+size_t
+nixlLibfabricEngine::reapStalePendingNotifications(std::chrono::steady_clock::time_point now) {
+    size_t dropped = 0;
+    std::string example; // the first one dropped, logged after the lock is released
+    {
+        std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
+        for (auto it = pending_notifications_.begin(); it != pending_notifications_.end();) {
+            const PendingNotification &pending = it->second;
+            const uint32_t sender = pendingKeySender(it->first);
+            const bool sender_live = live_senders_.count(sender) != 0;
+            // A live sender's complete notification waits longer, for writes that may be slow
+            const bool waits_for_writes =
+                sender_live && pending.received_msg_fragments >= pending.expected_msg_fragments;
+            const std::chrono::seconds age =
+                waits_for_writes ? stale_writes_age_ : stale_pending_age_;
+            if (age.count() == 0 || now - pending.last_activity < age) {
+                ++it;
+                continue;
+            }
+            if (dropped++ == 0) {
+                const bool expected_known =
+                    pending.expected_completions != static_cast<uint32_t>(INT_MAX);
+                example = "sender agent index " + std::to_string(sender) +
+                    (sender_live ? "" : " (disconnected)") + ", XFER_ID " +
+                    std::to_string(pending.notif_xfer_id) + ", " +
+                    std::to_string(pending.received_completions) + "/" +
+                    (expected_known ? std::to_string(pending.expected_completions) : "?") +
+                    " writes, " + std::to_string(pending.received_msg_fragments) + "/" +
+                    std::to_string(pending.expected_msg_fragments) + " fragments";
+            }
+            it = pending_notifications_.erase(it);
+        }
+    }
+    if (dropped != 0) {
+        NIXL_WARN << "Dropped " << dropped << " notification(s) that made no progress, e.g. "
+                  << example;
+    }
+    return dropped;
+}
+
+void
+nixlLibfabricEngine::maybeReapStalePendingNotifications(bool drained) {
+    const std::chrono::seconds interval =
+        (stale_pending_age_.count() != 0 && stale_pending_age_ < kStaleReapInterval) ?
+        stale_pending_age_ :
+        kStaleReapInterval;
+    const auto now = std::chrono::steady_clock::now();
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    int64_t last_ns = last_stale_reap_ns_.load(std::memory_order_relaxed);
+    const int64_t since_ns = now_ns - last_ns;
+    // Under steady traffic no pass finds the CQs empty; sweep anyway after four intervals
+    const int64_t due_ns = std::chrono::nanoseconds(drained ? interval : 4 * interval).count();
+    if (since_ns < due_ns ||
+        !last_stale_reap_ns_.compare_exchange_strong(last_ns, now_ns, std::memory_order_relaxed)) {
+        return; // not due, or another thread is running it
+    }
+    reapStalePendingNotifications(now);
+}
 
 void
 nixlLibfabricEngine::checkPendingNotification(uint64_t key) {

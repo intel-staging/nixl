@@ -386,6 +386,7 @@ struct nixlLibfabricPostRequest {
     size_t length;
     void *local_desc;
     uint64_t immediate_data; // WRITE only
+    bool remote_cq_data = true; // WRITE only: post with FI_REMOTE_CQ_DATA, see postWrite()
     fi_addr_t dest_addr;
     uint64_t remote_addr;
     uint64_t remote_key;
@@ -500,9 +501,19 @@ public:
     static constexpr uint32_t kUnknownAgentIdx = std::numeric_limits<uint32_t>::max();
 
     // Address vector management methods
-    /** Insert remote endpoint address into address vector, and map it to agent_idx */
+    /** Insert remote endpoint address into address vector, and map it to agent_idx, taking it
+     *  over from replaces_agent_idx (a disconnected index of the same agent) without a warning;
+     *  *prev_agent_idx gets the index it was mapped to before. */
     nixl_status_t
-    insertAddress(const void *addr, uint32_t agent_idx, fi_addr_t *fi_addr_out) const;
+    insertAddress(const void *addr,
+                  uint32_t agent_idx,
+                  fi_addr_t *fi_addr_out,
+                  uint32_t replaces_agent_idx = kUnknownAgentIdx,
+                  uint32_t *prev_agent_idx = nullptr) const;
+
+    /** Map fi_addr to to_agent_idx (kUnknownAgentIdx unmaps) if it is mapped to from_agent_idx */
+    void
+    remapSourceAddress(fi_addr_t fi_addr, uint32_t from_agent_idx, uint32_t to_agent_idx) const;
 
     /** Remove address from address vector, and drop its source-address mapping */
     nixl_status_t
@@ -531,7 +542,8 @@ public:
     nixl_status_t
     postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLibfabricReq *req);
 
-    /** Post RDMA write operation with immediate data */
+    /** Post RDMA write operation with immediate data; remote_cq_data false (a transfer without a
+     *  notification) posts it without FI_REMOTE_CQ_DATA */
     nixl_status_t
     postWrite(const void *local_buffer,
               size_t length,
@@ -541,7 +553,8 @@ public:
               uint64_t remote_addr,
               uint64_t remote_key,
               nixlLibfabricReq *req,
-              uint64_t fi_flags = 0);
+              uint64_t fi_flags = 0,
+              bool remote_cq_data = true);
 
     /** Post RDMA read operation */
     nixl_status_t
@@ -704,8 +717,8 @@ private:
     const bool write_remote_cq_data_;
 
     uint64_t
-    writeCqDataFlag() const {
-        return write_remote_cq_data_ ? FI_REMOTE_CQ_DATA : 0;
+    writeCqDataFlag(bool remote_cq_data) const {
+        return (write_remote_cq_data_ && remote_cq_data) ? FI_REMOTE_CQ_DATA : 0;
     }
 
     // Whether a post refused with -FI_EAGAIN progresses the CQ before retrying.
@@ -715,9 +728,9 @@ private:
     void
     pollForCompletions();
 
-    /** Record that fi_addr belongs to agent_idx. Called from insertAddress(). */
-    void
-    mapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx) const;
+    /** Record that fi_addr belongs to agent_idx; returns its previous index */
+    uint32_t
+    mapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx, uint32_t replaces_agent_idx) const;
 
     // src_addr is FI_ADDR_NOTAVAIL when the provider has none (always for local completions).
     nixl_status_t

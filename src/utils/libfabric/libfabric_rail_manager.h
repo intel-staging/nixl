@@ -181,13 +181,16 @@ public:
      * @param fi_addrs_out Libfabric address handles for inserted endpoints,
      *                     indexed by local rail id.
      * @param ep_names_out Local endpoint names for reference
-     * @return NIXL_SUCCESS on success, error code on failure
+     * @param replaces_agent_idx See nixlLibfabricRail::insertAddress()
+     * @return NIXL_SUCCESS on success, error code on failure, after handing the addresses mapped
+     *         so far back to their previous indices
      */
     nixl_status_t
     insertAllAddresses(const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,
                        uint32_t agent_idx,
                        std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs_out,
-                       std::vector<char *> &ep_names_out);
+                       std::vector<char *> &ep_names_out,
+                       uint32_t replaces_agent_idx = nixlLibfabricRail::kUnknownAgentIdx);
 
     /** Whether every rail can carry device memory. Rails share one provider but negotiate
      *  FI_HMEM each on its own domain, and a VRAM buffer may be mapped to any of them. */
@@ -412,8 +415,8 @@ private:
     // See needsAllRailProgress(). Set in createRails(), before any transfer.
     bool needs_all_rail_progress_ = false;
 
-    // Immediate data for one write of transfer xfer_id: a fresh SEQ_ID, or 0 when writes carry
-    // no remote CQ data.
+    // Immediate data for one write of transfer xfer_id: a fresh SEQ_ID, or 0 if it carries no
+    // remote CQ data (notify-after-completion provider, or NIXL_UNTRACKED_XFER_ID).
     uint64_t
     writeImmData(uint16_t xfer_id) const;
 

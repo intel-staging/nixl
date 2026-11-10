@@ -1243,6 +1243,12 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
 nixl_status_t
 nixlLibfabricRail::processRemoteWriteCompletion(struct fi_cq_data_entry *comp,
                                                 fi_addr_t src_addr) const {
+    // A write without remote CQ data still raises an event under FI_RMA_EVENT (cxi), but its
+    // data is undefined and there is nothing to count
+    if (!(comp->flags & FI_REMOTE_CQ_DATA)) {
+        return NIXL_SUCCESS;
+    }
+
     // Decode the immediate data format
     uint64_t msg_type = NIXL_GET_MSG_TYPE_FROM_IMM(comp->data);
     uint32_t xfer_id = NIXL_GET_XFER_ID_FROM_IMM(comp->data);
@@ -1470,7 +1476,7 @@ nixlLibfabricRail::drainPostQueue() {
                 msg.data = pr.immediate_data;
 
                 const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
-                ret = fi_writemsg(endpoint, &msg, pr.fi_flags | writeCqDataFlag());
+                ret = fi_writemsg(endpoint, &msg, pr.fi_flags | writeCqDataFlag(pr.remote_cq_data));
             } else {
                 struct iovec iov{};
                 iov.iov_base = pr.local_addr;
@@ -1531,7 +1537,8 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
                              uint64_t remote_addr,
                              uint64_t remote_key,
                              nixlLibfabricReq *req,
-                             uint64_t fi_flags) {
+                             uint64_t fi_flags,
+                             bool remote_cq_data) {
     // Validation
     if (!req) {
         NIXL_ERROR << "Invalid request for write on rail " << rail_id;
@@ -1571,7 +1578,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
         // Libfabric fi_writemsg call (supports FI_MORE flag)
         {
             const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
-            ret = fi_writemsg(endpoint, &msg, fi_flags | writeCqDataFlag());
+            ret = fi_writemsg(endpoint, &msg, fi_flags | writeCqDataFlag(remote_cq_data));
         }
 
         if (ret == 0) {
@@ -1948,7 +1955,9 @@ nixlLibfabricRail::deregisterMemory(struct fid_mr *mr) const {
 nixl_status_t
 nixlLibfabricRail::insertAddress(const void *addr,
                                  uint32_t agent_idx,
-                                 fi_addr_t *fi_addr_out) const {
+                                 fi_addr_t *fi_addr_out,
+                                 uint32_t replaces_agent_idx,
+                                 uint32_t *prev_agent_idx) const {
     if (!addr || !fi_addr_out) {
         NIXL_ERROR << "Invalid parameters on rail " << rail_id;
         return NIXL_ERR_INVALID_PARAM;
@@ -1969,9 +1978,22 @@ nixlLibfabricRail::insertAddress(const void *addr,
     }
 
     // Kept together with the insert so the table cannot drift from the AV.
-    mapSourceAddress(*fi_addr_out, agent_idx);
+    const uint32_t prev = mapSourceAddress(*fi_addr_out, agent_idx, replaces_agent_idx);
+    if (prev_agent_idx) {
+        *prev_agent_idx = prev;
+    }
 
     return NIXL_SUCCESS;
+}
+
+void
+nixlLibfabricRail::remapSourceAddress(fi_addr_t fi_addr,
+                                      uint32_t from_agent_idx,
+                                      uint32_t to_agent_idx) const {
+    std::unique_lock<std::shared_mutex> lk(src_addr_mutex_);
+    if (fi_addr < src_addr_to_agent_.size() && src_addr_to_agent_[fi_addr] == from_agent_idx) {
+        src_addr_to_agent_[fi_addr] = to_agent_idx;
+    }
 }
 
 nixl_status_t
@@ -2007,11 +2029,13 @@ nixlLibfabricRail::removeAddress(fi_addr_t fi_addr) const {
     return NIXL_SUCCESS;
 }
 
-void
-nixlLibfabricRail::mapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx) const {
+uint32_t
+nixlLibfabricRail::mapSourceAddress(fi_addr_t fi_addr,
+                                    uint32_t agent_idx,
+                                    uint32_t replaces_agent_idx) const {
     if (fi_addr == FI_ADDR_NOTAVAIL) {
         NIXL_ERROR << "Refusing to map invalid fi_addr " << fi_addr << " on rail " << rail_id;
-        return;
+        return kUnknownAgentIdx;
     }
 
     std::unique_lock<std::shared_mutex> lk(src_addr_mutex_);
@@ -2020,16 +2044,18 @@ nixlLibfabricRail::mapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx) const
     }
 
     const uint32_t prev = src_addr_to_agent_[fi_addr];
-    if (prev != kUnknownAgentIdx && prev != agent_idx) {
-        // A reconnect: a duplicate fi_av_insert() returns the existing fi_addr under a fresh
-        // index. Last writer wins; transfers in flight under the old index are orphaned.
-        NIXL_WARN << "Re-mapping fi_addr " << fi_addr << " on rail " << rail_id
-                  << " from agent index " << prev << " to " << agent_idx;
+    // A reconnect takes over its disconnected index's fi_addr in one step
+    if (prev != kUnknownAgentIdx && prev != agent_idx && prev != replaces_agent_idx) {
+        // Two agents publishing the same endpoint: last writer wins
+        NIXL_WARN << "fi_addr " << fi_addr << " on rail " << rail_id
+                  << " is already mapped to agent index " << prev << "; re-mapping it to "
+                  << agent_idx << ": two agents share an endpoint";
     }
     src_addr_to_agent_[fi_addr] = agent_idx;
 
     NIXL_TRACE << "Mapped fi_addr " << fi_addr << " -> agent index " << agent_idx << " on rail "
                << rail_id;
+    return prev;
 }
 
 uint32_t
