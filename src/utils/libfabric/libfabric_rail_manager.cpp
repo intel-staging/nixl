@@ -25,9 +25,13 @@
 #include <tuple>
 #include <sstream>
 #include <algorithm>
+#include <numeric>
 #include <cctype>
 #include <cstdlib>
 #include <numaif.h>
+
+#include <arpa/inet.h>
+#include <ifaddrs.h>
 
 #include <numa.h>
 
@@ -403,12 +407,96 @@ nixlLibfabricRailManager::createRails(const std::vector<std::string> &nic_device
             NIXL_DEBUG << "Created rail " << i << " (device=" << nic_devices[i]
                        << ", provider=" << provider_name << ")";
         }
+        resolveRailFabricMasks();
     }
     catch (const std::exception &e) {
         NIXL_ERROR << "Failed to create rails: " << e.what();
         return NIXL_ERR_BACKEND;
     }
     return NIXL_SUCCESS;
+}
+
+namespace {
+std::string
+ipString(uint32_t addr) {
+    char ip[INET_ADDRSTRLEN] = {0};
+    struct in_addr a;
+    a.s_addr = addr;
+    inet_ntop(AF_INET, &a, ip, sizeof(ip));
+    return ip;
+}
+} // namespace
+
+void
+nixlLibfabricRailManager::resolveRailFabricMasks() {
+    const char *by_subnet = std::getenv("NIXL_LIBFABRIC_PEER_RAIL_BY_SUBNET");
+    peer_rail_by_subnet_ = !(by_subnet != nullptr && std::string(by_subnet) == "0");
+    if (!peer_rail_by_subnet_) {
+        NIXL_INFO << "NIXL_LIBFABRIC_PEER_RAIL_BY_SUBNET=0: peer rails are chosen by round-robin";
+    }
+
+    struct ifaddrs *ifa_list = nullptr;
+    if (getifaddrs(&ifa_list) != 0) {
+        NIXL_DEBUG << "getifaddrs failed, peer rails will match only by exact address";
+        ifa_list = nullptr;
+    }
+    local_fabric_ids_.clear();
+    for (const auto &rail : rails_) {
+        LibfabricUtils::resolveLocalFabricMask(rail->fabric_id, ifa_list);
+        local_fabric_ids_.push_back(rail->fabric_id);
+        if (rail->fabric_id.valid) {
+            NIXL_DEBUG << "Rail " << rail->rail_id << " (" << rail->device_name << ") address "
+                       << ipString(rail->fabric_id.addr) << " mask "
+                       << ipString(rail->fabric_id.mask);
+        }
+    }
+    if (ifa_list != nullptr) {
+        freeifaddrs(ifa_list);
+    }
+}
+
+LibfabricUtils::nixlLibfabricFabricIds
+nixlLibfabricRailManager::peerFabricIds(
+    const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints) const {
+    const bool any_local = std::any_of(local_fabric_ids_.begin(),
+                                       local_fabric_ids_.end(),
+                                       [](const auto &id) { return id.valid; });
+    if (!peer_rail_by_subnet_ || !any_local || endpoints.empty()) {
+        return {};
+    }
+    // Both agents use one provider. The peer's names are read as sockaddrs, and each name's own
+    // family decides, so one IPv6 rail does not hide the others.
+    LibfabricUtils::nixlLibfabricFabricIds ids;
+    ids.reserve(endpoints.size());
+    bool any_peer = false;
+    for (const auto &ep : endpoints) {
+        ids.push_back(LibfabricUtils::fabricIdFromEpName(FI_SOCKADDR, ep.data(), ep.size()));
+        any_peer = any_peer || ids.back().valid;
+    }
+    if (!any_peer) {
+        return {};
+    }
+
+    // Where the first round goes for a buffer on every rail on both sides, by the same function
+    // the posts use. Logged at INFO when it is not index order, which is otherwise invisible.
+    std::vector<size_t> all_local(rails_.size());
+    std::iota(all_local.begin(), all_local.end(), 0);
+    std::vector<size_t> all_peer(endpoints.size());
+    std::iota(all_peer.begin(), all_peer.end(), 0);
+    std::string map_str;
+    bool differs = false;
+    for (size_t pos = 0; pos < all_local.size(); ++pos) {
+        const size_t peer = LibfabricUtils::pickPeerRail(
+            all_local, pos, /*round=*/0, all_peer, local_fabric_ids_, ids);
+        differs = differs || peer != pos;
+        map_str += " " + std::to_string(pos) + "->" + std::to_string(peer);
+    }
+    if (differs) {
+        NIXL_INFO << "Peer rails chosen by subnet differ from index order:" << map_str;
+    } else {
+        NIXL_DEBUG << "Peer rails chosen by subnet:" << map_str;
+    }
+    return ids;
 }
 
 size_t
@@ -427,6 +515,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     const std::vector<struct fid_mr *> &local_mrs,
     const std::vector<uint64_t> &remote_keys,
     const std::vector<size_t> &remote_selected_endpoints,
+    const LibfabricUtils::nixlLibfabricFabricIds &peer_fabric_ids,
     const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
     uint16_t xfer_id,
     std::function<void(nixl_status_t)> completion_callback,
@@ -456,9 +545,14 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
             railSelectionIndex(base_offset, desc_idx, batch_write, selected_rails.size());
         const size_t rail_id = selected_rails[rail_sel_idx];
         // The remote endpoint round-robins over its own count, which can differ from the
-        // local rail count.
-        const size_t remote_ep_id = remote_selected_endpoints[railSelectionIndex(
-            base_offset, desc_idx, batch_write, remote_selected_endpoints.size())];
+        // local rail count, preferring peer rails on this rail's subnet.
+        const size_t remote_ep_id = LibfabricUtils::pickPeerRail(
+            selected_rails,
+            rail_sel_idx,
+            railSelectionCounter(base_offset, desc_idx, batch_write) / selected_rails.size(),
+            remote_selected_endpoints,
+            local_fabric_ids_,
+            peer_fabric_ids);
         const uint64_t fi_flags = (batch_write && apply_fi_more) ? FI_MORE : 0;
         NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id " << remote_ep_id;
         // Allocate request
@@ -544,8 +638,12 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
         size_t remainder = transfer_size % num_rails;
         for (size_t i = 0; i < num_rails; ++i) {
             const size_t rail_id = selected_rails[i];
-            const size_t remote_ep_id =
-                remote_selected_endpoints[i % remote_selected_endpoints.size()];
+            const size_t remote_ep_id = LibfabricUtils::pickPeerRail(selected_rails,
+                                                                     i,
+                                                                     /*round=*/0,
+                                                                     remote_selected_endpoints,
+                                                                     local_fabric_ids_,
+                                                                     peer_fabric_ids);
             NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id=" << remote_ep_id;
             size_t current_chunk_size = chunk_size + (i == num_rails - 1 ? remainder : 0);
             if (current_chunk_size == 0) {

@@ -407,6 +407,9 @@ public:
     std::string device_name; ///< Libfabric domain name for this rail
     std::string provider_name; ///< Core provider name (e.g., "efa", "cxi", "verbs")
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
+    /// This rail's subnet, for preferring a peer rail on it (LibfabricUtils::pickPeerRail). The
+    /// rail manager fills in the netmask. Invalid when the endpoint name is not an IPv4 sockaddr.
+    LibfabricUtils::nixlLibfabricFabricId fabric_id;
     struct fid_ep *endpoint; ///< Libfabric endpoint handle
 
     /** Initialize libfabric rail with all resources

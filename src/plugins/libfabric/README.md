@@ -186,6 +186,27 @@ Notes specific to verbs:
   newer than v2.6.0. On a build without it the rail comes up without `FI_HMEM` (logged at
   startup) and device buffers are registered as host memory.
 
+## Peer Rail Choice
+
+A post goes from one of the local buffer's rails to one of the peer rails the remote buffer is
+registered on, both round-robin. Rail order comes from host-local domain names and cabling need
+not follow it, so on a segmented fabric local rail *k* and peer rail *k* can be on different
+subnets. Each post therefore prefers, among the registered peer rails, those on the posting rail's
+IPv4 subnet. The local rails on one subnet spread over those peer rails, each taking a different
+one within a round and rotating through them over rounds; with the same layout on both sides this
+is a fixed one-to-one pairing. When no registered peer rail is on its subnet (a routed fabric, or a
+buffer registered only elsewhere) a post round-robins over all of them as before.
+
+The peer rails' addresses come from the endpoint names exchanged at connection setup, the local
+netmasks from `getifaddrs()`; nothing new goes on the wire. Providers whose names are not IPv4
+sockaddrs (efa, cxi) keep the plain round-robin, as does `NIXL_LIBFABRIC_PEER_RAIL_BY_SUBNET=0`
+(e.g. on a routed fabric where the preference would crowd a few peer NICs). When the choice for a
+buffer on every rail is not index order it is logged at INFO once per connection, e.g.
+`Peer rails chosen by subnet differ from index order: 0->1 1->0`.
+
+Control messages (handshakes, notifications, transfer errors) still go from local rail 0 to peer
+rail 0, so local rail 0 and peer rail 0 must reach each other.
+
 ## Build Instructions
 
 ```bash
