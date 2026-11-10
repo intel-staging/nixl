@@ -117,6 +117,9 @@ public:
     const nixl_xfer_op_t operation_;
     const std::string remote_agent_;
     bool has_notif = false; // prepXfer()/postXfer() set it only when given opt_args
+    // A notified WRITE whose posting failed partway, so the notification postXfer() would have
+    // sent was not; notifXferFailure() sends it after the failure notice
+    bool notif_deferred = false;
     uint32_t total_notif_msg_len; // Total length of notification message across all fragments
 
     std::vector<BinaryNotification> binary_notifs; // Vector of BinaryNotification for fragmentation

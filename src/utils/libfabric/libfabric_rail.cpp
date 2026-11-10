@@ -348,6 +348,8 @@ ControlRequestPool::allocate(size_t needed_size, uint32_t req_id) {
     nixlLibfabricReq *req = allocateReq(req_id);
 
     if (req) {
+        // A send unless postRecv() makes it a receive; reset, as the request may have been one
+        req->operation_type = nixlLibfabricReq::SEND;
         // Always reset buffer_size to the actual message size needed
         // The buffer itself is always NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE, but we need
         // to set buffer_size to the actual message size for libfabric operations
@@ -905,10 +907,11 @@ nixlLibfabricRail::setXferErrorCallback(
     xferErrorCallback = callback;
 }
 
-// Per-rail completion processing - handles one rail's CQ with configurable blocking behavior
+// Reads and handles one batch of this rail's CQ. An error completion that reaches its request's
+// callback is handled like any completion: the error belongs to that request, which may be another
+// transfer's, so it is not returned. Only an error no request can be told of is returned.
 nixl_status_t
-nixlLibfabricRail::progressCompletionQueue() {
-    // Completion processing FIRST — process arrivals before posting new items
+nixlLibfabricRail::reapCompletions() {
     struct fi_cq_data_entry completions[NIXL_LIBFABRIC_CQ_BATCH_SIZE];
     fi_addr_t src_addrs[NIXL_LIBFABRIC_CQ_BATCH_SIZE];
 
@@ -932,55 +935,68 @@ nixlLibfabricRail::progressCompletionQueue() {
     // CQ lock released here - completion is now local data
 
     if (ret < 0 && ret != -FI_EAGAIN) {
-        NIXL_ERROR << "fi_cq_readfrom returned error " << ret << " on rail " << rail_id << ": "
-                   << fi_strerror(-ret);
-        if (err_ret > 0) {
-            NIXL_ERROR << "CQ read failed on rail " << rail_id
-                       << " with error: " << fi_strerror(err_entry.err)
-                       << " prov_errno: " << err_entry.prov_errno << " len: " << err_entry.len;
-
-            // Notify the owning handle of the error and release the request. Done without the
-            // EP lock: the callback and the request pool take their own locks.
-            if (err_entry.op_context) {
-                nixlLibfabricReq *req = findRequestFromContext(err_entry.op_context);
-                if (req && req->in_use) {
-                    if (req->completion_callback) {
-                        req->completion_callback(NIXL_ERR_BACKEND);
-                    }
-                    releaseRequest(req);
-                }
-            }
-        } else {
-            NIXL_ERROR << "fi_cq_readerr failed with " << err_ret;
+        if (err_ret <= 0) {
+            NIXL_ERROR << "fi_cq_readfrom returned error " << ret << " on rail " << rail_id
+                       << " and fi_cq_readerr failed with " << err_ret;
+            return NIXL_ERR_BACKEND;
         }
-        return NIXL_ERR_BACKEND;
+        NIXL_ERROR << "CQ error on rail " << rail_id << ": " << fi_strerror(err_entry.err)
+                   << " prov_errno: " << err_entry.prov_errno << " len: " << err_entry.len;
+        // Notify the owning handle of the error and release the request. Done without the EP
+        // lock: the callback and the request pool take their own locks.
+        nixlLibfabricReq *req =
+            err_entry.op_context ? findRequestFromContext(err_entry.op_context) : nullptr;
+        if (!req || !req->in_use) {
+            NIXL_ERROR << "CQ error on rail " << rail_id << " belongs to no known request";
+            return NIXL_ERR_BACKEND;
+        }
+        const bool recv =
+            (err_entry.flags & FI_RECV) || req->operation_type == nixlLibfabricReq::RECV;
+        const bool owned = static_cast<bool>(req->completion_callback);
+        if (owned) {
+            req->completion_callback(NIXL_ERR_BACKEND);
+        }
+        releaseRequest(req);
+        if (recv) {
+            // Keep the receive pool full; a cancelled one means the endpoint is going away
+            return err_entry.err == FI_ECANCELED ? NIXL_SUCCESS : postReplacementRecv();
+        }
+        // A control send (notification, failure notice, handshake) has no owner to tell
+        return owned ? NIXL_SUCCESS : NIXL_ERR_BACKEND;
     }
 
-    if (ret == -FI_EAGAIN) {
-        // No completions - fall through to drainPostQueue
+    if (ret <= 0) {
+        return NIXL_IN_PROG; // -FI_EAGAIN: nothing completed
     }
 
-    if (ret > 0) {
-        nixl_status_t first_error = NIXL_SUCCESS;
-        for (int i = 0; i < ret; ++i) {
-            // Process completion using local data. Callbacks have their own thread safety
-            nixl_status_t status = processCompletionQueueEntry(&completions[i], src_addrs[i]);
-            if (status != NIXL_SUCCESS) {
-                NIXL_ERROR << "Failed to process completion " << i << " out of batch of " << ret
-                           << " on rail " << rail_id << " with status " << status;
-                // Keep draining: these entries are already dequeued, so stopping here would
-                // drop the valid ones behind the failure. Report the first error afterwards.
-                if (first_error == NIXL_SUCCESS) {
-                    first_error = status;
-                }
+    nixl_status_t first_error = NIXL_SUCCESS;
+    for (int i = 0; i < ret; ++i) {
+        // Process completion using local data. Callbacks have their own thread safety
+        nixl_status_t status = processCompletionQueueEntry(&completions[i], src_addrs[i]);
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to process completion " << i << " out of batch of " << ret
+                       << " on rail " << rail_id << " with status " << status;
+            // Keep draining: these entries are already dequeued, so stopping here would drop the
+            // valid ones behind the failure. Report the first error afterwards.
+            if (first_error == NIXL_SUCCESS) {
+                first_error = status;
             }
         }
+    }
+    if (first_error != NIXL_SUCCESS) {
+        return first_error;
+    }
+    NIXL_DEBUG << "Processed " << ret << " completions on rail " << rail_id;
+    return NIXL_SUCCESS;
+}
 
-        if (first_error != NIXL_SUCCESS) {
-            return first_error;
-        }
-
-        NIXL_DEBUG << "Processed " << ret << " completions on rail " << rail_id;
+// Per-rail completion processing - handles one rail's CQ with configurable blocking behavior
+nixl_status_t
+nixlLibfabricRail::progressCompletionQueue() {
+    // Completion processing FIRST — process arrivals before posting new items
+    const nixl_status_t reaped = reapCompletions();
+    if (reaped != NIXL_SUCCESS && reaped != NIXL_IN_PROG) {
+        return reaped;
     }
 
     // PT-owns-endpoint: drain pending posts AFTER processing completions
@@ -992,30 +1008,14 @@ nixlLibfabricRail::progressCompletionQueue() {
         }
     }
 
-    return (ret > 0) ? NIXL_SUCCESS : NIXL_IN_PROG;
+    // A parked post alone is not progress: the progress thread sleeps between its retries
+    return reaped;
 }
 
 void
 nixlLibfabricRail::pollForCompletions() {
-    struct fi_cq_data_entry cq_buf[NIXL_LIBFABRIC_CQ_BATCH_SIZE];
-    fi_addr_t src_addrs[NIXL_LIBFABRIC_CQ_BATCH_SIZE];
-    struct fi_cq_err_entry err_entry = {};
-    int cq_ret;
-    {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
-        cq_ret = fi_cq_readfrom(cq, cq_buf, NIXL_LIBFABRIC_CQ_BATCH_SIZE, src_addrs);
-        if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
-            fi_cq_readerr(cq, &err_entry, 0);
-        }
-    }
-    if (cq_ret > 0) {
-        for (int c = 0; c < cq_ret; c++) {
-            processCompletionQueueEntry(&cq_buf[c], src_addrs[c]);
-        }
-    } else if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
-        NIXL_ERROR << "CQ error in drain interleave on rail " << rail_id << ": "
-                   << fi_strerror(err_entry.err);
-    }
+    // Between posts of a drain; an error it could not attribute is logged by reapCompletions()
+    (void)reapCompletions();
 }
 
 // Route completion to appropriate handler (rail-specific)
@@ -1223,7 +1223,12 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
 
     releaseRequest(req);
 
-    // Post a new receive using new resource management system
+    const nixl_status_t status = postReplacementRecv();
+    return status != NIXL_SUCCESS ? status : result;
+}
+
+nixl_status_t
+nixlLibfabricRail::postReplacementRecv() const {
     nixlLibfabricReq *new_req = allocateControlRequest(NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE,
                                                        LibfabricUtils::getNextXferId());
     if (!new_req) {
@@ -1236,7 +1241,7 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
         releaseRequest(new_req);
         return status;
     }
-    return result;
+    return NIXL_SUCCESS;
 }
 
 // Handle remote write completions (data arrival notification)
@@ -1294,6 +1299,7 @@ nixlLibfabricRail::postRecv(nixlLibfabricReq *req) const {
         NIXL_ERROR << "Invalid request or buffer for receive on rail " << rail_id;
         return NIXL_ERR_INVALID_PARAM;
     }
+    req->operation_type = nixlLibfabricReq::RECV;
 
     struct fi_msg msg = {};
     struct iovec msg_iov;
@@ -1344,7 +1350,7 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
                << " XFER_ID=" << NIXL_GET_XFER_ID_FROM_IMM(immediate_data)
                << " dest_addr=" << dest_addr << std::dec << " context=" << &req->ctx;
 
-    // Retry indefinitely until senddata succeeds or fails for all providers
+    // Retry until senddata succeeds, fails, or the peer has refused posts for too long
     int ret = -FI_EAGAIN;
     int attempt = 0;
 
@@ -1363,6 +1369,7 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
 
         if (ret == 0) {
             // Success
+            clearRefused(dest_addr);
             NIXL_TRACE << "Send posted successfully"
                        << (attempt > 0 ? " after " + std::to_string(attempt + 1) + " attempts" :
                                          "");
@@ -1370,8 +1377,12 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
         }
 
         if (ret == -FI_EAGAIN) {
-            // Resource temporarily unavailable - retry indefinitely for all providers
+            // Resource temporarily unavailable - retry, see refusedTooLong()
             attempt++;
+            if ((attempt == 1 || attempt % kRefusedCheckInterval == 0) &&
+                refusedTooLong(dest_addr, "fi_senddata", attempt)) {
+                return NIXL_ERR_BACKEND;
+            }
 
             // Log every N attempts to avoid log spam
             if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {
@@ -1388,6 +1399,7 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
                 if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
                     NIXL_ERROR << "progressCompletionQueue failed on rail " << rail_id
                                << " during fi_senddata retry";
+                    clearRefused(dest_addr);
                     return progress_status;
                 }
                 if (progress_status == NIXL_SUCCESS) {
@@ -1402,6 +1414,7 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
         }
     }
 
+    clearRefused(dest_addr);
     NIXL_ERROR << "fi_senddata failed on rail " << rail_id << ": " << fi_strerror(-ret);
     return NIXL_ERR_BACKEND;
 }
@@ -1425,7 +1438,14 @@ nixlLibfabricRail::drainPostQueue() {
     // drain the queue up to configured limit,
     // to ensure requests from other rails do not wait too much time
     size_t post_req_count = 0;
-    while (post_req_count < POST_MAX_BATCH_SIZE && post_ring_.pop(pr)) {
+    while (post_req_count < POST_MAX_BATCH_SIZE) {
+        // A post parked by an earlier drain goes first, so posts keep their order
+        if (pending_post_) {
+            pr = *pending_post_;
+            pending_post_.reset();
+        } else if (!post_ring_.pop(pr)) {
+            break;
+        }
         ++post_req_count;
         int ret = -FI_EAGAIN;
 
@@ -1450,10 +1470,11 @@ nixlLibfabricRail::drainPostQueue() {
             // deferred request cannot be executed, continue to the next
             NIXL_ERROR << "Failed to bind accelerator device " << pr.accel.device
                        << " while posting deferred descriptor";
+            clearRefused(pr.dest_addr);
             continue;
         }
 
-        while (ret == -FI_EAGAIN) {
+        for (size_t attempt = 0; ret == -FI_EAGAIN && attempt < POST_EAGAIN_RETRIES; ++attempt) {
             if (pr.type == nixlLibfabricPostRequest::WRITE) {
                 struct iovec iov{};
                 iov.iov_base = pr.local_addr;
@@ -1506,7 +1527,21 @@ nixlLibfabricRail::drainPostQueue() {
             }
         }
 
+        // Still -FI_EAGAIN: park the request and return rather than spin, so the progress thread
+        // can service other rails. A lazily connecting provider may be waiting on a peer that is
+        // itself blocked until this agent progresses another rail. Once the peer has refused
+        // posts for NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S, its posts fail like any other error.
+        if (ret == -FI_EAGAIN &&
+            !refusedTooLong(
+                pr.dest_addr, "drainPostQueue", static_cast<int>(POST_EAGAIN_RETRIES))) {
+            pending_post_ = pr;
+            return NIXL_SUCCESS;
+        }
+
         if (ret != 0) {
+            if (ret != -FI_EAGAIN) {
+                clearRefused(pr.dest_addr); // ended otherwise than by the refusal timeout
+            }
             NIXL_ERROR << "drainPostQueue: post failed ret=" << ret << " (" << fi_strerror(-ret)
                        << ") on rail " << rail_id;
             if (pr.req && pr.req->completion_callback) {
@@ -1519,6 +1554,7 @@ nixlLibfabricRail::drainPostQueue() {
             }
             continue;
         }
+        clearRefused(pr.dest_addr);
         posted++;
         if (posted % POST_POLL_INTERLEAVE_RATIO == 0) {
             pollForCompletions();
@@ -1526,6 +1562,34 @@ nixlLibfabricRail::drainPostQueue() {
     }
 
     return NIXL_SUCCESS;
+}
+
+bool
+nixlLibfabricRail::refusedTooLong(fi_addr_t dest_addr, const char *op, int attempt) const {
+    const auto now = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point since;
+    {
+        const std::lock_guard<std::mutex> lock(refused_mutex_);
+        since = refused_since_.try_emplace(dest_addr, now).first->second;
+        refused_count_.store(refused_since_.size(), std::memory_order_relaxed);
+    }
+    if (post_eagain_timeout_.count() == 0 || now - since < post_eagain_timeout_) {
+        return false;
+    }
+    NIXL_ERROR << op << " on rail " << rail_id << ": fi_addr " << dest_addr
+               << " has refused posts with -FI_EAGAIN for " << post_eagain_timeout_.count() << "s ("
+               << attempt << " attempts on this one); failing it";
+    return true;
+}
+
+void
+nixlLibfabricRail::clearRefused(fi_addr_t dest_addr) const {
+    if (refused_count_.load(std::memory_order_relaxed) == 0) {
+        return; // the common case: no peer is refusing
+    }
+    const std::lock_guard<std::mutex> lock(refused_mutex_);
+    refused_since_.erase(dest_addr);
+    refused_count_.store(refused_since_.size(), std::memory_order_relaxed);
 }
 
 nixl_status_t
@@ -1550,7 +1614,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
                << " dest_addr=" << dest_addr << " remote_addr=" << (void *)remote_addr
                << " remote_key=" << remote_key << " context=" << &req->ctx;
 
-    // Retry indefinitely until writedata succeeds or fails for all providers
+    // Retry until writedata succeeds, fails, or the peer has refused posts for too long
     int ret = -FI_EAGAIN;
     int attempt = 0;
 
@@ -1583,6 +1647,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
 
         if (ret == 0) {
             // Success
+            clearRefused(dest_addr);
             NIXL_TRACE << "RDMA write posted successfully"
                        << (attempt > 0 ? " after " + std::to_string(attempt + 1) + " attempts" :
                                          "");
@@ -1591,8 +1656,12 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
 
         if (ret == -FI_EAGAIN) {
             // SQ full - do inline CQ progress to free slots, then retry
-            // Resource temporarily unavailable - retry indefinitely for all providers
+            // Resource temporarily unavailable - retry, see refusedTooLong()
             attempt++;
+            if ((attempt == 1 || attempt % kRefusedCheckInterval == 0) &&
+                refusedTooLong(dest_addr, "fi_writemsg", attempt)) {
+                return NIXL_ERR_BACKEND;
+            }
 
             // Log every N attempts to avoid log spam
             if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {
@@ -1609,6 +1678,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
                 if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
                     NIXL_ERROR << "progressCompletionQueue failed on rail " << rail_id
                                << " during fi_writemsg retry";
+                    clearRefused(dest_addr);
                     return progress_status;
                 }
                 if (progress_status == NIXL_SUCCESS) {
@@ -1623,6 +1693,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
         }
     }
 
+    clearRefused(dest_addr);
     NIXL_ERROR << "fi_writemsg failed on rail " << rail_id << ": " << fi_strerror(-ret);
     return NIXL_ERR_BACKEND;
 }
@@ -1646,7 +1717,7 @@ nixlLibfabricRail::postRead(void *local_buffer,
                << " dest_addr=" << dest_addr << " remote_addr=" << (void *)remote_addr
                << " remote_key=" << remote_key << " context=" << &req->ctx;
 
-    // Retry indefinitely until readdata succeeds or fails for all providers
+    // Retry until readdata succeeds, fails, or the peer has refused posts for too long
     int ret = -FI_EAGAIN;
     int attempt = 0;
 
@@ -1666,6 +1737,7 @@ nixlLibfabricRail::postRead(void *local_buffer,
 
         if (ret == 0) {
             // Success
+            clearRefused(dest_addr);
             NIXL_TRACE << "RDMA read posted successfully"
                        << (attempt > 0 ? " after " + std::to_string(attempt + 1) + " attempts" :
                                          "");
@@ -1674,8 +1746,12 @@ nixlLibfabricRail::postRead(void *local_buffer,
 
         if (ret == -FI_EAGAIN) {
             // SQ full - do inline CQ progress to free slots, then retry
-            // Resource temporarily unavailable - retry indefinitely for all providers
+            // Resource temporarily unavailable - retry, see refusedTooLong()
             attempt++;
+            if ((attempt == 1 || attempt % kRefusedCheckInterval == 0) &&
+                refusedTooLong(dest_addr, "fi_read", attempt)) {
+                return NIXL_ERR_BACKEND;
+            }
 
             // Log every N attempts to avoid log spam
             if (attempt % NIXL_LIBFABRIC_LOG_INTERVAL_ATTEMPTS == 0) {
@@ -1692,6 +1768,7 @@ nixlLibfabricRail::postRead(void *local_buffer,
                 if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
                     NIXL_ERROR << "progressCompletionQueue failed on rail " << rail_id
                                << " during fi_read retry";
+                    clearRefused(dest_addr);
                     return progress_status;
                 }
                 if (progress_status == NIXL_SUCCESS) {
@@ -1706,6 +1783,7 @@ nixlLibfabricRail::postRead(void *local_buffer,
         }
     }
 
+    clearRefused(dest_addr);
     NIXL_ERROR << "fi_read failed on rail " << rail_id << ": " << fi_strerror(-ret);
     return NIXL_ERR_BACKEND;
 }
@@ -1982,6 +2060,8 @@ nixlLibfabricRail::insertAddress(const void *addr,
     if (prev_agent_idx) {
         *prev_agent_idx = prev;
     }
+    // A (re)connected peer starts with a clean record of refused posts
+    clearRefused(*fi_addr_out);
 
     return NIXL_SUCCESS;
 }
