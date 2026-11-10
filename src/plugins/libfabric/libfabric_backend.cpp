@@ -449,17 +449,6 @@ nixlLibfabricEngine::~nixlLibfabricEngine() {
     NIXL_DEBUG
         << "Destructor starting, stopping all threads FIRST to prevent timing report interruption";
 
-    // Stop the CM thread first: an in-flight reply send may be waiting on the progress
-    // thread to drain its completions, so the progress thread must stop after it.
-    {
-        const std::lock_guard<std::mutex> lock(cm_mutex_);
-        cm_thread_stop_ = true;
-    }
-    cm_cv_.notify_all();
-    if (cm_thread_.joinable()) {
-        cm_thread_.join();
-    }
-
     post_thread_pool_.reset();
     if (progress_thread_enabled_) {
         progress_thread_stop_.store(true);
@@ -509,6 +498,33 @@ nixlLibfabricEngine::getConnInfo(std::string &str) const {
 nixl_status_t
 nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
                                         const std::string &remote_conn_info) {
+    std::shared_ptr<nixlLibfabricConnection> conn_for_handshake;
+    nixl_status_t status =
+        createConnectionFromInfo(remote_agent, remote_conn_info, conn_for_handshake);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
+    if (conn_for_handshake) {
+        nixl_status_t hs = sendHandshakeTo(*conn_for_handshake);
+        if (hs != NIXL_SUCCESS) {
+            NIXL_ERROR << "Handshake send to '" << remote_agent << "' failed with status " << hs
+                       << "; their first transfers to us will land in the pre-handshake bucket";
+            return hs;
+        }
+    }
+
+    NIXL_INFO << "Successfully stored multirail connection for " << remote_agent << " on "
+              << rail_manager_.getNumRails() << " rails";
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlLibfabricEngine::createConnectionFromInfo(
+    const std::string &remote_agent,
+    const std::string &remote_conn_info,
+    std::shared_ptr<nixlLibfabricConnection> &conn_for_handshake) {
+    conn_for_handshake.reset();
 
     NIXL_DEBUG << "Loading remote info for agent: " << remote_agent
                << ", info length=" << remote_conn_info.length() << ", info (hex): "
@@ -532,39 +548,24 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
         return status;
     }
 
-    std::shared_ptr<nixlLibfabricConnection> conn_for_handshake;
-    {
-        std::lock_guard<std::mutex> lock(connection_state_mutex_);
+    std::lock_guard<std::mutex> lock(connection_state_mutex_);
 
-        bool already_exists = (connections_.find(remote_agent) != connections_.end());
-        if (already_exists) {
-            NIXL_INFO << "Connection for " << remote_agent
-                      << " already exists, skipping duplicate loadRemoteConnInfo";
-            return NIXL_SUCCESS;
-        }
-
-        nixl_status_t conn_status = createAgentConnection(remote_agent, data_endpoints);
-        if (conn_status != NIXL_SUCCESS) {
-            NIXL_ERROR << "createAgentConnection failed with status: " << conn_status;
-            return conn_status;
-        }
-
-        if (remote_agent != localAgent) {
-            conn_for_handshake = connections_[remote_agent];
-        }
+    bool already_exists = (connections_.find(remote_agent) != connections_.end());
+    if (already_exists) {
+        NIXL_INFO << "Connection for " << remote_agent
+                  << " already exists, skipping duplicate loadRemoteConnInfo";
+        return NIXL_SUCCESS;
     }
 
-    if (conn_for_handshake) {
-        nixl_status_t hs = sendHandshakeTo(*conn_for_handshake);
-        if (hs != NIXL_SUCCESS) {
-            NIXL_ERROR << "Handshake send to '" << remote_agent << "' failed with status " << hs
-                       << "; their first transfers to us will land in the pre-handshake bucket";
-            return hs;
-        }
+    nixl_status_t conn_status = createAgentConnection(remote_agent, data_endpoints);
+    if (conn_status != NIXL_SUCCESS) {
+        NIXL_ERROR << "createAgentConnection failed with status: " << conn_status;
+        return conn_status;
     }
 
-    NIXL_INFO << "Successfully stored multirail connection for " << remote_agent << " on "
-              << rail_manager_.getNumRails() << " rails";
+    if (remote_agent != localAgent) {
+        conn_for_handshake = connections_[remote_agent];
+    }
     return NIXL_SUCCESS;
 }
 
@@ -598,31 +599,38 @@ nixlLibfabricEngine::connect(const std::string &remote_agent) {
 
 nixl_status_t
 nixlLibfabricEngine::disconnect(const std::string &remote_agent) {
-    std::lock_guard<std::mutex> lock(connection_state_mutex_);
-    auto it = connections_.find(remote_agent);
-    if (it == connections_.end()) {
-        NIXL_WARN << "Disconnect failed. No metadata connection info for " << remote_agent;
-        return NIXL_ERR_NOT_FOUND;
-    }
+    nixl_status_t status;
+    {
+        std::lock_guard<std::mutex> lock(connection_state_mutex_);
+        auto it = connections_.find(remote_agent);
+        if (it == connections_.end()) {
+            NIXL_WARN << "Disconnect failed. No metadata connection info for " << remote_agent;
+            return NIXL_ERR_NOT_FOUND;
+        }
 
-    nixl_status_t status = it->second->disconnect();
-    // The source addresses stay mapped: an invalidation is unordered against the fabric, so the
-    // peer's last writes and notification may still be arriving.
-    const uint32_t agent_idx = static_cast<uint32_t>(it->second->agent_index_);
-    disconnected_agent_idx_[remote_agent] = agent_idx;
-    {
-        const std::lock_guard<std::mutex> tracking_lock(receiver_tracking_mutex_);
-        live_senders_.erase(agent_idx);
+        status = it->second->disconnect();
+        // The source addresses stay mapped: an invalidation is unordered against the fabric, so
+        // the peer's last writes and notification may still be arriving.
+        const uint32_t agent_idx = static_cast<uint32_t>(it->second->agent_index_);
+        disconnected_agent_idx_[remote_agent] = agent_idx;
+        {
+            const std::lock_guard<std::mutex> tracking_lock(receiver_tracking_mutex_);
+            live_senders_.erase(agent_idx);
+        }
+        connections_.erase(it);
+        // Drop queued replies for this peer so teardown never posts toward it
+        {
+            const std::lock_guard<std::mutex> reply_lock(handshake_replies_mutex_);
+            std::erase_if(handshake_replies_,
+                          [&remote_agent](const std::shared_ptr<nixlLibfabricConnection> &pending) {
+                              return pending->remoteAgent_ == remote_agent;
+                          });
+        }
     }
-    connections_.erase(it);
-    // Drop queued replies for this peer so teardown never posts toward it from the CM thread.
-    {
-        const std::lock_guard<std::mutex> cm_lock(cm_mutex_);
-        std::erase_if(pending_replies_,
-                      [&remote_agent](const std::shared_ptr<nixlLibfabricConnection> &pending) {
-                          return pending->remoteAgent_ == remote_agent;
-                      });
-    }
+    // Wait for a reply the progress thread already admitted, which saw the connection still
+    // registered, to finish; any later one finds it gone. Taken after connection_state_mutex_ is
+    // released, the order the progress thread takes them in.
+    { const std::lock_guard<std::mutex> send_lock(handshake_reply_send_mutex_); }
     return status;
 }
 
@@ -2061,6 +2069,7 @@ nixlLibfabricEngine::progressThread() {
             // Don't return error, continue for robustness
         }
         sendQueuedCompletionNotifs();
+        sendQueuedHandshakeReplies();
         // An error pass is not drained: completions may be queued behind the error
         maybeReapStalePendingNotifications(status == NIXL_IN_PROG);
         if (!any_completions) {

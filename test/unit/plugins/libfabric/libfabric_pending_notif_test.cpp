@@ -382,7 +382,7 @@ runStaleNotificationScenario(const string &a_name, const string &b_name) {
 
     b->disconnect(a_name);
     a->disconnect(b_name);
-    // A is the holder replying to B: its CM thread must be gone before B frees its buffers
+    // A is the holder replying to B: its progress thread must be gone before B frees its buffers
     delete a;
     delete b;
 }

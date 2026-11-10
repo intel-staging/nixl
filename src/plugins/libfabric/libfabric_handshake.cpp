@@ -191,6 +191,9 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
     }
 
     if (!conn) {
+        if (handshake_lookup_miss_hook_) {
+            handshake_lookup_miss_hook_(peer_agent_name);
+        }
         {
             std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
             pending_inbound_handshakes_.insert(peer_agent_name);
@@ -205,18 +208,41 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
             NIXL_ERROR << "Connection not found for peer agent: " << peer_agent_name
                        << ", and no piggybacked_conn_info provided in handshake";
             return;
-        } else {
-            nixl_status_t load_status =
-                this->loadRemoteConnInfo(peer_agent_name, piggybacked_conn_info);
-            if (load_status != NIXL_SUCCESS) {
-                NIXL_ERROR << "Failed to loadRemoteConnInfo() received with handshake. "
-                           << "peer agent: " << peer_agent_name
-                           << ", piggybacked_conn_info size: " << piggybacked_conn_info.size();
-            }
-            return; // loadRemoteConnInfo will take care of draining the
-                    // buffered handshake as part of connection creation.
         }
-    } else {
+        // Creating the connection drains the buffered handshake
+        std::shared_ptr<nixlLibfabricConnection> new_conn;
+        nixl_status_t load_status =
+            createConnectionFromInfo(peer_agent_name, piggybacked_conn_info, new_conn);
+        if (load_status != NIXL_SUCCESS) {
+            dropBufferedHandshake(peer_agent_name);
+            NIXL_ERROR << "Failed to load the connection info received with a handshake. "
+                       << "peer agent: " << peer_agent_name
+                       << ", piggybacked_conn_info size: " << piggybacked_conn_info.size();
+            return;
+        }
+        if (new_conn) {
+            replyHandshake(new_conn, "first-contact handshake");
+            return;
+        }
+        // A user thread's loadRemoteConnInfo() created the connection after the lookup above, so
+        // its drain may have run before the buffering: apply the handshake to it here instead.
+        dropBufferedHandshake(peer_agent_name);
+        {
+            std::lock_guard<std::mutex> lock(connection_state_mutex_);
+            auto it = connections_.find(peer_agent_name);
+            if (it != connections_.end() && it->second) {
+                conn = it->second;
+            }
+        }
+        if (!conn) {
+            NIXL_WARN << "Handshake from '" << peer_agent_name
+                      << "' arrived as its connection was created, which is now gone";
+            return;
+        }
+    }
+
+    // Apply the handshake to the known connection
+    {
         {
             std::lock_guard<std::mutex> hlk(conn->handshake_mutex_);
             conn->handshake_received_.store(true, std::memory_order_release);
@@ -241,74 +267,75 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
             }
             NIXL_INFO << "Peer '" << peer_agent_name
                       << "' re-established its side; replying so its handshake wait completes";
-            if (progress_thread_enabled_) {
-                // handleHandshake runs on the progress thread here, and postSend()
-                // retries FI_EAGAIN without draining its own completions when the
-                // progress thread owns them — an inline reply could wedge the only
-                // thread that can make progress. Hand the reply to the CM thread.
-                queueHandshakeReply(conn);
-            } else {
-                nixl_status_t status = sendHandshakeTo(*conn);
-                if (status != NIXL_SUCCESS) {
-                    NIXL_WARN << "Replying to re-establishment handshake from '" << peer_agent_name
-                              << "' failed (non-fatal; re-triggers on the peer's next re-add): "
-                                 "status="
-                              << status;
-                }
-            }
+            replyHandshake(conn, "re-establishment handshake reply");
         }
     }
 }
 
 void
-nixlLibfabricEngine::queueHandshakeReply(std::shared_ptr<nixlLibfabricConnection> conn) {
-    {
-        const std::lock_guard<std::mutex> lock(cm_mutex_);
-        if (cm_thread_stop_) {
-            return; // engine teardown; the peer's next re-add re-triggers the reply
-        }
-        pending_replies_.push_back(std::move(conn));
-        if (!cm_thread_.joinable()) {
-            cm_thread_ = std::thread(&nixlLibfabricEngine::cmThread, this);
-        }
-    }
-    cm_cv_.notify_one();
-}
-
-void
-nixlLibfabricEngine::cmThread() {
-    while (true) {
-        std::shared_ptr<nixlLibfabricConnection> conn;
+nixlLibfabricEngine::replyHandshake(const std::shared_ptr<nixlLibfabricConnection> &conn,
+                                    const char *what) {
+    if (progress_thread_enabled_) {
+        // handleHandshake runs inside the progress thread's CQ processing, which must not post: a
+        // send refused with FI_EAGAIN would wait for completions only this thread reaps. Queue it
+        // for that thread to send after its CQ pass.
         {
-            std::unique_lock<std::mutex> lock(cm_mutex_);
-            cm_cv_.wait(lock, [this]() { return cm_thread_stop_ || !pending_replies_.empty(); });
-            if (cm_thread_stop_) {
-                return; // pending replies are dropped: teardown makes them moot
-            }
-            conn = std::move(pending_replies_.front());
-            pending_replies_.pop_front();
+            const std::lock_guard<std::mutex> lock(handshake_replies_mutex_);
+            handshake_replies_.push_back(conn);
         }
-        if (cm_thread_stop_) {
-            continue; // teardown started: drop the popped reply
+        handshake_replies_pending_.store(true, std::memory_order_release);
+        return;
+    }
+    nixl_status_t status = sendHandshakeTo(*conn);
+    if (status != NIXL_SUCCESS) {
+        NIXL_WARN << what << " to '" << conn->remoteAgent_ << "' failed with status " << status
+                  << "; the peer's handshake wait will time out unless it re-adds us";
+    }
+}
+
+void
+nixlLibfabricEngine::sendQueuedHandshakeReplies() {
+    if (!handshake_replies_pending_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::vector<std::shared_ptr<nixlLibfabricConnection>> due;
+    {
+        const std::lock_guard<std::mutex> lock(handshake_replies_mutex_);
+        due.swap(handshake_replies_);
+        handshake_replies_pending_.store(false, std::memory_order_relaxed);
+    }
+    // This thread progresses the CQs, so a send refused with -FI_EAGAIN progresses them itself.
+    // A handshake arriving meanwhile queues its reply for the next pass.
+    const nixlLibfabricRail::ProgressOnEagainScope progress_on_eagain;
+    for (const auto &conn : due) {
+        if (progress_thread_stop_.load()) {
+            NIXL_DEBUG << "Engine shutting down; dropping the remaining handshake replies";
+            return;
         }
-        // DISCONNECTED is also the pre-connect state of a live registration, so the
-        // state cannot decide this: only a registration that is gone (disconnect()
-        // removes it) means no reply. An unconnected holder still owes one — nothing
-        // else completes the re-establishing peer's wait.
+        // Across the check and the send, so disconnect() waits for this reply to finish
+        const std::lock_guard<std::mutex> send_lock(handshake_reply_send_mutex_);
+        // DISCONNECTED is also the pre-connect state of a live registration, so the state cannot
+        // decide this: only a registration that is gone (disconnect() removes it) means no reply.
+        // An unconnected holder still owes one: nothing else completes the peer's wait.
         {
             std::lock_guard<std::mutex> lock(connection_state_mutex_);
             auto it = connections_.find(conn->remoteAgent_);
             if (it == connections_.end() || it->second != conn) {
-                NIXL_DEBUG << "Skipping re-establishment reply to '" << conn->remoteAgent_
+                NIXL_DEBUG << "Skipping handshake to '" << conn->remoteAgent_
                            << "': connection no longer registered";
                 continue;
             }
         }
         nixl_status_t status = sendHandshakeTo(*conn);
         if (status != NIXL_SUCCESS) {
-            NIXL_WARN << "Replying to re-establishment handshake from '" << conn->remoteAgent_
-                      << "' failed (non-fatal; re-triggers on the peer's next re-add): status="
-                      << status;
+            NIXL_WARN << "Handshake to '" << conn->remoteAgent_ << "' failed with status " << status
+                      << "; the peer's handshake wait will time out unless it re-adds us";
         }
     }
+}
+
+void
+nixlLibfabricEngine::dropBufferedHandshake(const std::string &peer_agent_name) {
+    std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
+    pending_inbound_handshakes_.erase(peer_agent_name);
 }
