@@ -395,7 +395,15 @@ getPluginDir() {
         NIXL_ERROR << "Failed to get plugin directory from dladdr";
         return "";
     }
-    return (std::filesystem::path(info.dli_fname).parent_path() / "plugins").string();
+    // The default directory only exists in an install tree. A build tree finds its plugins through
+    // the NIXL_USE_PLUGIN_FILE list or NIXL_PLUGIN_DIR, so a missing default is not an error.
+    const auto default_dir = std::filesystem::path(info.dli_fname).parent_path() / "plugins";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(default_dir, ec)) {
+        NIXL_DEBUG << "Default plugin directory " << default_dir << " not found, skipping";
+        return "";
+    }
+    return default_dir.string();
 }
 } // namespace
 
