@@ -119,7 +119,7 @@ public:
     const std::string remote_agent_;
     bool has_notif = false; // prepXfer()/postXfer() set it only when given opt_args
     // A notified WRITE whose posting failed partway, so the notification postXfer() would have
-    // sent was not; notifXferFailure() sends it after the failure notice
+    // sent was not; notifXferFailure() sends it once the failure notice has been delivered
     bool notif_deferred = false;
     uint32_t total_notif_msg_len; // Total length of notification message across all fragments
 
@@ -228,6 +228,35 @@ private:
         uint16_t xfer_id = 0;
         std::shared_ptr<nixlLibfabricBackendH::CompletionNotifResult> result;
     };
+
+    // A failed notified WRITE's report to its target (notifXferFailure()): the transfer-error
+    // message, resent until its own send completes, then the notification still owed, if any.
+    // Driven without blocking by driveXferFailureReports(), on the progress thread or, without
+    // one, from checkXfer() and getNotifs(). Values only, so the handle may be released meanwhile.
+    struct XferFailureReport {
+        enum : int { kSendPending = 0, kSendOk = 1, kSendFailed = 2 };
+
+        std::string remote_agent;
+        uint16_t xfer_id = 0;
+        uint32_t final_completions = 0;
+        bool send_notif = false;
+        std::vector<BinaryNotification> fragments;
+        uint32_t total_len = 0;
+        int attempt = 0; // messages posted so far
+        bool warned = false; // a failure has been logged; later ones are not
+        // Outcome of the attempt in flight, set by its send completion; null when none is
+        std::shared_ptr<std::atomic<int>> outcome;
+        std::chrono::steady_clock::time_point next_try; // no attempt before
+        std::chrono::steady_clock::time_point deadline; // no new attempt after
+    };
+
+    static constexpr std::chrono::milliseconds kXferErrorResendBackoff{100};
+
+    mutable std::mutex failure_reports_mutex_;
+    mutable std::vector<XferFailureReport> failure_reports_;
+    mutable std::atomic<bool> failure_reports_pending_{false};
+    // Held by the thread driving the reports, so they are stepped by one thread at a time
+    mutable std::mutex failure_reports_drive_mutex_;
 
     mutable std::mutex completion_notifs_mutex_;
     mutable std::vector<CompletionNotif> completion_notifs_;
@@ -390,19 +419,35 @@ private:
                   uint32_t expected_completions,
                   bool may_reconnect = true) const;
 
-    // Tell the target that notif_xfer_id failed on this side and that only final_completions of
-    // its writes will arrive, so it stops waiting for the rest.
+    // Post one message telling the target that notif_xfer_id failed on this side and that only
+    // final_completions of its writes will arrive, so it stops waiting for the rest. @p on_send
+    // gets its send completion's status. NIXL_ERR_NOT_FOUND without a connection,
+    // NIXL_ERR_NOT_ALLOWED when no control request is free.
     nixl_status_t
     notifXferErrorPriv(const std::string &remote_agent,
                        uint16_t notif_xfer_id,
-                       uint32_t final_completions) const;
+                       uint32_t final_completions,
+                       std::function<void(nixl_status_t)> on_send) const;
+
+    // One step of a failure report: wait for the attempt in flight, send the owed notification
+    // once the error message is delivered, or post the next attempt after a backoff, until the
+    // post -FI_EAGAIN timeout (60 s when that is 0) has passed. True when the report is finished.
+    bool
+    stepXferFailureReport(XferFailureReport &report,
+                          std::chrono::steady_clock::time_point now) const;
+
+    // Step every queued failure report; never waits
+    void
+    driveXferFailureReports() const;
 
     // Receiver-side handler for NIXL_LIBFABRIC_MSG_XFER_ERROR
     void
     handleXferError(uint16_t notif_xfer_id, uint32_t sender_peer_idx, uint32_t final_completions);
 
-    // Tell the target once that this transfer failed, so it stops waiting for writes that never
-    // went out. With notify-after-completion, also sends the notification it was still owed.
+    // Queue the report (XferFailureReport) telling the target once that this transfer failed, so
+    // it stops waiting for writes that never went out, followed by the notification still owed
+    // with notify-after-completion or after a partial post. The notification is sent only once
+    // the error message has been delivered. Returns without waiting.
     // Called only from checkXfer: an asynchronous post failure must not turn postXfer into an
     // error.
     void

@@ -614,6 +614,11 @@ public:
         post_eagain_timeout_ = timeout;
     }
 
+    std::chrono::seconds
+    getPostEagainTimeout() const {
+        return post_eagain_timeout_;
+    }
+
     /** Check if progress thread is enabled for this rail */
     bool
     isProgressThreadEnabled() const {
