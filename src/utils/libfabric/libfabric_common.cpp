@@ -630,14 +630,45 @@ getNumConfiguredNumaNodes(int &node_count) {
 static std::atomic<uint16_t> g_xfer_id_counter{1}; // 16-bit XFER_ID counter, start from 1
 static std::atomic<uint8_t> g_seq_id_counter{0}; // 4-bit SEQ_ID counter, start from 0
 
+// One bit per XFER_ID reserved by reserveXferId(), and how many are, so getNextXferId() only
+// reads the bitmap while some are
+static std::array<std::atomic<uint64_t>, 65536 / 64> g_reserved_xfer_ids{};
+static std::atomic<uint32_t> g_reserved_xfer_id_count{0};
+
+static bool
+isReservedXferId(uint16_t xfer_id) {
+    return (g_reserved_xfer_ids[xfer_id / 64].load(std::memory_order_acquire) >> (xfer_id % 64)) &
+        1;
+}
+
 uint16_t
 getNextXferId() {
-    // The 16-bit counter wraps by itself; only NIXL_UNTRACKED_XFER_ID (0) is skipped.
+    // The 16-bit counter wraps by itself; NIXL_UNTRACKED_XFER_ID (0) and reserved IDs are
+    // skipped. Should every ID be reserved, one is reused rather than spin forever.
     uint16_t xfer_id;
+    size_t skipped = 0;
     do {
         xfer_id = g_xfer_id_counter.fetch_add(1);
-    } while (xfer_id == NIXL_UNTRACKED_XFER_ID);
+    } while (xfer_id == NIXL_UNTRACKED_XFER_ID ||
+             (g_reserved_xfer_id_count.load(std::memory_order_acquire) != 0 &&
+              isReservedXferId(xfer_id) && ++skipped < 65536));
     return xfer_id;
+}
+
+void
+reserveXferId(uint16_t xfer_id) {
+    const uint64_t bit = uint64_t{1} << (xfer_id % 64);
+    if ((g_reserved_xfer_ids[xfer_id / 64].fetch_or(bit, std::memory_order_acq_rel) & bit) == 0) {
+        g_reserved_xfer_id_count.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+void
+releaseXferId(uint16_t xfer_id) {
+    const uint64_t bit = uint64_t{1} << (xfer_id % 64);
+    if ((g_reserved_xfer_ids[xfer_id / 64].fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0) {
+        g_reserved_xfer_id_count.fetch_sub(1, std::memory_order_acq_rel);
+    }
 }
 
 uint8_t

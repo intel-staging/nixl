@@ -1193,11 +1193,11 @@ nixlLibfabricRailManager::cleanupConnection(const std::vector<fi_addr_t> &fi_add
 }
 
 nixl_status_t
-nixlLibfabricRailManager::postControlMessage(
-    ControlMessageType msg_type,
-    nixlLibfabricReq *req,
-    fi_addr_t dest_addr,
-    std::function<void(nixl_status_t)> completion_callback) {
+nixlLibfabricRailManager::postControlMessage(ControlMessageType msg_type,
+                                             nixlLibfabricReq *req,
+                                             fi_addr_t dest_addr,
+                                             std::function<void(nixl_status_t)> completion_callback,
+                                             bool single_attempt) {
     // Validation - use rail 0 for notifications
     if (rails_.empty()) {
         NIXL_ERROR << "No rails available";
@@ -1240,11 +1240,13 @@ nixlLibfabricRailManager::postControlMessage(
                << " imm_data=" << imm_data << " dest_addr=" << dest_addr << " on rail " << rail_id;
 
     // Use rail 0 for notifications
-    nixl_status_t status = rails_[rail_id]->postSend(imm_data, dest_addr, req);
+    nixl_status_t status = rails_[rail_id]->postSend(imm_data, dest_addr, req, single_attempt);
 
     if (status != NIXL_SUCCESS) {
-        NIXL_ERROR << "Failed to send control message type " << static_cast<int>(msg_type)
-                   << " on rail " << rail_id;
+        if (status != NIXL_ERR_NOT_ALLOWED) { // a single attempt refused with -FI_EAGAIN
+            NIXL_ERROR << "Failed to send control message type " << static_cast<int>(msg_type)
+                       << " on rail " << rail_id;
+        }
         // Release the pre-allocated control request back to pool on failure
         rails_[rail_id]->releaseRequest(req);
         return status;

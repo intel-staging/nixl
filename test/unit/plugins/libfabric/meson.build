@@ -64,3 +64,12 @@ libfabric_handshake_race_test = executable('libfabric_handshake_race_test',
         install: true)
 
 test('libfabric_handshake_race_test', libfabric_handshake_race_test, timeout: 120)
+
+libfabric_xfer_error_test = executable('libfabric_xfer_error_test',
+        'libfabric_xfer_error_test.cpp',
+        dependencies: libfabric_backend_test_dep,
+        include_directories: libfabric_test_include_directories,
+        cpp_args: ['-DHAVE_LIBFABRIC'],
+        install: true)
+
+test('libfabric_xfer_error_test', libfabric_xfer_error_test, timeout: 120)
