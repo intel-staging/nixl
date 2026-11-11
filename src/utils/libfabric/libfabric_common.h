@@ -310,9 +310,16 @@ template<typename T, typename U = T> struct pair_hash {
 
 // Global XFER_ID management
 namespace LibfabricUtils {
-// Get next unique XFER_ID
+// Get next unique XFER_ID, skipping reserved ones
 uint16_t
 getNextXferId();
+// Keep getNextXferId() from handing out @p xfer_id until releaseXferId(): for an XFER_ID that a
+// queued message may still refer to on the target, so a newer transfer does not take it after
+// the 16-bit counter wraps. Not counted: reserve an ID at most once at a time.
+void
+reserveXferId(uint16_t xfer_id);
+void
+releaseXferId(uint16_t xfer_id);
 // Get next 4-bit SEQ_ID
 uint8_t
 getNextSeqId();

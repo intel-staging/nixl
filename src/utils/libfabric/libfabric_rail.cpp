@@ -1335,7 +1335,10 @@ nixlLibfabricRail::postRecv(nixlLibfabricReq *req) const {
 }
 
 nixl_status_t
-nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLibfabricReq *req) {
+nixlLibfabricRail::postSend(uint64_t immediate_data,
+                            fi_addr_t dest_addr,
+                            nixlLibfabricReq *req,
+                            bool single_attempt) {
     if (req->buffer_size == 0 || req->buffer_size > NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE) {
         NIXL_ERROR << "Invalid message size=" << req->buffer_size
                    << " (max: " << NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE << ")";
@@ -1375,6 +1378,12 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
                        << (attempt > 0 ? " after " + std::to_string(attempt + 1) + " attempts" :
                                          "");
             return NIXL_SUCCESS;
+        }
+
+        if (ret == -FI_EAGAIN && single_attempt) {
+            NIXL_TRACE << "fi_senddata returned EAGAIN on rail " << rail_id
+                       << "; single attempt, not retrying";
+            return NIXL_ERR_NOT_ALLOWED;
         }
 
         if (ret == -FI_EAGAIN) {

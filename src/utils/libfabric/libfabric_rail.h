@@ -544,9 +544,14 @@ public:
     nixl_status_t
     postRecv(nixlLibfabricReq *req) const;
 
-    /** Post send operation with immediate data */
+    /** Post send operation with immediate data. Retries -FI_EAGAIN until the destination has
+     *  refused posts for post_eagain_timeout_; with @p single_attempt, returns
+     *  NIXL_ERR_NOT_ALLOWED on the first -FI_EAGAIN instead, so the caller never waits. */
     nixl_status_t
-    postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLibfabricReq *req);
+    postSend(uint64_t immediate_data,
+             fi_addr_t dest_addr,
+             nixlLibfabricReq *req,
+             bool single_attempt = false);
 
     /** Post RDMA write operation with immediate data; remote_cq_data false (a transfer without a
      *  notification) posts it without FI_REMOTE_CQ_DATA */
@@ -612,6 +617,11 @@ public:
     void
     setPostEagainTimeout(std::chrono::seconds timeout) {
         post_eagain_timeout_ = timeout;
+    }
+
+    std::chrono::seconds
+    getPostEagainTimeout() const {
+        return post_eagain_timeout_;
     }
 
     /** Check if progress thread is enabled for this rail */

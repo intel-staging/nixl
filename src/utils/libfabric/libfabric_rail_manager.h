@@ -314,13 +314,15 @@ public:
      * @param req Control request with data buffer
      * @param dest_addr Destination address
      * @param completion_callback Optional completion callback
-     * @return NIXL_SUCCESS on success, error code on failure
+     * @param single_attempt Do not retry -FI_EAGAIN: return NIXL_ERR_NOT_ALLOWED at once
+     * @return NIXL_SUCCESS on success, error code on failure; the request is released on failure
      */
     nixl_status_t
     postControlMessage(ControlMessageType msg_type,
                        nixlLibfabricReq *req,
                        fi_addr_t dest_addr,
-                       std::function<void(nixl_status_t)> completion_callback = nullptr);
+                       std::function<void(nixl_status_t)> completion_callback = nullptr,
+                       bool single_attempt = false);
     // Progress APIs
     /** Process completions on active rails only (optimized for CPU overhead)
      * @return NIXL_SUCCESS if completions processed, NIXL_IN_PROG if none, error on failure

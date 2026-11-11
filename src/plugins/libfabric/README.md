@@ -175,7 +175,19 @@ Notes specific to verbs:
   soon as the progress thread reaps the last completion; without one, from the `postXfer()` or
   `checkXfer()` call that sees the transfer complete, as a READ's notification does. A WRITE that
   fails sends the target a transfer-error message and then the notification, which the target
-  releases with a warning that the data is incomplete, as on other providers.
+  releases with a warning that the data is incomplete, as on other providers. `checkXfer()`
+  returns the error at once; the report goes out in the background (on the progress thread, or
+  without one from later `checkXfer()` and `getNotifs()` calls). The transfer-error message is
+  resent until its send completes, since the failed write may have broken the connection it
+  travels on and flushed it, and the notification follows only once it has, so the target never
+  takes a failed transfer's notification for a successful one. The message is sent once more
+  right before the notification, in case the target has meanwhile dropped what it recorded (after
+  `pending_notif_timeout`). If the message is not delivered within the post `-FI_EAGAIN` timeout,
+  neither is the notification: the target application does not hear of that transfer. Every post
+  of the report is a single attempt, retried 100 ms later if refused, so it never holds up the
+  progress thread; a report goes only to the connection its transfer used, and is dropped if that
+  agent disconnects; and its XFER_ID is not reused by a newer transfer until it is finished. A send completion means the peer acknowledged the message on verbs;
+  on tcp it only means the socket took it.
   - The notification travels on rail 0, possibly through a different NIC than the data. The
     initiator's completion of a write means the target NIC has acknowledged it, and the target
     relies on that NIC having written the data before it acknowledged, as the UCX backend does
@@ -287,6 +299,9 @@ shorter) once a progress pass finds the completion queues empty, or after four i
 How long, in seconds, a destination may keep refusing posts with -FI_EAGAIN before posts to it fail,
 so a transfer to a peer that is gone fails instead of hanging. Defaults to 60; 0 retries forever.
 Also the `post_eagain_timeout` backend parameter; the environment variable takes precedence.
+It also bounds how long a failed WRITE's transfer-error message is resent (60 s when it is 0).
+With 0, a single post that keeps being refused still retries forever, on the progress thread or,
+without one, in the calling thread.
 
 ### Summary
 
