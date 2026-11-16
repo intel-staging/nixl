@@ -900,8 +900,8 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         NIXL_ERROR << "postXfer called without a prepared request";
         return NIXL_ERR_INVALID_PARAM;
     }
-    if (ofi_req->wr_id.load() != 0) {
-        NIXL_ERROR << "Request reposted with " << ofi_req->wr_id.load() << " operations outstanding";
+    if (ofi_req->pending() != 0) {
+        NIXL_ERROR << "Request reposted with " << ofi_req->pending() << " operations outstanding";
         return NIXL_ERR_REPOST_ACTIVE;
     }
     ofi_req->failed.store(false);
@@ -936,7 +936,7 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         if (!use_inject) {
             op_context = new nixlOfiOpContext{ofi_req};
             // count before posting so a fast completion can never underflow the counter
-            ofi_req->wr_id.fetch_add(1);
+            ofi_req->state.fetch_add(1);
         }
 
         nixl_status_t post_status;
@@ -961,7 +961,7 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
             // handle stays valid until the agent releases it
             if (op_context) {
                 delete op_context;
-                ofi_req->wr_id.fetch_sub(1);
+                ofi_req->state.fetch_sub(1);
             }
             ofi_req->failed.store(true);
             return post_status;
@@ -970,7 +970,7 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
 
     // NIXL_SUCCESS from postXfer means the transfer already finished, and the agent then
     // never calls checkXfer. Report posted-but-uncompleted operations as in progress.
-    return ofi_req->wr_id.load() == 0 ? NIXL_SUCCESS : NIXL_IN_PROG;
+    return ofi_req->pending() == 0 ? NIXL_SUCCESS : NIXL_IN_PROG;
 }
 
 void nixlOfiEngine::connectionProgressFunc() {
@@ -1066,7 +1066,7 @@ void nixlOfiEngine::completeOp(void *op_context, bool error) {
     if (error) {
         req->failed.store(true);
     }
-    if (req->wr_id.fetch_sub(1) == 1 && req->released.load() && !req->freed.exchange(true)) {
+    if (req->state.fetch_sub(1) == (nixlOfiRequest::RELEASED | 1)) {
         delete req;
     }
 }
@@ -1132,7 +1132,7 @@ nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    if (ofi_req->wr_id.load() > 0) {
+    if (ofi_req->pending() > 0) {
         int ret = ofi_progress_manual(ofi_req->cq);
         if (ret < 0 && ret != -FI_EAGAIN) {
             return NIXL_ERR_BACKEND;
@@ -1142,7 +1142,7 @@ nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
     if (ofi_req->failed.load()) {
         return NIXL_ERR_BACKEND;
     }
-    return ofi_req->wr_id.load() == 0 ? NIXL_SUCCESS : NIXL_IN_PROG;
+    return ofi_req->pending() == 0 ? NIXL_SUCCESS : NIXL_IN_PROG;
 }
 
 nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
@@ -1153,22 +1153,22 @@ nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
 
     // RMA operations cannot be cancelled; give outstanding ones a bounded time to finish
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (ofi_req->wr_id.load() > 0 && !shutdownFlag_.load() &&
+    while (ofi_req->pending() > 0 && !shutdownFlag_.load() &&
            std::chrono::steady_clock::now() < deadline) {
         if (ofi_progress_manual(ofi_req->cq) == -FI_EAGAIN) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
 
-    uint64_t remaining = ofi_req->wr_id.load();
+    uint64_t remaining = ofi_req->pending();
     if (remaining > 0 && !shutdownFlag_.load()) {
         NIXL_WARN << "Releasing request with " << remaining
                   << " pending operations; it is freed when they complete";
     }
 
-    // whoever sees the request idle after it was released frees it, exactly once
-    ofi_req->released.store(true);
-    if (ofi_req->wr_id.load() == 0 && !ofi_req->freed.exchange(true)) {
+    // Mark released and read the count in one step. If operations are still outstanding,
+    // the last completion deletes the request, so it must not be touched after this.
+    if (ofi_req->state.fetch_or(nixlOfiRequest::RELEASED) == 0) {
         delete ofi_req;
     }
     return NIXL_SUCCESS;
