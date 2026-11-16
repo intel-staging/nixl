@@ -1258,8 +1258,8 @@ nixl_status_t nixlOfiEngine::loadRemoteMD(const nixlBlobDesc &input, const nixl_
         std::string key_str(input.metaInfo.begin(), input.metaInfo.end());
         uint64_t remote_key = std::stoull(key_str);
         
-        // validate remote key before storing
-        if (remote_key == 0 || remote_key == UINT64_MAX) {
+        // 0 is a valid key (tcp hands it out); FI_KEY_NOTAVAIL is not
+        if (remote_key == FI_KEY_NOTAVAIL) {
             delete remote_meta;
             NIXL_ERROR << "Invalid remote memory key: " << remote_key;
             return NIXL_ERR_INVALID_PARAM;
