@@ -41,11 +41,19 @@ if enabled_plugins.get('LIBFABRIC')
     endif
 endif
 
+# OFI includes habanalabs/synapse_api.h, so it needs the SynapseAI headers to build.
+has_synapse_api = meson.get_compiler('cpp').has_header('habanalabs/synapse_api.h')
 if enabled_plugins.get('OFI')
-    if not libfabric_dep.found() and is_explicit_enable
-        error('OFI plugin requested but libfabric dependency not found')
-    elif libfabric_dep.found()
+    if (not libfabric_dep.found() or not has_synapse_api) and is_explicit_enable
+        if not libfabric_dep.found()
+            error('OFI plugin requested but libfabric dependency not found')
+        else
+            error('OFI plugin requested but SynapseAI header habanalabs/synapse_api.h not found')
+        endif
+    elif libfabric_dep.found() and has_synapse_api
         subdir('ofi')
+    elif libfabric_dep.found()
+        message('SynapseAI header habanalabs/synapse_api.h not found, skipping OFI plugin')
     endif
 endif
 
