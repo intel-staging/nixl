@@ -212,6 +212,10 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
 
     // detect HMEM capabilities for this provider
     detectHmemCapabilities(fi_, providerName_, hmemSynapseaiSupported_);
+    if (hmemSynapseaiSupported_ && !loadSynapseAI()) {
+        NIXL_INFO << "SynapseAI runtime not found; VRAM_SEG is not supported";
+        hmemSynapseaiSupported_ = false;
+    }
 
     ret = fi_fabric(fi_->fabric_attr, &fabric_, nullptr);
     if (ret) {
@@ -736,9 +740,9 @@ nixl_status_t nixlOfiEngine::registerMem(const nixlBlobDesc &mem,
         if (iface == FI_HMEM_SYNAPSEAI) {
             status = registerSynapseAIMemoryExplicit(mem, ofi_meta);
         } else {
-            // VRAM requested but no device interface available - fallback
-            NIXL_WARN << "VRAM requested but no HMEM interface available - falling back to system memory";
-            status = registerDramMemory(mem, ofi_meta);
+            // registering the device pointer as host memory would hand the NIC an invalid buffer
+            NIXL_ERROR << "VRAM registration needs SynapseAI, which is not available";
+            status = NIXL_ERR_NOT_SUPPORTED;
         }
     }
 
@@ -1644,6 +1648,43 @@ nixl_status_t nixlOfiEngine::registerDramMemory(const nixlBlobDesc &mem, nixlOfi
     return NIXL_SUCCESS;
 }
 
+// Loads the SynapseAI runtime once. Returns false when it is not installed.
+bool nixlOfiEngine::loadSynapseAI() {
+    std::lock_guard<std::mutex> lock(synapseai_init_mutex_);
+    if (synapseai_ops_.synDeviceGetInfoV2 && synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd) {
+        return true;
+    }
+
+    if (!synapseai_handle_) {
+        synapseai_handle_ = dlopen("libSynapse.so", RTLD_NOW);
+        if (!synapseai_handle_) {
+            NIXL_DEBUG << "failed to dlopen libSynapse.so: " << dlerror();
+            return false;
+        }
+    }
+    synapseai_ops_.synDeviceGetInfoV2 =
+        (synStatus (*)(const synDeviceId, synDeviceInfoV2 *))dlsym(synapseai_handle_, "synDeviceGetInfoV2");
+    if (!synapseai_ops_.synDeviceGetInfoV2) {
+        NIXL_ERROR << "failed to find synDeviceGetInfoV2: " << dlerror();
+        return false;
+    }
+
+    if (!hlthunk_handle_) {
+        hlthunk_handle_ = dlopen("libhl-thunk.so", RTLD_NOW);
+        if (!hlthunk_handle_) {
+            NIXL_DEBUG << "failed to dlopen libhl-thunk.so: " << dlerror();
+            return false;
+        }
+    }
+    synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd =
+        (int (*)(int, uint64_t, uint64_t, uint64_t, uint32_t))dlsym(hlthunk_handle_, "hlthunk_device_mapped_memory_export_dmabuf_fd");
+    if (!synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd) {
+        NIXL_ERROR << "failed to find hlthunk_device_mapped_memory_export_dmabuf_fd: " << dlerror();
+        return false;
+    }
+    return true;
+}
+
 nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const {
     // Try to get device info from the memory descriptor first
     // If mem.devId is a valid SynapseAI device handle, use it directly
@@ -1653,44 +1694,19 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
     // Try to get device info directly using the device ID from memory descriptor
     NIXL_DEBUG << "Attempting to get device info for device ID: " << device_id;
     
-    // thread-safe initialization of static handles
+    if (!loadSynapseAI()) {
+        NIXL_ERROR << "SynapseAI runtime not available; cannot register VRAM";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    // serialize registrations that use the shared SynapseAI handles
     std::lock_guard<std::mutex> lock(synapseai_init_mutex_);
-    
-    // load synapseAI library functions (shared across instances)
-    if (!synapseai_handle_) {
-        synapseai_handle_ = dlopen("libSynapse.so", RTLD_NOW);
-        if (!synapseai_handle_) {
-            NIXL_ERROR << "failed to dlopen libSynapse.so: " << dlerror();
-            return NIXL_ERR_BACKEND;
-        }
-        
-        synapseai_ops_.synDeviceGetInfoV2 = 
-            (synStatus (*)(const synDeviceId, synDeviceInfoV2 *))dlsym(synapseai_handle_, "synDeviceGetInfoV2");
-        if (!synapseai_ops_.synDeviceGetInfoV2) {
-            NIXL_ERROR << "failed to find synDeviceGetInfoV2: " << dlerror();
-            return NIXL_ERR_BACKEND;
-        }
-    }
-    
-    if (!hlthunk_handle_) {
-        hlthunk_handle_ = dlopen("libhl-thunk.so", RTLD_NOW);
-        if (!hlthunk_handle_) {
-            NIXL_ERROR << "failed to dlopen libhl-thunk.so: " << dlerror();
-            return NIXL_ERR_BACKEND;
-        }
-        
-        synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd = 
-            (int (*)(int, uint64_t, uint64_t, uint64_t, uint32_t))dlsym(hlthunk_handle_, "hlthunk_device_mapped_memory_export_dmabuf_fd");
-        if (!synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd) {
-            NIXL_ERROR << "failed to find hlthunk_device_mapped_memory_export_dmabuf_fd: " << dlerror();
-            return NIXL_ERR_BACKEND;
-        }
-    }
-    
+
     // Check if device is available first
     if (synapseai_ops_.synDeviceGetInfoV2(device_id, &device_info) != synSuccess) {
-        NIXL_INFO << "SynapseAI device " << device_id << " not available, falling back to DRAM registration";
-        return registerDramMemory(mem, ofi_meta);
+        // registering the device pointer as host memory would hand the NIC an invalid buffer
+        NIXL_ERROR << "SynapseAI device " << device_id << " not available; cannot register VRAM";
+        return NIXL_ERR_NOT_SUPPORTED;
     }
     
     NIXL_INFO << "Using existing SynapseAI device (PyTorch initialized) ID: " << device_id;
