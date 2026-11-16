@@ -292,14 +292,6 @@ cleanup_teardown:
     this->initErr = true;
 }
 
-void nixlOfiEngine::getStringParam(const nixlBackendInitParams* init_params, const std::string& key, std::string& value) {
-    const auto &params = getCustomParams();
-    auto it = params.find(key);
-    if (it != params.end()) {
-        value = it->second;
-    }
-}
-
 void nixlOfiEngine::getLongParam(const nixlBackendInitParams* init_params, const std::string& key, long& value, long min_val, long max_val) {
     const auto &params = getCustomParams();
     auto it = params.find(key);
@@ -313,20 +305,6 @@ void nixlOfiEngine::getLongParam(const nixlBackendInitParams* init_params, const
             }
         } catch (const std::exception& e) {
             NIXL_WARN << "Invalid " << key << " parameter: " << it->second << ", using default " << value;
-        }
-    }
-}
-
-void nixlOfiEngine::getSizeTParam(const nixlBackendInitParams* init_params, const std::string& key, size_t& value) {
-    const auto &params = getCustomParams();
-    auto it = params.find(key);
-    if (it != params.end()) {
-        try {
-            size_t parsed_val = std::stoull(it->second);
-            value = parsed_val;
-            NIXL_DEBUG << "Set " << key << " to " << value;
-        } catch (const std::exception& e) {
-            NIXL_WARN << "Invalid " << key << ": " << it->second << ", keeping default " << value;
         }
     }
 }
