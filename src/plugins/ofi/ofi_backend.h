@@ -45,8 +45,11 @@ class nixlOfiMetadata : public nixlBackendMD {
 public:
     fid_mr *mr;
     void *desc;
+    // Start of the registered region. Without FI_MR_VIRT_ADDR the provider addresses
+    // remote memory by offset from it, so it is published with the key.
+    uint64_t base;
 
-    nixlOfiMetadata() : nixlBackendMD(false), mr(nullptr), desc(nullptr) { }
+    nixlOfiMetadata() : nixlBackendMD(false), mr(nullptr), desc(nullptr), base(0) { }
     ~nixlOfiMetadata() { }
 };
 
