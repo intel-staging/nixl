@@ -57,6 +57,15 @@ void* nixlOfiEngine::hlthunk_handle_ = nullptr;
 nixlOfiEngine::synapseai_ops nixlOfiEngine::synapseai_ops_ = {};
 static std::mutex synapseai_init_mutex_;
 
+// Notifications are not implemented (see README.md). Say so once rather than drop them silently.
+static void
+warnNotifDropped() {
+    static std::once_flag flag;
+    std::call_once(flag, [] {
+        NIXL_WARN << "OFI backend does not implement notifications; notification messages are dropped";
+    });
+}
+
 // progress rate limiting constant
 const std::chrono::milliseconds nixlOfiEngine::PROGRESS_INTERVAL{1};
 
@@ -482,10 +491,9 @@ nixl_status_t nixlOfiEngine::getNotifs(notif_list_t &notif_list) {
 }
 
 nixl_status_t nixlOfiEngine::genNotif(const std::string &remote_agent, const std::string &msg) const {
-    // TODO: Implement actual OFI notification sending mechanism
-    // This could use fi_send with a special notification message format
-    // For now, return success as a no-op to satisfy the interface
-    NIXL_DEBUG << "OFI genNotif stub called for agent " << remote_agent << " with message: " << msg;
+    // TODO: send notifications, e.g. with fi_send in a dedicated message format
+    warnNotifDropped();
+    NIXL_DEBUG << "OFI genNotif dropped for agent " << remote_agent << " with message: " << msg;
     return NIXL_SUCCESS;
 }
 
@@ -905,6 +913,9 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         return NIXL_ERR_REPOST_ACTIVE;
     }
     ofi_req->failed.store(false);
+    if (opt_args && opt_args->hasNotif) {
+        warnNotifDropped();
+    }
 
     fid_ep *target_ep;
     fi_addr_t dest_addr;
