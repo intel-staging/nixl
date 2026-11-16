@@ -439,7 +439,7 @@ if __name__ == "__main__":
     parser.add_argument("--blocks-per-xfer", type=int, default=128)
     parser.add_argument("--num-iterations", type=int, default=100)
     parser.add_argument("--nixl-memory-type", type=str, default="DRAM", choices=["DRAM", "VRAM"])
-    parser.add_argument("--device-type", type=str, default="cpu", choices=["cpu", "cuda", "hpu"])
+    parser.add_argument("--device-type", type=str, default="cpu", choices=["cpu", "hpu"])
     parser.add_argument("--nixl_backend", type=str, default="OFI")
     parser.add_argument("--ucx-transport", type=str, default=None, help="default is tcp, you might configure as 'cuda_copy,sm'")
     parser.add_argument("--debug-ucx", action="store_true",
@@ -460,15 +460,9 @@ if __name__ == "__main__":
     args.blocks_per_xfer = min(args.blocks_per_xfer, args.num_blocks)
     if args.device_type == "cpu":
         args.nixl_memory_type = "DRAM"
-    elif args.device_type == "cuda":
-        args.nixl_memory_type = "VRAM"
     elif args.device_type == "hpu":
-        args.nixl_memory_type = "VRAM"  # Gaudi HBM treated as DRAM_SEG
+        args.nixl_memory_type = "VRAM"
     #args.dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
-
-    if args.device_type == "cuda" and not torch.cuda.is_available():
-        logging.error("CUDA device specified but not available. Exiting.")
-        exit(1)
 
     # Run only the specified role
     if args.role == "sender":

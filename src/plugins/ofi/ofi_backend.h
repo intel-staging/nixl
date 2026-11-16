@@ -221,6 +221,7 @@ private:
     };
     static synapseai_ops synapseai_ops_;
     
+    static bool loadSynapseAI();
     nixl_status_t registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
 };
 
