@@ -160,6 +160,9 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     // for shm and tcp providers, use minimal configuration (only provider name)
     if (providerName_ == "shm" || providerName_ == "tcp") {
         hints->fabric_attr->prov_name = strdup(providerName_.c_str());
+        // a completed WRITE must mean the data is in target memory, which these
+        // software providers only guarantee at delivery-complete level
+        hints->tx_attr->op_flags = FI_DELIVERY_COMPLETE;
         NIXL_DEBUG << "Using minimal auto-negotiated hints for " << providerName_ << " provider";
     } else {
         // for other providers, use predefined configuration from SUPPORTED_PROVIDERS  
