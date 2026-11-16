@@ -151,8 +151,6 @@ private:
     static nixl_status_t getEndpointAddress(fid_ep* endpoint, std::string& address);
     static void detectHmemCapabilities(struct fi_info* fi_info,
                                        const std::string& provider_name,
-                                       bool& cuda_supported,
-                                       bool& ze_supported,
                                        bool& synapseai_supported);
     static const ProviderConfig* findProviderConfig(const std::string& provider_name);
     
@@ -168,7 +166,6 @@ private:
     static uint64_t getMemoryRegistrationAccessFlags(const struct fi_info* fi_info);
     fi_hmem_iface selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const;
     nixl_status_t registerDramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
-    nixl_status_t registerHmemMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta, fi_hmem_iface iface, uint64_t device_id) const;
 
     // data members
     fid_fabric *fabric_;
@@ -206,8 +203,6 @@ private:
     // intelligent main-thread progress rate limiting
     mutable std::atomic<std::chrono::steady_clock::time_point> lastProgressTime_;
     static const std::chrono::milliseconds PROGRESS_INTERVAL;
-    bool hmemZeSupported_;
-    bool hmemCudaSupported_;
     bool hmemSynapseaiSupported_;
 
     std::string localAgentName_;
