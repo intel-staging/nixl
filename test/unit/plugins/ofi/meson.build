@@ -23,5 +23,8 @@ ofi_backend_test = executable('ofi_backend_test',
         include_directories: [nixl_inc_dirs, utils_inc_dirs, '../../../../src/plugins/ofi'],
         install: true)
 
-test('ofi_backend_test', ofi_backend_test)
+# libfabric reads FI_PROVIDER once per process, so run once per provider.
+foreach provider : ['tcp', 'shm']
+    test('ofi_backend_test_' + provider, ofi_backend_test, env: ['FI_PROVIDER=' + provider])
+endforeach
 
