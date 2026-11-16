@@ -740,6 +740,7 @@ nixl_status_t nixlOfiEngine::registerMem(const nixlBlobDesc &mem,
     // DRAM_SEG = system memory, VRAM_SEG = device memory  
     if (nixl_mem == DRAM_SEG) {
         status = registerDramMemory(mem, ofi_meta);
+        ofi_meta->base = mem.addr;
     } else {  // VRAM_SEG
         // determine device interface for VRAM
         uint64_t device_id = 0;
@@ -925,6 +926,8 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     }
 
     size_t inject_size = fi_ ? fi_->tx_attr->inject_size : 0;
+    // without FI_MR_VIRT_ADDR (tcp, shm) the target takes RMA addresses as offsets
+    const bool virt_addr = fi_ && fi_->domain_attr && (fi_->domain_attr->mr_mode & FI_MR_VIRT_ADDR);
 
     for (size_t i = 0; i < static_cast<size_t>(local.descCount()); ++i) {
         const nixlMetaDesc &local_desc = local[i];
@@ -941,6 +944,9 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
             remote_key = static_cast<uint64_t>(desc_as_ptr);
         }
 
+        const uint64_t remote_addr =
+            virt_addr ? remote_desc.addr : remote_desc.addr - remote_meta->base;
+
         // injected writes generate no completion, so they are not counted
         bool use_inject = (local_desc.len <= inject_size) && (operation == NIXL_WRITE);
         nixlOfiOpContext *op_context = nullptr;
@@ -955,16 +961,16 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
             OFI_POST(post_status, fi_read, cq_, "fi_read",
                     target_ep, reinterpret_cast<void*>(local_desc.addr),
                     local_desc.len, local_meta->desc, dest_addr,
-                    (uint64_t)remote_desc.addr, remote_key, op_context);
+                    remote_addr, remote_key, op_context);
         } else if (use_inject) {
             OFI_POST(post_status, fi_inject_write, cq_, "fi_inject_write",
                     target_ep, reinterpret_cast<void*>(local_desc.addr),
-                    local_desc.len, dest_addr, (uint64_t)remote_desc.addr, remote_key);
+                    local_desc.len, dest_addr, remote_addr, remote_key);
         } else {
             OFI_POST(post_status, fi_write, cq_, "fi_write",
                     target_ep, reinterpret_cast<void*>(local_desc.addr),
                     local_desc.len, local_meta->desc, dest_addr,
-                    (uint64_t)remote_desc.addr, remote_key, op_context);
+                    remote_addr, remote_key, op_context);
         }
 
         if (post_status != NIXL_SUCCESS) {
@@ -1231,9 +1237,9 @@ nixl_status_t nixlOfiEngine::getPublicData(const nixlBackendMD* meta, std::strin
         return NIXL_ERR_INVALID_PARAM;
     }
     
-    // serialize memory registration key for remote access
+    // serialize the registration key and region base for remote access, as "key:base"
     uint64_t mr_key = fi_mr_key(ofi_meta->mr);
-    str = std::to_string(mr_key);
+    str = std::to_string(mr_key) + ":" + std::to_string(ofi_meta->base);
     return NIXL_SUCCESS;
 }
 
@@ -1246,7 +1252,7 @@ nixl_status_t nixlOfiEngine::loadRemoteMD(const nixlBlobDesc &input, const nixl_
     }
     
     // validate input metadata
-    if (input.metaInfo.empty() || input.metaInfo.size() > 32) {
+    if (input.metaInfo.empty() || input.metaInfo.size() > 64) {
         delete remote_meta;
         NIXL_ERROR << "Invalid metadata size: " << input.metaInfo.size();
         return NIXL_ERR_INVALID_PARAM;
@@ -1256,7 +1262,9 @@ nixl_status_t nixlOfiEngine::loadRemoteMD(const nixlBlobDesc &input, const nixl_
     try {
         // copy metaInfo to ensure null termination and lifetime safety
         std::string key_str(input.metaInfo.begin(), input.metaInfo.end());
-        uint64_t remote_key = std::stoull(key_str);
+        size_t sep = key_str.find(':');
+        uint64_t remote_key = std::stoull(key_str.substr(0, sep));
+        uint64_t remote_base = sep == std::string::npos ? 0 : std::stoull(key_str.substr(sep + 1));
         
         // 0 is a valid key (tcp hands it out); FI_KEY_NOTAVAIL is not
         if (remote_key == FI_KEY_NOTAVAIL) {
@@ -1269,6 +1277,7 @@ nixl_status_t nixlOfiEngine::loadRemoteMD(const nixlBlobDesc &input, const nixl_
         // store the key for later use in RMA operations - safe conversion
         remote_meta->mr = nullptr;  // No local mr for remote metadata
         remote_meta->desc = reinterpret_cast<void*>(static_cast<uintptr_t>(remote_key));
+        remote_meta->base = remote_base;
         
         output = remote_meta;
         return NIXL_SUCCESS;
@@ -1786,6 +1795,7 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
     dmabuf.offset = 0;                                   // kernel handled offset
     dmabuf.len = modi_memlen;                                // exact buffer size
     dmabuf.base_addr = reinterpret_cast<void*>(modi_mem_addr); // exact buffer start
+    ofi_meta->base = modi_mem_addr;
     
     // Set up memory registration attributes
     struct fi_mr_attr mr_attr = {};
