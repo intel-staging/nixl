@@ -157,9 +157,7 @@ private:
     static const ProviderConfig* findProviderConfig(const std::string& provider_name);
     
     // parameter helpers
-    void getStringParam(const nixlBackendInitParams* init_params, const std::string& key, std::string& value);
     void getLongParam(const nixlBackendInitParams* init_params, const std::string& key, long& value, long min_val, long max_val);
-    void getSizeTParam(const nixlBackendInitParams* init_params, const std::string& key, size_t& value);
     
     // connection helpers
     nixl_status_t connect_unlocked(const std::string &remote_agent);
