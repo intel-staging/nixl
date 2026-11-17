@@ -919,7 +919,7 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         // before anyone knows the data arrived
         auto *op_context = new nixlOfiOpContext{ofi_req};
         // count before posting so a fast completion can never underflow the counter
-        ofi_req->state.fetch_add(1);
+        ofi_req->outstanding.fetch_add(1);
 
         nixl_status_t post_status;
         if (operation == NIXL_READ) {
@@ -938,7 +938,7 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
             // already-posted operations still complete through the reaper and the
             // handle stays valid until the agent releases it
             delete op_context;
-            ofi_req->state.fetch_sub(1);
+            ofi_req->outstanding.fetch_sub(1);
             ofi_req->failed.store(true);
             return post_status;
         }
@@ -1007,8 +1007,7 @@ void nixlOfiEngine::driveProgressIfNeeded() const {
     }
 }
 
-// Credits one finished operation to the request that posted it. The request is deleted
-// here when it was already released and this was its last outstanding operation.
+// Credits one finished operation to the request that posted it.
 void nixlOfiEngine::completeOp(void *op_context, bool error) {
     if (!op_context) {
         return;
@@ -1019,9 +1018,8 @@ void nixlOfiEngine::completeOp(void *op_context, bool error) {
     if (error) {
         req->failed.store(true);
     }
-    if (req->state.fetch_sub(1) == (nixlOfiRequest::RELEASED | 1)) {
-        delete req;
-    }
+    // last access: releaseReqH frees the request only once this has reached 0
+    req->outstanding.fetch_sub(1);
 }
 
 // Reaps completions from the shared CQ for every request. All CQ readers go through
@@ -1120,17 +1118,15 @@ nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
         }
     }
 
+    // The NIC may still be reading or writing the caller's buffers. Refuse, so the agent
+    // keeps the request and returns NIXL_ERR_REPOST_ACTIVE; the caller can retry.
+    // ponytail: a request still in flight at shutdown is leaked; fine at process exit
     uint64_t remaining = ofi_req->pending();
-    if (remaining > 0 && !shutdownFlag_.load()) {
-        NIXL_WARN << "Releasing request with " << remaining
-                  << " pending operations; it is freed when they complete";
+    if (remaining > 0) {
+        NIXL_WARN << "Cannot release request with " << remaining << " operations still in flight";
+        return NIXL_ERR_REPOST_ACTIVE;
     }
-
-    // Mark released and read the count in one step. If operations are still outstanding,
-    // the last completion deletes the request, so it must not be touched after this.
-    if (ofi_req->state.fetch_or(nixlOfiRequest::RELEASED) == 0) {
-        delete ofi_req;
-    }
+    delete ofi_req;
     return NIXL_SUCCESS;
 }
 
