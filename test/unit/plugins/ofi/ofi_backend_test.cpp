@@ -29,31 +29,8 @@
 #include "common/nixl_log.h"
 
 // The engine takes its provider from FI_PROVIDER, and libfabric reads FI_PROVIDER once per
-// process, so each provider runs in its own test process (see meson.build). Changing it at
-// run time only affects the engine's own provider check, which InvalidProvider relies on.
-class ScopedProvider {
-public:
-    explicit ScopedProvider(const char *provider) {
-        const char *old = getenv("FI_PROVIDER");
-        if (old) {
-            saved_ = old;
-            hadOld_ = true;
-        }
-        setenv("FI_PROVIDER", provider, 1);
-    }
-
-    ~ScopedProvider() {
-        if (hadOld_) {
-            setenv("FI_PROVIDER", saved_.c_str(), 1);
-        } else {
-            unsetenv("FI_PROVIDER");
-        }
-    }
-
-private:
-    std::string saved_;
-    bool hadOld_ = false;
-};
+// process, so each provider runs in its own test process (see meson.build); main() sets a
+// default. Changing it at run time only affects the engine's own provider check.
 
 class OfiBackendTest : public ::testing::Test {
 protected:
@@ -90,8 +67,10 @@ TEST_F(OfiBackendTest, GetSupportedMems) {
 }
 
 TEST_F(OfiBackendTest, InvalidProvider) {
-    ScopedProvider invalid("invalid_provider");
+    const std::string saved = getenv("FI_PROVIDER");
+    setenv("FI_PROVIDER", "invalid_provider", 1);
     std::unique_ptr<nixlOfiEngine> engine(new nixlOfiEngine(&init_params));
+    setenv("FI_PROVIDER", saved.c_str(), 1);
     EXPECT_TRUE(engine->getInitErr());
 }
 
