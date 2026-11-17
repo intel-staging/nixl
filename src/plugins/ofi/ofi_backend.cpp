@@ -1000,31 +1000,8 @@ void nixlOfiEngine::connectionProgressFunc() {
 }
 
 void nixlOfiEngine::driveProgress() const {
-    if (shutdownFlag_.load()) {
-        return;  // shutdown in progress
-    }
-
-    if (!cq_) {
-        return;  // no cq to drive
-    }
-
-    // fabtest-style progress driving with proper error handling
-    int progress_ret = ofi_progress_manual(cq_);
-
-    if (progress_ret > 0) {
-        // successful completion read, context cleanup handled elsewhere
-        NIXL_DEBUG << "Progress thread: advanced " << progress_ret << " completion(s)";
-    } else if (progress_ret == -FI_EAGAIN) {
-        // no completions available, normal condition
-        return;
-    } else if (progress_ret < 0) {
-        // error occurred, rate-limit error messages
-        static auto last_error_time = std::chrono::steady_clock::now();
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_error_time).count() >= 1) {
-            NIXL_DEBUG << "Progress thread error: " << fi_strerror(-progress_ret);
-            last_error_time = now;
-        }
+    if (!shutdownFlag_.load() && cq_) {
+        ofi_progress_manual(cq_);
     }
 }
 
