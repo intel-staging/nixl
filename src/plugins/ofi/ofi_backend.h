@@ -55,21 +55,16 @@ public:
 
 class nixlOfiRequest : public nixlBackendReqH {
 public:
-    // The outstanding-operation count and the released flag share one atomic word, so
-    // a release and the last completion each see the other in a single step and
-    // exactly one of them deletes the request.
-    static constexpr uint64_t RELEASED = 1ULL << 63;
-
     fid_cq *cq;
-    std::atomic<uint64_t> state;  // RELEASED | operations posted and not yet completed
-    std::atomic<bool> failed;     // an operation completed with an error
+    std::atomic<uint64_t> outstanding;  // operations posted and not yet completed
+    std::atomic<bool> failed;           // an operation completed with an error
 
-    nixlOfiRequest() : cq(nullptr), state(0), failed(false) { }
+    nixlOfiRequest() : cq(nullptr), outstanding(0), failed(false) { }
     ~nixlOfiRequest() { }
 
     uint64_t
     pending() const {
-        return state.load() & ~RELEASED;
+        return outstanding.load();
     }
 };
 
