@@ -266,6 +266,8 @@ private:
         uint32_t total_len = 0;
         uint16_t xfer_id = 0;
         std::shared_ptr<nixlLibfabricBackendH::CompletionNotifResult> result;
+        // Fragments already posted; a send the provider refused resumes here.
+        size_t next_fragment = 0;
     };
 
     mutable std::mutex completion_notifs_mutex_;
@@ -375,19 +377,29 @@ private:
     void
     onXferComplete(nixlLibfabricBackendH &handle) const;
 
-    // Progress thread: sends the notifications onXferComplete() queued.
+    // Progress thread: sends the notifications onXferComplete() queued, without waiting for the
+    // provider; what it refuses stays queued, in order, for the next iteration.
     void
     sendQueuedCompletionNotifs();
 
+    // Progress thread, on exit: fails the notifications still queued.
+    void
+    failQueuedCompletionNotifs();
+
     // Private notification implementation with unified binary notification system. Without
-    // may_reconnect, a DISCONNECTED connection fails with NIXL_ERR_NOT_FOUND.
+    // may_reconnect, a DISCONNECTED connection fails with NIXL_ERR_NOT_FOUND. With next_fragment,
+    // sending starts at that fragment and leaves it at the first fragment not posted; under
+    // nixlLibfabricRail::PostOnceScope a fragment the provider refuses for now (or that finds the
+    // control request pool empty) returns NIXL_IN_PROG instead of being waited for, and a later
+    // call resumes there.
     nixl_status_t
     notifSendPriv(const std::string &remote_agent,
                   std::vector<BinaryNotification> &binary_notifications,
                   uint32_t total_message_length,
                   uint16_t notif_xfer_id,
                   uint32_t expected_completions,
-                  bool may_reconnect = true) const;
+                  bool may_reconnect = true,
+                  size_t *next_fragment = nullptr) const;
 
     // Tell the target that notif_xfer_id failed on this side and that only final_completions of
     // its writes will arrive, so it stops waiting for the rest.

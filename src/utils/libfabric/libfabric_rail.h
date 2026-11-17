@@ -417,20 +417,25 @@ public:
                       bool auto_progress = false);
 
     /**
-     * @brief While alive, a post refused with -FI_EAGAIN on this thread progresses the rail's CQ
-     * itself before retrying, even with a progress thread.
+     * @brief While alive, a send refused with -FI_EAGAIN on this thread is not retried: postSend()
+     * returns NIXL_IN_PROG, nothing posted.
      *
-     * With a progress thread a post normally just retries and leaves the CQ to that thread. The
-     * progress thread itself must not do that when it posts, or it waits on itself; it holds one
-     * of these while it sends (never inside CQ processing).
+     * A send normally retries until the provider takes it, leaving the CQ to the progress thread
+     * if there is one. The progress thread itself must not wait like that, or it stops
+     * progressing every rail; it holds one of these while it sends (never inside CQ processing)
+     * and tries again on a later iteration.
      */
-    class ProgressOnEagainScope {
+    class PostOnceScope {
     public:
-        ProgressOnEagainScope();
-        ~ProgressOnEagainScope();
-        ProgressOnEagainScope(const ProgressOnEagainScope &) = delete;
-        ProgressOnEagainScope &
-        operator=(const ProgressOnEagainScope &) = delete;
+        PostOnceScope();
+        ~PostOnceScope();
+        PostOnceScope(const PostOnceScope &) = delete;
+        PostOnceScope &
+        operator=(const PostOnceScope &) = delete;
+
+        /** Whether this thread holds one. */
+        static bool
+        active();
 
     private:
         bool previous_;
@@ -696,10 +701,6 @@ private:
     writeCqDataFlag() const {
         return write_remote_cq_data_ ? FI_REMOTE_CQ_DATA : 0;
     }
-
-    // Whether a post refused with -FI_EAGAIN progresses the CQ before retrying.
-    bool
-    progressesOnEagain() const;
 
     void
     pollForCompletions();

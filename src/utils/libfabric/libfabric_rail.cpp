@@ -421,8 +421,8 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 // Rail Class Implementation
 
 namespace {
-// Set by nixlLibfabricRail::ProgressOnEagainScope on the thread holding one.
-thread_local bool t_progress_on_eagain = false;
+// Set by nixlLibfabricRail::PostOnceScope on the thread holding one.
+thread_local bool t_post_once = false;
 
 // The table entry for a rail's provider; an unlisted provider gets the defaults.
 const LibfabricUtils::nixlLibfabricProviderInfo &
@@ -441,18 +441,17 @@ railProviderInfo(const std::string &provider) {
 
 } // namespace
 
-nixlLibfabricRail::ProgressOnEagainScope::ProgressOnEagainScope()
-    : previous_(t_progress_on_eagain) {
-    t_progress_on_eagain = true;
+nixlLibfabricRail::PostOnceScope::PostOnceScope() : previous_(t_post_once) {
+    t_post_once = true;
 }
 
-nixlLibfabricRail::ProgressOnEagainScope::~ProgressOnEagainScope() {
-    t_progress_on_eagain = previous_;
+nixlLibfabricRail::PostOnceScope::~PostOnceScope() {
+    t_post_once = previous_;
 }
 
 bool
-nixlLibfabricRail::progressesOnEagain() const {
-    return !progress_thread_enabled_ || t_progress_on_eagain;
+nixlLibfabricRail::PostOnceScope::active() {
+    return t_post_once;
 }
 
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
@@ -1351,6 +1350,12 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
             return NIXL_SUCCESS;
         }
 
+        if (ret == -FI_EAGAIN && t_post_once) {
+            // Not posted; the caller keeps the message and tries again later.
+            NIXL_TRACE << "fi_senddata returned EAGAIN on rail " << rail_id << ", not retrying";
+            return NIXL_IN_PROG;
+        }
+
         if (ret == -FI_EAGAIN) {
             // Resource temporarily unavailable - retry indefinitely for all providers
             attempt++;
@@ -1365,7 +1370,7 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
             }
 
             // Progress completion queue to drain pending completions before retry
-            if (progressesOnEagain()) {
+            if (!progress_thread_enabled_) {
                 nixl_status_t progress_status = progressCompletionQueue();
                 if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
                     NIXL_ERROR << "progressCompletionQueue failed on rail " << rail_id
@@ -1609,7 +1614,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
             }
 
             // Progress completion queue to drain pending completions before retry
-            if (progressesOnEagain()) {
+            if (!progress_thread_enabled_) {
                 nixl_status_t progress_status = progressCompletionQueue();
                 if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
                     NIXL_ERROR << "progressCompletionQueue failed on rail " << rail_id
@@ -1692,7 +1697,7 @@ nixlLibfabricRail::postRead(void *local_buffer,
             }
 
             // Progress completion queue to drain pending completions before retry
-            if (progressesOnEagain()) {
+            if (!progress_thread_enabled_) {
                 nixl_status_t progress_status = progressCompletionQueue();
                 if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
                     NIXL_ERROR << "progressCompletionQueue failed on rail " << rail_id

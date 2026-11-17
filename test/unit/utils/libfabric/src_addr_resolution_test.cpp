@@ -385,6 +385,40 @@ testWriteRemoteCqData() {
     return 0;
 }
 
+// Under PostOnceScope a send the provider refuses with -FI_EAGAIN returns at once, nothing posted,
+// so the progress thread can go on progressing the rails; otherwise it is retried until taken.
+static int
+testPostOnceScope() {
+    NIXL_INFO << "  testPostOnceScope";
+    nixlLibfabricRail rail("efa_0", "efa", 91, FI_HMEM_SYSTEM);
+    rail.setProgressThreadEnabled(true);
+    nixlLibfabricReq *req = rail.allocateControlRequest(64, /*req_id=*/3);
+    TEST_ASSERT(req != nullptr, "allocated a control request");
+    req->buffer_size = 64;
+    const uint64_t imm = NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_NOTIFICTION, 3, 0);
+    TEST_ASSERT(!nixlLibfabricRail::PostOnceScope::active(), "no scope held by default");
+    {
+        const nixlLibfabricRail::PostOnceScope post_once;
+        TEST_ASSERT(nixlLibfabricRail::PostOnceScope::active(), "the scope is visible while held");
+        mock_senddata_calls = 0;
+        mock_senddata_eagain = 1000;
+        TEST_ASSERT(rail.postSend(imm, 0x1, req) == NIXL_IN_PROG,
+                    "a refused send returns NIXL_IN_PROG under the scope");
+        TEST_ASSERT(mock_senddata_calls == 1, "it is tried once, not retried");
+        mock_senddata_eagain = 0;
+        TEST_ASSERT(rail.postSend(imm, 0x1, req) == NIXL_SUCCESS,
+                    "an accepted send still succeeds under the scope");
+    }
+    TEST_ASSERT(!nixlLibfabricRail::PostOnceScope::active(), "the scope ends with its object");
+    mock_senddata_calls = 0;
+    mock_senddata_eagain = 3;
+    TEST_ASSERT(rail.postSend(imm, 0x1, req) == NIXL_SUCCESS,
+                "without the scope a refused send is retried until taken");
+    TEST_ASSERT(mock_senddata_calls == 4, "three refusals, then the accepted attempt");
+    rail.releaseRequest(req);
+    return 0;
+}
+
 static int
 testRecvCompletionAttribution(nixlLibfabricRailManager &mgr) {
     NIXL_INFO << "  testRecvCompletionAttribution";
@@ -539,6 +573,9 @@ main() {
         return res;
     }
     if ((res = testWriteRemoteCqData()) != 0) {
+        return res;
+    }
+    if ((res = testPostOnceScope()) != 0) {
         return res;
     }
     if ((res = testFiSourceRequested()) != 0) {

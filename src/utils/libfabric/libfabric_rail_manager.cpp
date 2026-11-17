@@ -1157,6 +1157,11 @@ nixlLibfabricRailManager::postControlMessage(
     // Use rail 0 for notifications
     nixl_status_t status = rails_[rail_id]->postSend(imm_data, dest_addr, req);
 
+    if (status == NIXL_IN_PROG) {
+        // Refused for now under nixlLibfabricRail::PostOnceScope; the caller tries again.
+        rails_[rail_id]->releaseRequest(req);
+        return status;
+    }
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Failed to send control message type " << static_cast<int>(msg_type)
                    << " on rail " << rail_id;
