@@ -935,12 +935,12 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         }
 
         if (post_status != NIXL_SUCCESS) {
-            // already-posted operations still complete through the reaper and the
-            // handle stays valid until the agent releases it
+            // Operations already posted still complete through the reaper; until they have,
+            // report IN_PROG and let checkXfer report the failure.
             delete op_context;
             ofi_req->outstanding.fetch_sub(1);
             ofi_req->failed.store(true);
-            return post_status;
+            return ofi_req->pending() > 0 ? NIXL_IN_PROG : post_status;
         }
     }
 
@@ -1073,30 +1073,30 @@ int nixlOfiEngine::ofi_progress_manual(fid_cq *cq) const {
     return total_processed > 0 ? total_processed : -FI_EAGAIN;
 }
 
-// A completion records its error before it decrements the count, so read the count
-// first: once it reads 0, every error is visible.
+// Report an error only once nothing is in flight: on an error the agent drops the request,
+// and the caller may then free buffers the NIC is still accessing. A completion records its
+// error before it decrements the count, so once the count reads 0 every error is visible.
 nixl_status_t nixlOfiEngine::transferStatus(const nixlOfiRequest *req) {
-    const uint64_t pending = req->pending();
-    if (req->failed.load()) {
-        return NIXL_ERR_BACKEND;
+    if (req->pending() > 0) {
+        return NIXL_IN_PROG;
     }
-    return pending == 0 ? NIXL_SUCCESS : NIXL_IN_PROG;
+    return req->failed.load() ? NIXL_ERR_BACKEND : NIXL_SUCCESS;
 }
 
 nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
-    if (shutdownFlag_.load()) {
-        return NIXL_ERR_BACKEND;  // shutdown in progress
-    }
-
     nixlOfiRequest *ofi_req = static_cast<nixlOfiRequest*>(handle);
     if (!ofi_req || !ofi_req->cq) {
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    if (ofi_req->pending() > 0) {
+    // A shutdown or progress error fails the transfer, but it is only reported once the
+    // operations still in flight have completed (see transferStatus).
+    if (shutdownFlag_.load()) {
+        ofi_req->failed.store(true);
+    } else if (ofi_req->pending() > 0) {
         int ret = ofi_progress_manual(ofi_req->cq);
         if (ret < 0 && ret != -FI_EAGAIN) {
-            return NIXL_ERR_BACKEND;
+            ofi_req->failed.store(true);
         }
     }
 
