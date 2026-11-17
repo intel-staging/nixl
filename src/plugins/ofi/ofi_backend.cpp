@@ -894,7 +894,6 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         return status;
     }
 
-    size_t inject_size = fi_ ? fi_->tx_attr->inject_size : 0;
     // without FI_MR_VIRT_ADDR (tcp, shm) the target takes RMA addresses as offsets
     const bool virt_addr = fi_ && fi_->domain_attr && (fi_->domain_attr->mr_mode & FI_MR_VIRT_ADDR);
 
@@ -916,14 +915,11 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         const uint64_t remote_addr =
             virt_addr ? remote_desc.addr : remote_desc.addr - remote_meta->base;
 
-        // injected writes generate no completion, so they are not counted
-        bool use_inject = (local_desc.len <= inject_size) && (operation == NIXL_WRITE);
-        nixlOfiOpContext *op_context = nullptr;
-        if (!use_inject) {
-            op_context = new nixlOfiOpContext{ofi_req};
-            // count before posting so a fast completion can never underflow the counter
-            ofi_req->state.fetch_add(1);
-        }
+        // every operation is tracked to a completion; injected writes would be done
+        // before anyone knows the data arrived
+        auto *op_context = new nixlOfiOpContext{ofi_req};
+        // count before posting so a fast completion can never underflow the counter
+        ofi_req->state.fetch_add(1);
 
         nixl_status_t post_status;
         if (operation == NIXL_READ) {
@@ -931,10 +927,6 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
                     target_ep, reinterpret_cast<void*>(local_desc.addr),
                     local_desc.len, local_meta->desc, dest_addr,
                     remote_addr, remote_key, op_context);
-        } else if (use_inject) {
-            OFI_POST(post_status, fi_inject_write, cq_, "fi_inject_write",
-                    target_ep, reinterpret_cast<void*>(local_desc.addr),
-                    local_desc.len, dest_addr, remote_addr, remote_key);
         } else {
             OFI_POST(post_status, fi_write, cq_, "fi_write",
                     target_ep, reinterpret_cast<void*>(local_desc.addr),
@@ -945,10 +937,8 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         if (post_status != NIXL_SUCCESS) {
             // already-posted operations still complete through the reaper and the
             // handle stays valid until the agent releases it
-            if (op_context) {
-                delete op_context;
-                ofi_req->state.fetch_sub(1);
-            }
+            delete op_context;
+            ofi_req->state.fetch_sub(1);
             ofi_req->failed.store(true);
             return post_status;
         }
