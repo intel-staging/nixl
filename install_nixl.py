@@ -12,7 +12,6 @@ WHEELS_CACHE_HOME = os.environ.get("WHEELS_CACHE_HOME", "/tmp/wheels_cache")
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 UCX_DIR = os.path.join('/tmp', 'ucx_source')
 LIBFABRIC_DIR = os.path.join('/tmp', 'libfabric_source')
-NIXL_DIR = os.path.join('/tmp', 'nixl_source')
 UCX_INSTALL_DIR = os.path.join('/tmp', 'ucx_install')
 LIBFABRIC_INSTALL_DIR = os.path.join('/tmp', 'libfabric_install')
 
@@ -21,8 +20,6 @@ UCX_REPO_URL = 'https://github.com/openucx/ucx.git'
 UCX_BRANCH = 'v1.19.x'
 LIBFABRIC_REPO_URL = 'https://github.com/ofiwg/libfabric.git'
 LIBFABRIC_REF = 'v1.21.0'  # Using a recent stable tag
-NIXL_REPO_URL = 'https://github.com/intel-staging/nixl.git'
-NIXL_BRANCH = 'v1.5.0_OFI'
 # vLLM's NIXL connector requires NIXL >= 1.5.0 (strided descriptor lists).
 NIXL_VERSION = os.environ.get("NIXL_VERSION", "1.5.0")
 # Since NIXL 1.0 the bindings ship as nixl_cu12 (the variant built without CUDA),
@@ -181,9 +178,8 @@ def build_and_install_prerequisites(args):
     
     
     # -- Step 3: Build NIXL wheel from source --
-    print(f"\n[3/4] Building NIXL (branch: {NIXL_BRANCH}) wheel from source...", flush=True)
-    if not os.path.exists(NIXL_DIR):
-        run_command(['git', 'clone', '--branch', NIXL_BRANCH, NIXL_REPO_URL, NIXL_DIR])
+    # Build the checkout this script lives in, never a copy left over from an earlier run.
+    print(f"\n[3/4] Building NIXL wheel from {ROOT_DIR}...", flush=True)
 
     build_env = os.environ.copy()
     # Configure environment to find both UCX and Libfabric
@@ -216,7 +212,7 @@ def build_and_install_prerequisites(args):
     ]
 
     run_command(wheel_build_cmd,
-                cwd=os.path.abspath(NIXL_DIR),
+                cwd=ROOT_DIR,
                 env=build_env)
 
     # -- Step 4: Repair wheel, then replace libfabric --
