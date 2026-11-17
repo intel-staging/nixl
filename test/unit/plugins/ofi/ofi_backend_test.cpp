@@ -295,17 +295,16 @@ TEST_F(OfiTransferTest, RepostHandle) {
         fill(remote_, 20 + round);
         nixl_status_t st = initiator_->postXfer(NIXL_READ, local, remote, "target", h);
         ASSERT_TRUE(st == NIXL_SUCCESS || st == NIXL_IN_PROG);
-        if (st == NIXL_IN_PROG) {
-            // Reposting an active request must be refused. The progress thread may finish
-            // the first post before this call, and then the repost is valid instead.
-            nixl_status_t again = initiator_->postXfer(NIXL_READ, local, remote, "target", h);
-            EXPECT_TRUE(again == NIXL_ERR_REPOST_ACTIVE || again == NIXL_IN_PROG ||
-                        again == NIXL_SUCCESS)
-                << "repost returned " << again;
-        }
         ASSERT_EQ(waitDone(h), NIXL_SUCCESS);
         EXPECT_EQ(local_, remote_) << "round " << int(round);
     }
+
+    // With an operation still in flight, reposting and releasing must both be refused.
+    auto *req = static_cast<nixlOfiRequest *>(h);
+    req->outstanding.fetch_add(1);
+    EXPECT_EQ(initiator_->postXfer(NIXL_READ, local, remote, "target", h), NIXL_ERR_REPOST_ACTIVE);
+    EXPECT_EQ(initiator_->releaseReqH(h), NIXL_ERR_REPOST_ACTIVE); // after its drain deadline
+    req->outstanding.fetch_sub(1);
     EXPECT_EQ(initiator_->releaseReqH(h), NIXL_SUCCESS);
 }
 
