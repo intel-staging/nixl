@@ -265,7 +265,7 @@ testProgressAllRails() {
     // verbs, no progress thread: rails open with FI_PROGRESS_AUTO and every rail is polled.
     useProvider("verbs;ofi_rxm", "mlx5_");
     {
-        nixlLibfabricRailManager mgr(0, /*progress_thread_enabled=*/false);
+        nixlLibfabricRailManager mgr(0, /*progress_thread_enabled=*/false, /*enable_verbs=*/true);
         check(mgr.getNumRails() == k_num_rails && cq_order.size() == k_num_rails,
               "verbs: one rail and one CQ per mock NIC");
         check(mgr.needsAllRailProgress(), "verbs: the manager progresses every rail");

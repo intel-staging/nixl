@@ -79,10 +79,13 @@ public:
      * @param striping_threshold Size threshold for enabling multi-rail striping
      * @param progress_thread_enabled Whether the backend runs a progress thread. Without one,
      *        lazily connecting providers get FI_PROGRESS_AUTO rails
+     * @param enable_verbs Consider verbs even without discrete Intel GPUs; it is opt-in (the
+     *        enable_verbs backend parameter, or NIXL_LIBFABRIC_ENABLE_VERBS)
      * @throws std::runtime_error if initialization fails
      */
     explicit nixlLibfabricRailManager(size_t striping_threshold,
-                                      bool progress_thread_enabled = true);
+                                      bool progress_thread_enabled = true,
+                                      bool enable_verbs = false);
     /** Destroy rail manager and cleanup all resources */
     ~nixlLibfabricRailManager();
 

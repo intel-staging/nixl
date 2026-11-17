@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <deque>
 #include <functional>
 #include <iomanip>
@@ -237,6 +238,23 @@ zeQueryVram(const nixlBlobDesc &mem, std::string &pci_bus_id, int &device_id) {
     NIXL_DEBUG << "Queried PCI bus ID: " << pci_bus_id << " (ZE device " << info.device
                << ") for device " << mem.devId;
     return NIXL_SUCCESS;
+}
+
+/**
+ * @brief Whether verbs, an opt-in provider, is enabled explicitly: the enable_verbs backend
+ *        parameter, or NIXL_LIBFABRIC_ENABLE_VERBS, set to 1, true, yes or on.
+ */
+bool
+verbsEnabled(const nixl_b_params_t &custom_params) {
+    std::string value;
+    if (LibfabricUtils::getCustomStringParam(custom_params, "enable_verbs", value) !=
+        NIXL_SUCCESS) {
+        return false;
+    }
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
 } // namespace
@@ -583,7 +601,9 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
     : nixlBackendEngine(init_params),
       progress_thread_enabled_(init_params->enableProgTh),
       progress_thread_delay_(std::chrono::microseconds(init_params->pthrDelay)),
-      rail_manager_(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD, init_params->enableProgTh),
+      rail_manager_(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD,
+                    init_params->enableProgTh,
+                    verbsEnabled(getCustomParams())),
       post_thread_count_(NIXL_LIBFABRIC_DEFAULT_POST_THREADS),
       post_split_batch_size_(NIXL_LIBFABRIC_DEFAULT_POST_SPLIT_BATCH_SIZE),
       runtime_(FI_HMEM_SYSTEM) {

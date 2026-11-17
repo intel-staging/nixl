@@ -36,6 +36,9 @@ private:
     // PCI bus ID to EFA device mapping: "0000:72:00.0"→[efa0,efa1], etc.
     std::unordered_map<std::string, std::vector<std::string>> pci_to_efa_devices;
 
+    // Whether verbs, an opt-in provider, was enabled explicitly
+    const bool enable_verbs_;
+
     // All available network devices discovered on this system
     std::vector<std::string> all_devices;
 
@@ -239,7 +242,9 @@ private:
     calcAvgNicUpstreamBandwidth();
 
 public:
-    nixlLibfabricTopology(); // Automatically discovers topology
+    /** Automatically discovers topology.
+     *  @param enable_verbs Consider verbs even without discrete Intel GPUs (it is opt-in). */
+    explicit nixlLibfabricTopology(bool enable_verbs = false);
     ~nixlLibfabricTopology();
 
     // Accelerator-based queries (main interface)

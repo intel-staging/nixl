@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <iomanip>
 #include <sstream>
 #include <atomic>
@@ -122,6 +123,7 @@ namespace {
         /*needs_all_rail_progress=*/false,
         /*notify_after_completion=*/false,
         /*single_domain=*/false,
+        /*opt_in=*/false,
         /*select_domains=*/nullptr,
         /*carries_ze=*/true,
     };
@@ -139,6 +141,7 @@ namespace {
         /*needs_all_rail_progress=*/false,
         /*notify_after_completion=*/false,
         /*single_domain=*/false,
+        /*opt_in=*/false,
         /*select_domains=*/nullptr,
         // libfabric's efa provider has no Level Zero support.
         /*carries_ze=*/false,
@@ -162,6 +165,9 @@ namespace {
         // peer's writes; see providerNotifiesAfterCompletion().
         /*notify_after_completion=*/true,
         /*single_domain=*/false,
+        // Selected only when enabled (enable_verbs, or discrete Intel GPUs): a host that ran
+        // over tcp before verbs was added keeps tcp.
+        /*opt_in=*/true,
         /*select_domains=*/selectVerbsDomains,
         /*carries_ze=*/true,
     };
@@ -179,6 +185,7 @@ namespace {
         /*needs_all_rail_progress=*/false,
         /*notify_after_completion=*/false,
         /*single_domain=*/true,
+        /*opt_in=*/false,
         /*select_domains=*/nullptr,
         /*carries_ze=*/true,
     };
@@ -196,6 +203,7 @@ namespace {
         /*needs_all_rail_progress=*/false,
         /*notify_after_completion=*/false,
         /*single_domain=*/true,
+        /*opt_in=*/false,
         /*select_domains=*/nullptr,
         /*carries_ze=*/false,
     };
@@ -287,13 +295,24 @@ providerNeedsFullTopology(const std::string &prov_name) {
 }
 
 std::pair<std::string, std::vector<std::string>>
-selectProvider(const nixlProviderDeviceMap &provider_device_map) {
+selectProvider(const nixlProviderDeviceMap &provider_device_map, bool allow_opt_in) {
     // First table entry with usable domains wins.
     for (const nixlLibfabricProviderInfo *provider : knownProviders()) {
         std::vector<std::string> domains = (provider->select_domains != nullptr) ?
             provider->select_domains(provider_device_map) :
             selectDomainsGeneric(provider_device_map, provider->name);
         if (domains.empty()) {
+            continue;
+        }
+        if (provider->opt_in && !allow_opt_in) {
+            std::string upper(provider->name);
+            std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
+                return static_cast<char>(std::toupper(c));
+            });
+            NIXL_INFO << "Found " << domains.size() << " " << provider->description
+                      << " device(s), not used: set NIXL_LIBFABRIC_ENABLE_" << upper
+                      << "=1 (or the enable_" << provider->name << " backend parameter) to select "
+                      << provider->name;
             continue;
         }
         if (provider->single_domain && domains.size() > 1) {
@@ -305,7 +324,7 @@ selectProvider(const nixlProviderDeviceMap &provider_device_map) {
 }
 
 std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
-selectNetworkDevices(const struct fi_info *info) {
+selectNetworkDevices(const struct fi_info *info, bool allow_opt_in) {
     nixlProviderDeviceMap provider_device_map;
     // Bus address and link speed per prov_name and domain name. Several providers can report the
     // same domain name (verbs and psm3) for different NICs or with different metadata, so a
@@ -359,7 +378,7 @@ selectNetworkDevices(const struct fi_info *info) {
 
     // Named references rather than a structured binding: the lambda below captures them, which
     // Clang before 16 rejects for structured bindings.
-    const auto selected = selectProvider(provider_device_map);
+    const auto selected = selectProvider(provider_device_map, allow_opt_in);
     const std::string &provider_name = selected.first;
     const std::vector<std::string> &domains = selected.second;
     if (provider_name == "none") {
@@ -419,7 +438,7 @@ selectNetworkDevices(const struct fi_info *info) {
 }
 
 std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
-getAvailableNetworkDevices() {
+getAvailableNetworkDevices(bool allow_opt_in) {
     struct fi_info *hints, *info;
     hints = fi_allocinfo();
     if (!hints) {
@@ -452,7 +471,7 @@ getAvailableNetworkDevices() {
         return {"none", {}};
     }
 
-    auto result = selectNetworkDevices(info);
+    auto result = selectNetworkDevices(info, allow_opt_in);
 
     fi_freeinfo(info);
     fi_freeinfo(hints);

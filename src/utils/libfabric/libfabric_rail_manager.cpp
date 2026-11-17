@@ -195,7 +195,8 @@ private:
 };
 
 nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
-                                                   bool progress_thread_enabled)
+                                                   bool progress_thread_enabled,
+                                                   bool enable_verbs)
     : striping_threshold_(striping_threshold),
       runtime_(FI_HMEM_CUDA),
       progress_thread_enabled_(progress_thread_enabled) {
@@ -206,7 +207,7 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
     nixlAccelInstallLogBridge();
 
     // Initialize topology system
-    topology = std::make_unique<nixlLibfabricTopology>();
+    topology = std::make_unique<nixlLibfabricTopology>(enable_verbs);
 
     // Determine system runtime type once at initialization. NVIDIA and AMD GPUs decide it as
     // before Level Zero support, except that a build without CUDA or ROCm (neither defines
