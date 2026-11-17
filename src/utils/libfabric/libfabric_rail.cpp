@@ -421,6 +421,8 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 // Rail Class Implementation
 
 namespace {
+// Set by nixlLibfabricRail::ProgressOnEagainScope on the thread holding one.
+thread_local bool t_progress_on_eagain = false;
 
 // The table entry for a rail's provider; an unlisted provider gets the defaults.
 const LibfabricUtils::nixlLibfabricProviderInfo &
@@ -439,10 +441,25 @@ railProviderInfo(const std::string &provider) {
 
 } // namespace
 
+nixlLibfabricRail::ProgressOnEagainScope::ProgressOnEagainScope()
+    : previous_(t_progress_on_eagain) {
+    t_progress_on_eagain = true;
+}
+
+nixlLibfabricRail::ProgressOnEagainScope::~ProgressOnEagainScope() {
+    t_progress_on_eagain = previous_;
+}
+
+bool
+nixlLibfabricRail::progressesOnEagain() const {
+    return !progress_thread_enabled_ || t_progress_on_eagain;
+}
+
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
                                      uint16_t id,
-                                     enum fi_hmem_iface runtime)
+                                     enum fi_hmem_iface runtime,
+                                     bool write_remote_cq_data)
     : rail_id(id),
       device_name(device),
       provider_name(provider),
@@ -450,7 +467,8 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
       data_request_pool_(NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL, id),
       provider_supports_hmem_(false),
       provider_info_(railProviderInfo(provider)),
-      runtime_(runtime) {
+      runtime_(runtime),
+      write_remote_cq_data_(write_remote_cq_data) {
     // Initialize all pointers to nullptr
     info = nullptr;
     fabric = nullptr;
@@ -1294,7 +1312,7 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
             }
 
             // Progress completion queue to drain pending completions before retry
-            if (!progress_thread_enabled_) {
+            if (progressesOnEagain()) {
                 nixl_status_t progress_status = progressCompletionQueue();
                 if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
                     NIXL_ERROR << "progressCompletionQueue failed on rail " << rail_id
@@ -1411,7 +1429,7 @@ nixlLibfabricRail::drainPostQueue() {
                 msg.data = pr.immediate_data;
 
                 const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
-                ret = fi_writemsg(endpoint, &msg, pr.fi_flags | FI_REMOTE_CQ_DATA);
+                ret = fi_writemsg(endpoint, &msg, pr.fi_flags | writeCqDataFlag());
             } else {
                 struct iovec iov{};
                 iov.iov_base = pr.local_addr;
@@ -1512,7 +1530,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
         // Libfabric fi_writemsg call (supports FI_MORE flag)
         {
             const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
-            ret = fi_writemsg(endpoint, &msg, fi_flags | FI_REMOTE_CQ_DATA);
+            ret = fi_writemsg(endpoint, &msg, fi_flags | writeCqDataFlag());
         }
 
         if (ret == 0) {
@@ -1538,7 +1556,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
             }
 
             // Progress completion queue to drain pending completions before retry
-            if (!progress_thread_enabled_) {
+            if (progressesOnEagain()) {
                 nixl_status_t progress_status = progressCompletionQueue();
                 if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
                     NIXL_ERROR << "progressCompletionQueue failed on rail " << rail_id
@@ -1621,7 +1639,7 @@ nixlLibfabricRail::postRead(void *local_buffer,
             }
 
             // Progress completion queue to drain pending completions before retry
-            if (!progress_thread_enabled_) {
+            if (progressesOnEagain()) {
                 nixl_status_t progress_status = progressCompletionQueue();
                 if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
                     NIXL_ERROR << "progressCompletionQueue failed on rail " << rail_id
