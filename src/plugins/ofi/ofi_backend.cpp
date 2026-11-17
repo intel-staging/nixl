@@ -1478,9 +1478,12 @@ fi_hmem_iface nixlOfiEngine::selectHmemInterface(const nixlBlobDesc &mem) const 
 
 nixl_status_t nixlOfiEngine::registerDramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const {
     uint64_t access_flags = getMemoryRegistrationAccessFlags(fi_);
-    
+    // Without FI_MR_PROV_KEY (tcp, shm) the application chooses keys, and live regions
+    // need distinct ones. The buffer address is unique per region, as in the libfabric plugin.
+    const uint64_t requested_key = (fi_->domain_attr->mr_mode & FI_MR_PROV_KEY) ? 0 : mem.addr;
+
     int ret = fi_mr_reg(domain_, reinterpret_cast<void*>(mem.addr), mem.len,
-                       access_flags, 0, 0, 0, &ofi_meta->mr, nullptr);
+                       access_flags, 0, requested_key, 0, &ofi_meta->mr, nullptr);
     
     if (ret) {
         NIXL_ERROR << "fi_mr_reg failed for system memory: " << fi_strerror(-ret);

@@ -323,6 +323,31 @@ TEST_F(OfiTransferTest, ReleaseInFlight) {
     EXPECT_EQ(initiator_->releaseReqH(h), NIXL_SUCCESS);
 }
 
+// vLLM registers one region per KV layer; a second live region must get its own key.
+TEST_F(OfiTransferTest, SecondRegionOnOneEngine) {
+    std::vector<uint8_t> second(kBlockLen);
+    fill(second, 13);
+    nixlBackendMD *md = registerDram(*target_, second);
+    ASSERT_NE(md, nullptr);
+    nixlBlobDesc blob;
+    ASSERT_EQ(target_->getPublicData(md, blob.metaInfo), NIXL_SUCCESS);
+    nixlBackendMD *key = nullptr;
+    ASSERT_EQ(initiator_->loadRemoteMD(blob, DRAM_SEG, "target", key), NIXL_SUCCESS);
+
+    nixl_meta_dlist_t local(DRAM_SEG), remote(DRAM_SEG);
+    local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(local_.data()), kBlockLen, 0, localMd_));
+    remote.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(second.data()), kBlockLen, 0, key));
+    nixlBackendReqH *h = nullptr;
+    ASSERT_EQ(initiator_->prepXfer(NIXL_READ, local, remote, "target", h), NIXL_SUCCESS);
+    nixl_status_t st = initiator_->postXfer(NIXL_READ, local, remote, "target", h);
+    ASSERT_TRUE(st == NIXL_SUCCESS || st == NIXL_IN_PROG);
+    ASSERT_EQ(waitDone(h), NIXL_SUCCESS);
+    EXPECT_TRUE(std::equal(second.begin(), second.end(), local_.begin()));
+    EXPECT_EQ(initiator_->releaseReqH(h), NIXL_SUCCESS);
+    initiator_->unloadMD(key);
+    target_->deregisterMem(md);
+}
+
 // Without SynapseAI, VRAM must be refused rather than registered as host memory.
 TEST_F(OfiTransferTest, VramNeedsSynapseAI) {
     nixl_mem_list_t mems = initiator_->getSupportedMems();
