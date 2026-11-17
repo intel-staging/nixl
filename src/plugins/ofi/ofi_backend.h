@@ -160,9 +160,7 @@ private:
     bool isConnectionlessProvider() const;
     nixl_status_t setupEndpoint(bool connection_oriented);
     static nixl_status_t getEndpointAddress(fid_ep* endpoint, std::string& address);
-    static void detectHmemCapabilities(struct fi_info* fi_info,
-                                       const std::string& provider_name,
-                                       bool& synapseai_supported);
+    static bool detectHmemCapabilities(const struct fi_info* fi_info, const std::string& provider_name);
     static const ProviderConfig* findProviderConfig(const std::string& provider_name);
     
     // parameter helpers

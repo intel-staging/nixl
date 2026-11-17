@@ -222,7 +222,7 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
                << " isConnectionless=" << isConnectionless_;
 
     // detect HMEM capabilities for this provider
-    detectHmemCapabilities(fi_, providerName_, hmemSynapseaiSupported_);
+    hmemSynapseaiSupported_ = detectHmemCapabilities(fi_, providerName_);
     if (hmemSynapseaiSupported_ && !loadSynapseAI()) {
         NIXL_INFO << "SynapseAI runtime not found; VRAM_SEG is not supported";
         hmemSynapseaiSupported_ = false;
@@ -1454,27 +1454,9 @@ nixl_status_t nixlOfiEngine::getEndpointAddress(fid_ep* endpoint, std::string& a
     return NIXL_SUCCESS;
 }
 
-void nixlOfiEngine::detectHmemCapabilities(struct fi_info* fi_info,
-                                            const std::string& provider_name,
-                                            bool& synapseai_supported) {
-    // Check if provider supports generic HMEM capability
-    if (!fi_info || !(fi_info->caps & FI_HMEM)) {
-        NIXL_DEBUG << "Provider " << provider_name << " does not support generic HMEM";
-        
-        // Special case: verbs can support SynapseAI through DMA buffers
-        // even without advertising FI_HMEM capability.
-        // Evidence: vrb_read_params() logs "dmabuf support is enabled" for verbs
-        if (provider_name == "verbs") {
-            synapseai_supported = true;
-        } else {
-            synapseai_supported = false;
-        }
-        return;
-    }
-
-    NIXL_DEBUG << "Provider " << provider_name << " supports generic HMEM capability";
-
-    synapseai_supported = true;
+// verbs reaches Gaudi HBM through dmabuf even without advertising FI_HMEM
+bool nixlOfiEngine::detectHmemCapabilities(const struct fi_info* fi_info, const std::string& provider_name) {
+    return provider_name == "verbs" || (fi_info && (fi_info->caps & FI_HMEM));
 }
 
 uint64_t nixlOfiEngine::getMemoryRegistrationAccessFlags(const struct fi_info* fi_info) {
