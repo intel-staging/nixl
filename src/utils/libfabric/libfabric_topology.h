@@ -19,6 +19,7 @@
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_TOPOLOGY_H
 
 #include "libfabric_common.h"
+#include "libfabric_accel.h"
 #include "nixl.h"
 #include <hwloc.h>
 #include <unordered_map>
@@ -48,6 +49,12 @@ private:
     int num_aws_accel; // AWS Trainium accelerators
     int num_nvidia_accel; // NVIDIA GPU accelerators
     int num_amd_accel; // AMD GPU accelerators
+    int num_intel_accel; // Discrete Intel GPUs enumerated by Level Zero
+    // Whether Intel GPUs are counted and grouped; see intelAccelCanDecideRuntime()
+    bool intel_accel_eligible_ = false;
+    // Whether hwloc lists an Intel display or processing-accelerator PCI device (integrated GPUs
+    // included); see intelAccelCanBeRuntime()
+    bool intel_gpu_class_seen_ = false;
     int num_numa_nodes;
     int num_devices;
 
@@ -181,6 +188,11 @@ private:
     isNeuronAccel(hwloc_obj_t obj) const;
     bool
     isAmdAccel(hwloc_obj_t obj) const;
+    bool
+    isIntelAccel(hwloc_obj_t obj) const;
+    // Whether Level Zero could become the system runtime, given the other accelerators found
+    bool
+    intelAccelCanDecideRuntime() const;
 
     // retrieves line speed of NIC from map
     size_t
@@ -271,6 +283,23 @@ public:
     int
     getNumAmdAccel() const {
         return num_amd_accel;
+    }
+
+    int
+    getNumIntelAccel() const {
+        return num_intel_accel;
+    }
+
+    /**
+     * @brief Whether Level Zero may become the system runtime: hwloc lists an Intel display or
+     * processing-accelerator PCI device (integrated GPUs included), and there is no NVIDIA or AMD
+     * GPU a GPU build can register, and no Neuron device. Taken from the accelerator inventory,
+     * which is made for every provider, so it holds also where tcp/sockets reset the counts. When
+     * false, Level Zero is never initialised.
+     */
+    bool
+    intelAccelCanBeRuntime() const {
+        return intel_accel_eligible_ && intel_gpu_class_seen_;
     }
 
     const std::vector<std::string> &

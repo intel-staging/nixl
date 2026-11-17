@@ -123,6 +123,7 @@ namespace {
         /*notify_after_completion=*/false,
         /*single_domain=*/false,
         /*select_domains=*/nullptr,
+        /*carries_ze=*/true,
     };
 
     const nixlLibfabricProviderInfo k_efa_provider = {
@@ -139,6 +140,8 @@ namespace {
         /*notify_after_completion=*/false,
         /*single_domain=*/false,
         /*select_domains=*/nullptr,
+        // libfabric's efa provider has no Level Zero support.
+        /*carries_ze=*/false,
     };
 
     const nixlLibfabricProviderInfo k_verbs_provider = {
@@ -160,6 +163,7 @@ namespace {
         /*notify_after_completion=*/true,
         /*single_domain=*/false,
         /*select_domains=*/selectVerbsDomains,
+        /*carries_ze=*/true,
     };
 
     const nixlLibfabricProviderInfo k_tcp_provider = {
@@ -176,6 +180,7 @@ namespace {
         /*notify_after_completion=*/false,
         /*single_domain=*/true,
         /*select_domains=*/nullptr,
+        /*carries_ze=*/true,
     };
 
     const nixlLibfabricProviderInfo k_sockets_provider = {
@@ -192,6 +197,7 @@ namespace {
         /*notify_after_completion=*/false,
         /*single_domain=*/true,
         /*select_domains=*/nullptr,
+        /*carries_ze=*/false,
     };
 
     /*

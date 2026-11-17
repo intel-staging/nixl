@@ -19,6 +19,7 @@
 #include "libfabric/libfabric_topology.h"
 #include "libfabric/libfabric_common.h"
 #include "libfabric/libfabric_rail_manager.h"
+#include "libfabric/libfabric_accel.h"
 #include "common/nixl_log.h"
 #include "gpu_utils.h"
 
@@ -588,7 +589,9 @@ testBasicTopology() {
 
                 std::string device_list;
                 for (const auto &device : gpu_devices) {
-                    if (!device_list.empty()) device_list += " ";
+                    if (!device_list.empty()) {
+                        device_list += " ";
+                    }
                     device_list += device;
                 }
                 NIXL_INFO << "   GPU " << gpu_id << " (PCI: " << pci_bus_id << ") mapped to "
@@ -599,6 +602,33 @@ testBasicTopology() {
             }
         } else {
             NIXL_INFO << "3. Skipping GPU-specific tests (no GPUs detected)";
+        }
+
+        // Intel GPUs are matched against the Level Zero driver's devices, so check live hwloc:
+        // every discrete GPU the driver lists is counted, unless Level Zero cannot become the
+        // runtime or the provider skips accelerator discovery.
+        const int intel = topology.getNumIntelAccel();
+        NIXL_INFO << "4. Intel accelerators detected: " << intel;
+        bool outranked = topology.getNumAwsAccel() > 0;
+#ifdef HAVE_GPU // CUDA or ROCm test build; the plugin defines HAVE_CUDA for both
+        outranked = outranked || topology.getNumNvidiaAccel() > 0 || topology.getNumAmdAccel() > 0;
+#endif
+        int expected_intel = 0;
+        if (!nfi_hmem_iface_available(FI_HMEM_ZE)) {
+            NIXL_INFO << "   Level Zero unavailable: expecting none";
+        } else if (!LibfabricUtils::providerNeedsFullTopology(topology.getProviderName())) {
+            NIXL_INFO << "   " << topology.getProviderName() << " skips accelerator discovery";
+        } else if (outranked) {
+            NIXL_INFO << "   another runtime outranks Level Zero: expecting none";
+        } else {
+            expected_intel = static_cast<int>(nfi_hmem_device_bdfs(FI_HMEM_ZE, nullptr, 0));
+            NIXL_INFO << "   expecting the " << expected_intel
+                      << " discrete GPU(s) Level Zero lists";
+        }
+        if (intel != expected_intel) {
+            NIXL_ERROR << "   topology reports " << intel << " Intel accelerator(s), expected "
+                       << expected_intel;
+            return 1;
         }
     }
     catch (const std::exception &e) {

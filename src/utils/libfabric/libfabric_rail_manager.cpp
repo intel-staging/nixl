@@ -19,6 +19,7 @@
 #include "libfabric_rail_manager.h"
 #include "libfabric/libfabric_common.h"
 #include "libfabric/libfabric_topology.h"
+#include "libfabric/nfi_hmem.h"
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
 #include <sstream>
@@ -201,21 +202,41 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
     NIXL_DEBUG << "Creating rail manager with striping threshold: " << striping_threshold_
                << " bytes";
 
+    // Before topology discovery, which initialises the accelerator runtimes
+    nixlAccelInstallLogBridge();
+
     // Initialize topology system
     topology = std::make_unique<nixlLibfabricTopology>();
 
-    // Determine system runtime type once at initialization
-    if (topology->getNumNvidiaAccel() > 0) {
+    // Determine system runtime type once at initialization. NVIDIA and AMD GPUs decide it as
+    // before Level Zero support, except that a build without CUDA or ROCm (neither defines
+    // HAVE_CUDA) cannot register their memory, so discrete Intel GPUs the topology counted
+    // (nixlLibfabricTopology::intelAccelCanDecideRuntime()) take precedence there.
+    const bool have_cuda_build =
+#ifdef HAVE_CUDA
+        true;
+#else
+        false;
+#endif
+    const bool other_gpus_decide = have_cuda_build || topology->getNumIntelAccel() == 0;
+    if (other_gpus_decide && topology->getNumNvidiaAccel() > 0) {
         runtime_ = FI_HMEM_CUDA;
         NIXL_INFO << "System runtime: CUDA for " << topology->getNumNvidiaAccel()
                   << " NVIDIA GPU(s)";
-    } else if (topology->getNumAmdAccel() > 0) {
+    } else if (other_gpus_decide && topology->getNumAmdAccel() > 0) {
         runtime_ = FI_HMEM_ROCR;
         NIXL_INFO << "System runtime: ROCr for " << topology->getNumAmdAccel() << " AMD GPU(s)";
     } else if (topology->getNumAwsAccel() > 0) {
         runtime_ = FI_HMEM_NEURON;
         NIXL_INFO << "System runtime: NEURON for " << topology->getNumAwsAccel()
                   << " AWS Trainium device(s)";
+    } else if (topology->getNumIntelAccel() > 0 ||
+               (topology->intelAccelCanBeRuntime() && nfi_hmem_iface_available(FI_HMEM_ZE))) {
+        // Also asked of Level Zero, where nothing outranks it and hwloc lists an Intel GPU:
+        // tcp/sockets reset the accelerator counts, and integrated GPUs are not counted.
+        runtime_ = FI_HMEM_ZE;
+        NIXL_INFO << "System runtime: ZE for " << topology->getNumIntelAccel()
+                  << " discrete Intel GPU(s)";
     } else {
         runtime_ = FI_HMEM_SYSTEM;
         NIXL_INFO << "System runtime: SYSTEM (no accelerators)";
@@ -857,7 +878,8 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
 
     enum fi_hmem_iface iface = FI_HMEM_SYSTEM;
     if (mem_type == VRAM_SEG) {
-        iface = topology->getMrAttrIface(device_id);
+        // Level Zero device_id is a driver ordinal, not a nixl device index.
+        iface = (runtime_ == FI_HMEM_ZE) ? FI_HMEM_ZE : topology->getMrAttrIface(device_id);
     }
 
     // Dmabufs exported for this registration, indexed by mapping type
