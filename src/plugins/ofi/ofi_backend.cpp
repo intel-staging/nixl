@@ -946,7 +946,7 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
 
     // NIXL_SUCCESS from postXfer means the transfer already finished, and the agent then
     // never calls checkXfer. Report posted-but-uncompleted operations as in progress.
-    return ofi_req->pending() == 0 ? NIXL_SUCCESS : NIXL_IN_PROG;
+    return transferStatus(ofi_req);
 }
 
 void nixlOfiEngine::connectionProgressFunc() {
@@ -1075,6 +1075,16 @@ int nixlOfiEngine::ofi_progress_manual(fid_cq *cq) const {
     return total_processed > 0 ? total_processed : -FI_EAGAIN;
 }
 
+// A completion records its error before it decrements the count, so read the count
+// first: once it reads 0, every error is visible.
+nixl_status_t nixlOfiEngine::transferStatus(const nixlOfiRequest *req) {
+    const uint64_t pending = req->pending();
+    if (req->failed.load()) {
+        return NIXL_ERR_BACKEND;
+    }
+    return pending == 0 ? NIXL_SUCCESS : NIXL_IN_PROG;
+}
+
 nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
     if (shutdownFlag_.load()) {
         return NIXL_ERR_BACKEND;  // shutdown in progress
@@ -1092,10 +1102,7 @@ nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
         }
     }
 
-    if (ofi_req->failed.load()) {
-        return NIXL_ERR_BACKEND;
-    }
-    return ofi_req->pending() == 0 ? NIXL_SUCCESS : NIXL_IN_PROG;
+    return transferStatus(ofi_req);
 }
 
 nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {

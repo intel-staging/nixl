@@ -155,6 +155,7 @@ private:
     void driveProgressIfNeeded() const;
     int ofi_progress_manual(fid_cq *cq) const;
     static void completeOp(void *op_context, bool error);
+    static nixl_status_t transferStatus(const nixlOfiRequest *req);
     nixl_status_t resolveTarget(const std::string &remote_agent, fid_ep *&target_ep,
                                 fi_addr_t &dest_addr) const;
     bool isConnectionlessProvider() const;
