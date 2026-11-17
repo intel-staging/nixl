@@ -108,8 +108,7 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     }
 
     // validate that the provider is supported
-    const auto* config = findProviderConfig(providerName_);
-    if (!config) {
+    if (providerName_ != "verbs" && providerName_ != "tcp" && providerName_ != "shm") {
         NIXL_ERROR << "Unsupported provider: " << providerName_;
         NIXL_ERROR << "Supported providers: shm, tcp, verbs";
         this->initErr = true;
@@ -324,33 +323,8 @@ void nixlOfiEngine::getLongParam(const nixlBackendInitParams* init_params, const
 
 // predefined provider configurations for providers that need explicit settings
 // Note: SHM and TCP providers use minimal auto-negotiated configuration instead
+// tcp and shm use minimal hints (see the constructor), so only verbs needs a config here.
 const nixlOfiEngine::ProviderConfig nixlOfiEngine::SUPPORTED_PROVIDERS[] = {
-    {   
-        "shm",
-        FI_EP_RDM,
-        FI_HMEM, // not implemented Gaudi HBM
-        0,  // let provider choose mode
-        0,  // let provider choose MR mode  
-        FI_RM_UNSPEC,
-        {0, 0, 0, 0, 0, 0, 0, 0, FI_TC_UNSPEC}, // tx_attr defaults
-        {0, 0, 0, 0, 0, 0}, // rx_attr defaults
-        FI_FORMAT_UNSPEC,
-        FI_PROGRESS_AUTO,
-        FI_PROGRESS_AUTO
-    },
-    {
-        "tcp",
-        FI_EP_MSG,
-        FI_MSG | FI_RMA | FI_READ | FI_WRITE,
-        FI_CONTEXT | FI_CONTEXT2,
-        0, // let provider choose mr_mode
-        FI_RM_ENABLED,
-        {0, 0, 0, 0, 0, 0, 0, 0, FI_TC_BULK_DATA}, // tx_attr with bulk data class
-        {0, 0, 0, 0, 0, 0}, // rx_attr defaults
-        FI_FORMAT_UNSPEC,
-        FI_PROGRESS_MANUAL,
-        FI_PROGRESS_MANUAL
-    },
     {
         // Match verbs;ofi_rxm capabilities from fi_info output
         "verbs",
@@ -380,15 +354,8 @@ const nixlOfiEngine::ProviderConfig* nixlOfiEngine::findProviderConfig(const std
 }
 
 void nixlOfiEngine::configureHintsForProvider(struct fi_info* hints, const std::string& provider_name) {
+    // the constructor has validated the name, and only verbs gets here
     const auto* config = findProviderConfig(provider_name);
-
-    if (!config) {
-        // if the provider is not in our list, use the verbs config as a safe default
-        config = findProviderConfig("verbs");
-        NIXL_DEBUG << "Unknown provider '" << provider_name << "', using verbs config as a fallback.";
-    } else {
-        NIXL_DEBUG << "Using predefined config for provider: " << provider_name;
-    }
 
     // apply the configuration from the data structure
     hints->ep_attr->type = config->ep_type;
