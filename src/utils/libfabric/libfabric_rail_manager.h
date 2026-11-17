@@ -76,9 +76,12 @@ public:
     /** Initialize rail manager with topology discovery and create rails based on available
      * network devices
      * @param striping_threshold Size threshold for enabling multi-rail striping
+     * @param progress_thread_enabled Whether the backend runs a progress thread. Without one,
+     *        lazily connecting providers get FI_PROGRESS_AUTO rails
      * @throws std::runtime_error if initialization fails
      */
-    nixlLibfabricRailManager(size_t striping_threshold);
+    explicit nixlLibfabricRailManager(size_t striping_threshold,
+                                      bool progress_thread_enabled = true);
     /** Destroy rail manager and cleanup all resources */
     ~nixlLibfabricRailManager();
 
@@ -192,6 +195,11 @@ public:
                        uint32_t agent_idx,
                        std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs_out,
                        std::vector<char *> &ep_names_out);
+
+    /** Whether every rail must be progressed. See providerNeedsAllRailProgress(). Valid once the
+     *  rails are created. */
+    bool
+    needsAllRailProgress() const;
 
     /** Whether a WRITE's notification waits for the WRITE to complete locally. See
      *  providerNotifiesAfterCompletion(). Valid once the rails are created; the rails post writes
@@ -403,8 +411,12 @@ private:
     // System runtime type (determined once at initialization)
     fi_hmem_iface runtime_;
 
+    // Whether the backend runs a progress thread
+    bool progress_thread_enabled_;
     // See notifiesAfterCompletion(). Set in createRails(), before any transfer.
     bool notify_after_completion_ = false;
+    // See needsAllRailProgress(). Set in createRails(), before any transfer.
+    bool needs_all_rail_progress_ = false;
 
     // Immediate data for one write of transfer xfer_id: a fresh SEQ_ID, or 0 when writes carry
     // no remote CQ data.
