@@ -2277,6 +2277,15 @@ nixlLibfabricEngine::notifXferFailure(nixlLibfabricBackendH *backend_handle,
     // Sent after the error message on the same rail and endpoint, so the target sees the failure
     // first (ofi_rxm keeps send-after-send order).
     if (notify_after_completion_ && backend_handle->claim_completion_notif()) {
+        if (status != NIXL_SUCCESS) {
+            // The target counts no writes, so without the error message it would release the
+            // notification as a complete transfer. Leave it waiting instead.
+            NIXL_ERROR << "Not sending the notification of failed XFER_ID="
+                       << backend_handle->post_xfer_id << " to " << backend_handle->remote_agent_
+                       << ": its transfer-error message could not be sent";
+            backend_handle->completion_notif_result_->finish(status);
+            return;
+        }
         status = notifSendPriv(backend_handle->remote_agent_,
                                backend_handle->binary_notifs,
                                backend_handle->total_notif_msg_len,
