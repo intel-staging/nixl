@@ -746,8 +746,7 @@ nixl_status_t nixlOfiEngine::registerMem(const nixlBlobDesc &mem,
         ofi_meta->base = mem.addr;
     } else {  // VRAM_SEG
         // determine device interface for VRAM
-        uint64_t device_id = 0;
-        fi_hmem_iface iface = selectHmemInterface(mem, device_id);
+        fi_hmem_iface iface = selectHmemInterface(mem);
         
         if (iface == FI_HMEM_SYNAPSEAI) {
             status = registerSynapseAIMemoryExplicit(mem, ofi_meta);
@@ -1569,90 +1568,13 @@ uint64_t nixlOfiEngine::getMemoryRegistrationAccessFlags(const struct fi_info* f
     return access_flags;
 }
 
-fi_hmem_iface nixlOfiEngine::selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const {
-    device_id = mem.devId >= 0 ? mem.devId : 0;
-    
-    // helper for safe environment variable checking
-    auto isEnvTrue = [](const char* env_val) -> bool {
-        return env_val && (strcmp(env_val, "1") == 0 || strcmp(env_val, "true") == 0);
-    };
-    
-    // Synapse device validation
-    auto validateSynapseAIDevice = [](uint64_t dev_id) -> bool {
-        std::string device_path = "/dev/accel/accel" + std::to_string(dev_id);
-        if (access(device_path.c_str(), R_OK | W_OK) != 0) {
-            NIXL_INFO << "SynapseAI device " << device_path << " not accessible, will fallback to system memory";
-            return false;
-        }
-        return true;
-    };
-    
-    
-    // HMEM interface configuration
-    struct HmemConfig {
-        fi_hmem_iface iface;
-        bool supported;
-        const char* name;
-        const char* explicit_env;      // HMEM_SYNAPSEAI
-        const char* implicit_env;      // HABANA_VISIBLE_DEVICES
-        std::function<bool(uint64_t)> validate;
-    };
-    
-    const HmemConfig configs[] = {
-        {
-            FI_HMEM_SYNAPSEAI, 
-            hmemSynapseaiSupported_, 
-            "SynapseAI",
-            "HMEM_SYNAPSEAI", 
-            "HABANA_VISIBLE_DEVICES",
-            validateSynapseAIDevice
-        }
-    };
-    
-    // 1 check explicit environment variable overrides first
-    for (const auto& config : configs) {
-        const char* explicit_env = getenv(config.explicit_env);
-        if (isEnvTrue(explicit_env)) {
-            if (!config.supported) {
-                NIXL_ERROR << config.explicit_env << " set but " << config.name 
-                          << " interface not supported by provider";
-                return FI_HMEM_SYSTEM;
-            }
-            if (!config.validate(device_id)) {
-                return FI_HMEM_SYSTEM;
-            }
-            NIXL_INFO << "Using " << config.name << " HMEM interface for device " 
-                     << device_id << " (via " << config.explicit_env << ")";
-            return config.iface;
-        }
+// VRAM on this plugin is Gaudi HBM: SynapseAI when supported and the device is accessible.
+fi_hmem_iface nixlOfiEngine::selectHmemInterface(const nixlBlobDesc &mem) const {
+    std::string device_path = "/dev/accel/accel" + std::to_string(mem.devId);
+    if (hmemSynapseaiSupported_ && access(device_path.c_str(), R_OK | W_OK) == 0) {
+        return FI_HMEM_SYNAPSEAI;
     }
-    
-    // 2 check implicit environment variables
-    for (const auto& config : configs) {
-        const char* implicit_env = getenv(config.implicit_env);
-        if (implicit_env && config.supported) {
-            if (!config.validate(device_id)) {
-                if (config.iface == FI_HMEM_SYNAPSEAI) {
-                    NIXL_ERROR << "  unset " << config.implicit_env << " to use host memory";
-                }
-                return FI_HMEM_SYSTEM;
-            }
-            NIXL_INFO << "Using " << config.name << " HMEM interface for device " 
-                     << device_id << " (via " << config.implicit_env << ")";
-            return config.iface;
-        }
-    }
-    
-    // 3 auto-select from supported interfaces
-    NIXL_INFO << "No HMEM environment variables detected, auto-selecting interface for VRAM";
-    for (const auto& config : configs) {
-        if (config.supported && config.validate(device_id)) {
-            NIXL_INFO << "Auto-selected " << config.name << " HMEM interface for device " << device_id;
-            return config.iface;
-        }
-    }
-    
-    NIXL_WARN << "No HMEM interfaces supported. Falling back to host memory registration";
+    NIXL_INFO << "SynapseAI device " << device_path << " not usable for VRAM";
     return FI_HMEM_SYSTEM;
 }
 
