@@ -1331,29 +1331,8 @@ void nixlOfiEngine::eq_event_loop() {
 }
 
 bool nixlOfiEngine::isConnectionlessProvider() const {
-    // use libfabric's endpoint type to determine connection model
-    // FI_EP_RDM (Reliable Datagram) = connectionless
-    // FI_EP_MSG (Message) = connection-oriented  
-    // FI_EP_DGRAM (Datagram) = connectionless
-    NIXL_DEBUG << "isConnectionlessProvider: checking fi_=" << (fi_ ? "valid" : "null") 
-               << " ep_attr=" << (fi_ && fi_->ep_attr ? "valid" : "null");
-    
-    if (fi_ && fi_->ep_attr) {
-        enum fi_ep_type ep_type = fi_->ep_attr->type;
-        bool is_connectionless = (ep_type == FI_EP_RDM || ep_type == FI_EP_DGRAM);
-        NIXL_DEBUG << "isConnectionlessProvider: ep_type=" << ep_type 
-                   << " (RDM=" << FI_EP_RDM << " DGRAM=" << FI_EP_DGRAM << ")"
-                   << " result=" << is_connectionless;
-        return is_connectionless;
-    }
-    
-    // fallback: if fi_ not available yet, use provider names for known cases
-    if (providerName_.find("ofi_rxm") != std::string::npos || 
-        providerName_ == "shm" || providerName_ == "udp") {
-        return true;
-    }
-    
-    return false;
+    // RDM and DGRAM endpoints are connectionless; MSG endpoints are connection-oriented
+    return fi_ && fi_->ep_attr && (fi_->ep_attr->type == FI_EP_RDM || fi_->ep_attr->type == FI_EP_DGRAM);
 }
 
 nixl_status_t nixlOfiEngine::setupEndpoint(bool connection_oriented) {
