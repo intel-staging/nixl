@@ -309,8 +309,25 @@ TEST_F(OfiTransferTest, RepostHandle) {
     EXPECT_EQ(initiator_->releaseReqH(h), NIXL_SUCCESS);
 }
 
-// Releasing with operations in flight must neither crash nor leak the request
-// (run under ASan/TSan to check the release/completion handoff).
+// A failure is reported only once nothing is in flight: on an error the agent drops the
+// request, and the caller may then free buffers the NIC is still accessing.
+TEST_F(OfiTransferTest, FailureWaitsForOutstanding) {
+    nixl_meta_dlist_t local(DRAM_SEG), remote(DRAM_SEG);
+    buildLists(0, kBlocks, local, remote);
+    nixlBackendReqH *h = nullptr;
+    ASSERT_EQ(initiator_->prepXfer(NIXL_READ, local, remote, "target", h), NIXL_SUCCESS);
+
+    auto *req = static_cast<nixlOfiRequest *>(h);
+    req->outstanding.fetch_add(1);
+    req->failed.store(true);
+    EXPECT_EQ(initiator_->checkXfer(h), NIXL_IN_PROG);
+    req->outstanding.fetch_sub(1);
+    EXPECT_EQ(initiator_->checkXfer(h), NIXL_ERR_BACKEND);
+    EXPECT_EQ(initiator_->releaseReqH(h), NIXL_SUCCESS);
+}
+
+// Releasing right after posting waits for the operations to drain, and later transfers are
+// still credited correctly.
 TEST_F(OfiTransferTest, ReleaseInFlight) {
     for (int i = 0; i < 20; ++i) {
         nixlBackendReqH *h = start(NIXL_READ, 0, kBlocks);
