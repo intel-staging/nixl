@@ -175,7 +175,7 @@ private:
     
     // Memory registration helpers
     static uint64_t getMemoryRegistrationAccessFlags(const struct fi_info* fi_info);
-    fi_hmem_iface selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const;
+    fi_hmem_iface selectHmemInterface(const nixlBlobDesc &mem) const;
     nixl_status_t registerDramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
 
     // data members
