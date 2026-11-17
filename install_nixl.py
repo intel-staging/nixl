@@ -42,6 +42,15 @@ def installed_version(package_name):
         return None
 
 
+def ofi_installed():
+    """True when the installed backend wheel has the OFI plugin; upstream wheels do not."""
+    try:
+        files = importlib.metadata.distribution(NIXL_BACKEND_PACKAGE).files or []
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return any('libplugin_OFI' in str(f) for f in files)
+
+
 def find_nixl_wheel_in_cache(cache_dir, repaired=True):
     """Finds a NIXL backend wheel file in the specified cache directory."""
     # Only a repaired wheel carries a 'manylinux' tag; a failed repair can leave
@@ -56,17 +65,16 @@ def find_nixl_wheel_in_cache(cache_dir, repaired=True):
     return None
 
 
-def install_nixl_wheels(backend_wheel, force_reinstall):
+def install_nixl_wheels(backend_wheel):
     """Installs the NIXL backend wheel together with the matching `nixl` meta package."""
     meta_wheel = os.path.join(WHEELS_CACHE_HOME, f"nixl-{NIXL_VERSION}-py3-none-any.whl")
     if not os.path.exists(meta_wheel):
         run_command([sys.executable, '-m', 'pip', 'download', '--no-deps', f'nixl=={NIXL_VERSION}',
                      f'--dest={WHEELS_CACHE_HOME}'])
-    # w/o "no-deps", it will install cuda-torch
-    install_command = [sys.executable, '-m', 'pip', 'install', '--no-deps', backend_wheel, meta_wheel]
-    if force_reinstall:
-        install_command.insert(-2, '--force-reinstall')
-    run_command(install_command)
+    # w/o "no-deps", it will install cuda-torch. Force, or pip keeps a same-version
+    # upstream nixl_cu12 that has no OFI plugin.
+    run_command([sys.executable, '-m', 'pip', 'install', '--no-deps', '--force-reinstall',
+                 backend_wheel, meta_wheel])
 
 
 def install_system_dependencies():
@@ -106,9 +114,10 @@ def install_system_dependencies():
 def build_and_install_prerequisites(args):
     """Builds UCX and NIXL from source, creating a self-contained wheel."""
 
-    # An older NIXL (e.g. 0.7.0 baked into an image) must not count as installed.
+    # An older NIXL (e.g. 0.7.0 baked into an image), or upstream NIXL without OFI, must not
+    # count as installed.
     if (not args.force_reinstall and installed_version('nixl') == NIXL_VERSION
-            and installed_version(NIXL_BACKEND_PACKAGE) == NIXL_VERSION):
+            and installed_version(NIXL_BACKEND_PACKAGE) == NIXL_VERSION and ofi_installed()):
         print(f"--> NIXL {NIXL_VERSION} is already installed. Nothing to do.", flush=True)
         return
 
@@ -117,7 +126,7 @@ def build_and_install_prerequisites(args):
     if not args.force_reinstall and cached_wheel:
         print(f"\n--> Found self-contained wheel: {os.path.basename(cached_wheel)}.", flush=True)
         print("--> Installing from cache, skipping all source builds.", flush=True)
-        install_nixl_wheels(cached_wheel, force_reinstall=False)
+        install_nixl_wheels(cached_wheel)
         print("\n--- Installation from cache complete. ---", flush=True)
         return
 
@@ -283,7 +292,7 @@ def build_and_install_prerequisites(args):
 
     print(f"--> Successfully built self-contained wheel: {os.path.basename(newly_built_wheel)}. Now installing...",
           flush=True)
-    install_nixl_wheels(newly_built_wheel, args.force_reinstall)
+    install_nixl_wheels(newly_built_wheel)
     print("--- NIXL installation complete ---", flush=True)
 
 
