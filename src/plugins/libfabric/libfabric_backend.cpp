@@ -221,14 +221,15 @@ zeQueryVram(const nixlBlobDesc &mem, std::string &pci_bus_id, int &device_id) {
     }
 
     if (info.pooled_check_skipped) {
-        static std::once_flag warned;
-        std::call_once(warned, [&]() {
-            NIXL_WARN << "Could not check whether Level Zero VRAM buffer " << (void *)mem.addr
-                      << " is a slice of a pooled allocation, which the NIC would address at the "
-                      << "wrong offset; registering it anyway. Allocate NIXL buffers with "
-                      << "zeMemAllocDevice() and a chained ze_external_memory_export_desc_t to be "
-                      << "safe. Reported once.";
-        });
+        // Unverified is treated as pooled: the NIC would address a pooled slice at the wrong
+        // offset. The check runs whenever the buffer can be exported as a dma-buf, which
+        // libfabric's verbs provider also needs to register Level Zero memory.
+        NIXL_ERROR << "Cannot register VRAM buffer " << (void *)mem.addr << ": could not check "
+                   << "whether it is a slice of a pooled Level Zero buffer object, which the NIC "
+                   << "would address at the wrong offset. Allocate memory for NIXL with "
+                   << "zeMemAllocDevice() and a chained ze_external_memory_export_desc_t "
+                   << "(ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF)";
+        return NIXL_ERR_NOT_SUPPORTED;
     }
 
     pci_bus_id = accelBusIdString(info);
