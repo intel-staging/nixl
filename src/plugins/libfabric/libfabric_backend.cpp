@@ -804,6 +804,8 @@ nixlLibfabricEngine::~nixlLibfabricEngine() {
     } else if (!progress_thread_enabled_) {
         NIXL_DEBUG << "Progress thread was not running";
     }
+    // The progress thread fails what it leaves queued; without one, nothing would.
+    failQueuedCompletionNotifs();
     NIXL_DEBUG << "All threads stopped, now cleaning up resources";
     cleanup();
 }
@@ -1834,6 +1836,8 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
             NIXL_ERROR << "Failed to progress rails in postXfer";
             return progress_status;
         }
+        // Without a progress thread, send what the progress thread would have.
+        sendQueuedCompletionNotifs();
     }
 
     // A last completion the progress thread reaped before the adjust above was not seen as last,
@@ -1920,17 +1924,22 @@ nixlLibfabricEngine::onXferComplete(nixlLibfabricBackendH &handle) const {
     // Runs inside the progress thread's CQ processing, which must not post: queue a copy and let
     // the progress thread send it once the CQs are drained. Called before the completion is
     // counted, so the handle is not yet complete to anyone else and cannot change under the copy.
+    queueCompletionNotif({handle.remote_agent_,
+                          handle.binary_notifs,
+                          handle.total_notif_msg_len,
+                          handle.post_xfer_id,
+                          handle.completion_notif_result_});
+}
+
+void
+nixlLibfabricEngine::queueCompletionNotif(CompletionNotif &&notif) const {
     const std::lock_guard<std::mutex> lock(completion_notifs_mutex_);
-    completion_notifs_.push_back({handle.remote_agent_,
-                                  handle.binary_notifs,
-                                  handle.total_notif_msg_len,
-                                  handle.post_xfer_id,
-                                  handle.completion_notif_result_});
+    completion_notifs_.push_back(std::move(notif));
     completion_notifs_pending_.store(true, std::memory_order_release);
 }
 
 void
-nixlLibfabricEngine::sendQueuedCompletionNotifs() {
+nixlLibfabricEngine::sendQueuedCompletionNotifs() const {
     if (!completion_notifs_pending_.load(std::memory_order_acquire)) {
         return;
     }
@@ -1965,7 +1974,7 @@ nixlLibfabricEngine::sendQueuedCompletionNotifs() {
             continue;
         }
         if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "PT: failed to send the notification for XFER_ID=" << n.xfer_id << " to "
+            NIXL_ERROR << "Failed to send the notification for XFER_ID=" << n.xfer_id << " to "
                        << n.remote_agent << " (status " << status << ")";
         }
         n.result->finish(status);
@@ -1980,7 +1989,7 @@ nixlLibfabricEngine::sendQueuedCompletionNotifs() {
 }
 
 void
-nixlLibfabricEngine::failQueuedCompletionNotifs() {
+nixlLibfabricEngine::failQueuedCompletionNotifs() const {
     std::vector<CompletionNotif> left;
     {
         const std::lock_guard<std::mutex> lock(completion_notifs_mutex_);
@@ -1988,7 +1997,7 @@ nixlLibfabricEngine::failQueuedCompletionNotifs() {
         completion_notifs_pending_.store(false, std::memory_order_relaxed);
     }
     for (auto &n : left) {
-        NIXL_WARN << "PT: stopping with the notification for XFER_ID=" << n.xfer_id << " to "
+        NIXL_WARN << "Stopping with the notification for XFER_ID=" << n.xfer_id << " to "
                   << n.remote_agent << " not sent (" << n.next_fragment << " of "
                   << n.fragments.size() << " fragments posted)";
         n.result->finish(NIXL_ERR_BACKEND);
@@ -2005,6 +2014,7 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
             NIXL_ERROR << "Failed to progress rails in checkXfer";
             return progress_status;
         }
+        sendQueuedCompletionNotifs();
     }
 
     // Then check for completions after processing any pending completions
@@ -2248,7 +2258,8 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
 nixl_status_t
 nixlLibfabricEngine::notifXferErrorPriv(const std::string &remote_agent,
                                         uint16_t notif_xfer_id,
-                                        uint32_t final_completions) const {
+                                        uint32_t final_completions,
+                                        std::function<void(nixl_status_t)> on_send_complete) const {
     std::shared_ptr<nixlLibfabricConnection> connection;
     {
         std::lock_guard<std::mutex> lock(connection_state_mutex_);
@@ -2281,14 +2292,18 @@ nixlLibfabricEngine::notifXferErrorPriv(const std::string &remote_agent,
     // caller's backend handle may already have been released, so capture values only and never
     // touch the handle.
     auto send_completion = [agent = remote_agent,
-                            xfer_id = notif_xfer_id](nixl_status_t send_status) {
-        if (send_status == NIXL_SUCCESS) {
-            return;
+                            xfer_id = notif_xfer_id,
+                            on_send_complete =
+                                std::move(on_send_complete)](nixl_status_t send_status) {
+        if (send_status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Transfer-error message to " << agent << " for XFER_ID=" << xfer_id
+                       << " failed in its send CQ with status " << send_status
+                       << "; that agent will keep waiting for writes that never arrive and will "
+                       << "not see this transfer's notification";
         }
-        NIXL_ERROR << "Transfer-error message to " << agent << " for XFER_ID=" << xfer_id
-                   << " failed in its send CQ with status " << send_status << "; that agent will "
-                   << "keep waiting for writes that never arrive and will not see this transfer's "
-                   << "notification";
+        if (on_send_complete) {
+            on_send_complete(send_status);
+        }
     };
 
     nixl_status_t status =
@@ -2301,12 +2316,12 @@ nixlLibfabricEngine::notifXferErrorPriv(const std::string &remote_agent,
         return NIXL_ERR_BACKEND;
     }
 
-    // Without a progress thread, progress rail to ensure the message is sent
+    // Without a progress thread, push it out. Its own status goes to on_send_complete, not here.
     if (!progress_thread_enabled_) {
         status = rail_manager_.getRail(rail_id).progressCompletionQueue();
         if (status != NIXL_SUCCESS && status != NIXL_IN_PROG) {
-            NIXL_ERROR << "Failed to progress rail 0 in notifXferErrorPriv";
-            return status;
+            NIXL_WARN << "Progressing rail 0 after posting the transfer-error message for XFER_ID="
+                      << notif_xfer_id << " reported status " << status;
         }
     }
 
@@ -2340,38 +2355,44 @@ nixlLibfabricEngine::notifXferFailure(nixlLibfabricBackendH *backend_handle,
                << backend_handle->get_submitted_requests_count()
                << " writes completed; notifying target so it does not wait for the rest";
 
-    nixl_status_t status = notifXferErrorPriv(
-        backend_handle->remote_agent_, backend_handle->post_xfer_id, final_completions);
+    // With notify-after-completion the notification is owed too. The target counts no writes, so
+    // without the error message it would release it as complete: send it only once the error
+    // message's send has completed, which also orders the two. That completion runs inside CQ
+    // processing, which must not post, possibly after the handle is released, so it queues a copy.
+    std::shared_ptr<CompletionNotif> owed;
+    std::function<void(nixl_status_t)> on_send_complete;
+    if (notify_after_completion_ && backend_handle->claim_completion_notif()) {
+        owed = std::make_shared<CompletionNotif>(
+            CompletionNotif{backend_handle->remote_agent_,
+                            backend_handle->binary_notifs,
+                            backend_handle->total_notif_msg_len,
+                            backend_handle->post_xfer_id,
+                            backend_handle->completion_notif_result_});
+        on_send_complete = [this, owed](nixl_status_t send_status) {
+            if (send_status == NIXL_SUCCESS) {
+                queueCompletionNotif(CompletionNotif(*owed)); // a copy: owed stays whole
+            } else {
+                owed->result->finish(send_status);
+            }
+        };
+    }
+
+    const nixl_status_t status = notifXferErrorPriv(backend_handle->remote_agent_,
+                                                    backend_handle->post_xfer_id,
+                                                    final_completions,
+                                                    std::move(on_send_complete));
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Could not notify " << backend_handle->remote_agent_
                    << " of the transfer error for XFER_ID=" << backend_handle->post_xfer_id
                    << " (status " << status
                    << "); that agent will keep waiting for writes that never arrive";
+        if (owed) {
+            owed->result->finish(status); // not sent: the target would take it as complete
+        }
     }
-
-    // Sent after the error message on the same rail and endpoint, so the target sees the failure
-    // first (ofi_rxm keeps send-after-send order).
-    if (notify_after_completion_ && backend_handle->claim_completion_notif()) {
-        if (status != NIXL_SUCCESS) {
-            // The target counts no writes, so without the error message it would release the
-            // notification as a complete transfer. Leave it waiting instead.
-            NIXL_ERROR << "Not sending the notification of failed XFER_ID="
-                       << backend_handle->post_xfer_id << " to " << backend_handle->remote_agent_
-                       << ": its transfer-error message could not be sent";
-            backend_handle->completion_notif_result_->finish(status);
-            return;
-        }
-        status = notifSendPriv(backend_handle->remote_agent_,
-                               backend_handle->binary_notifs,
-                               backend_handle->total_notif_msg_len,
-                               backend_handle->post_xfer_id,
-                               0);
-        if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Could not send the notification of failed XFER_ID="
-                       << backend_handle->post_xfer_id << " to " << backend_handle->remote_agent_
-                       << " (status " << status << ")";
-        }
-        backend_handle->completion_notif_result_->finish(status);
+    if (!progress_thread_enabled_) {
+        // Its completion may already have been reaped, queuing the notification.
+        sendQueuedCompletionNotifs();
     }
 }
 
@@ -2396,6 +2417,7 @@ nixlLibfabricEngine::getNotifs(notif_list_t &notif_list) {
             NIXL_ERROR << "Failed to progress rails in getNotifs";
             return progress_status;
         }
+        sendQueuedCompletionNotifs();
     }
 
     // Then check for available notifications after processing completions
