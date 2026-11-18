@@ -378,7 +378,8 @@ private:
     onXferComplete(nixlLibfabricBackendH &handle) const;
 
     // Progress thread: sends the notifications onXferComplete() queued, without waiting for the
-    // provider; what it refuses stays queued, in order, for the next iteration.
+    // provider. What it refuses stays queued for the next iteration; a refused peer's later
+    // notifications wait behind it, in order, and other peers' are still sent.
     void
     sendQueuedCompletionNotifs();
 

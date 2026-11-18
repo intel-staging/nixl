@@ -1945,27 +1945,37 @@ nixlLibfabricEngine::sendQueuedCompletionNotifs() {
     }
     // This thread progresses every rail, so it must not wait for the provider to take a send:
     // one it refuses stays queued and is tried again next iteration, after the rails have been
-    // progressed. The queue keeps its order, so a peer receives its notifications in order.
+    // progressed. A refused peer's later notifications wait behind it, so each peer receives its
+    // notifications in order, while other peers' are still sent.
     const nixlLibfabricRail::PostOnceScope post_once;
-    for (size_t i = 0; i < due.size(); ++i) {
-        CompletionNotif &n = due[i];
+    std::vector<CompletionNotif> kept;
+    std::unordered_set<std::string> refused_peers;
+    for (CompletionNotif &n : due) {
+        if (refused_peers.count(n.remote_agent) != 0) {
+            kept.push_back(std::move(n));
+            continue;
+        }
         // Re-establishing a connection waits for a handshake only this thread can process, so a
         // notification to a disconnected peer fails here; checkXfer() reports it.
         const nixl_status_t status = notifSendPriv(
             n.remote_agent, n.fragments, n.total_len, n.xfer_id, 0, false, &n.next_fragment);
         if (status == NIXL_IN_PROG) {
-            const std::lock_guard<std::mutex> lock(completion_notifs_mutex_);
-            completion_notifs_.insert(completion_notifs_.begin(),
-                                      std::make_move_iterator(due.begin() + i),
-                                      std::make_move_iterator(due.end()));
-            completion_notifs_pending_.store(true, std::memory_order_release);
-            return;
+            refused_peers.insert(n.remote_agent);
+            kept.push_back(std::move(n));
+            continue;
         }
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "PT: failed to send the notification for XFER_ID=" << n.xfer_id << " to "
                        << n.remote_agent << " (status " << status << ")";
         }
         n.result->finish(status);
+    }
+    if (!kept.empty()) {
+        const std::lock_guard<std::mutex> lock(completion_notifs_mutex_);
+        completion_notifs_.insert(completion_notifs_.begin(),
+                                  std::make_move_iterator(kept.begin()),
+                                  std::make_move_iterator(kept.end()));
+        completion_notifs_pending_.store(true, std::memory_order_release);
     }
 }
 
