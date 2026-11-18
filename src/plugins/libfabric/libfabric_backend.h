@@ -26,6 +26,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
@@ -266,6 +267,8 @@ private:
         uint32_t total_len = 0;
         uint16_t xfer_id = 0;
         std::shared_ptr<nixlLibfabricBackendH::CompletionNotifResult> result;
+        // Fragments already posted; a send the provider refused resumes here.
+        size_t next_fragment = 0;
     };
 
     mutable std::mutex completion_notifs_mutex_;
@@ -375,33 +378,53 @@ private:
     void
     onXferComplete(nixlLibfabricBackendH &handle) const;
 
-    // Progress thread: sends the notifications onXferComplete() queued.
+    // Progress thread, or without one the postXfer(), checkXfer() and getNotifs() calls that
+    // progress the rails: sends the queued notifications, without waiting for the provider. What it
+    // refuses stays queued for the next iteration; a refused peer's later notifications wait behind
+    // it, in order, and other peers' are still sent.
     void
-    sendQueuedCompletionNotifs();
+    sendQueuedCompletionNotifs() const;
+
+    // Queues a notification for sendQueuedCompletionNotifs(). Safe inside CQ processing.
+    void
+    queueCompletionNotif(CompletionNotif &&notif) const;
+
+    // Progress thread on exit, or the destructor: fails the notifications still queued.
+    void
+    failQueuedCompletionNotifs() const;
 
     // Private notification implementation with unified binary notification system. Without
-    // may_reconnect, a DISCONNECTED connection fails with NIXL_ERR_NOT_FOUND.
+    // may_reconnect, a DISCONNECTED connection fails with NIXL_ERR_NOT_FOUND. With next_fragment,
+    // sending starts at that fragment and leaves it at the first fragment not posted; under
+    // nixlLibfabricRail::PostOnceScope a fragment the provider refuses for now (or that finds the
+    // control request pool empty) returns NIXL_IN_PROG instead of being waited for, and a later
+    // call resumes there.
     nixl_status_t
     notifSendPriv(const std::string &remote_agent,
                   std::vector<BinaryNotification> &binary_notifications,
                   uint32_t total_message_length,
                   uint16_t notif_xfer_id,
                   uint32_t expected_completions,
-                  bool may_reconnect = true) const;
+                  bool may_reconnect = true,
+                  size_t *next_fragment = nullptr) const;
 
     // Tell the target that notif_xfer_id failed on this side and that only final_completions of
     // its writes will arrive, so it stops waiting for the rest.
+    // on_send_complete, if set, runs with the message's send completion status, inside CQ
+    // processing. The return value reports only posting; on_send_complete does not run if it fails.
     nixl_status_t
     notifXferErrorPriv(const std::string &remote_agent,
                        uint16_t notif_xfer_id,
-                       uint32_t final_completions) const;
+                       uint32_t final_completions,
+                       std::function<void(nixl_status_t)> on_send_complete = nullptr) const;
 
     // Receiver-side handler for NIXL_LIBFABRIC_MSG_XFER_ERROR
     void
     handleXferError(uint16_t notif_xfer_id, uint32_t sender_peer_idx, uint32_t final_completions);
 
     // Tell the target once that this transfer failed, so it stops waiting for writes that never
-    // went out. With notify-after-completion, also sends the notification it was still owed.
+    // went out. With notify-after-completion, also sends the notification it was still owed, once
+    // the transfer-error message's send has completed.
     // Called only from checkXfer: an asynchronous post failure must not turn postXfer into an
     // error.
     void

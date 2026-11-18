@@ -328,11 +328,12 @@ struct nixlLibfabricDeviceInfo {
 };
 
 /**
- * @brief Selects a provider and returns its usable domains, with fallback to tcp/sockets.
+ * @brief Selects a provider and returns its usable domains, with fallback to tcp/sockets. An
+ *        opt_in provider (verbs) is considered only with @p allow_opt_in.
  * @return Core provider name and one entry per rail, in rail order; {"none", {}} if none found.
  */
 std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
-getAvailableNetworkDevices();
+getAvailableNetworkDevices(bool allow_opt_in = false);
 
 /** @brief Core provider of a possibly layered prov_name: "verbs;ofi_rxm" -> "verbs". */
 std::string
@@ -374,6 +375,11 @@ struct nixlLibfabricProviderInfo {
     bool notify_after_completion;
     /** @brief Use only the first domain: every domain reaches every peer (tcp, sockets). */
     bool single_domain;
+    /**
+     * @brief Selected only when enabled (see @ref selectProvider). For verbs, so that a host that
+     * used tcp before verbs was added keeps it unless asked: enable_verbs, or discrete Intel GPUs.
+     */
+    bool opt_in;
     /** @brief Provider-specific domain selection, or nullptr for @ref selectDomainsGeneric. */
     std::vector<std::string> (*select_domains)(const nixlProviderDeviceMap &);
     /** @brief The provider can carry Level Zero (FI_HMEM_ZE) memory given FI_HMEM: by RDMA (cxi,
@@ -458,11 +464,11 @@ selectDomainsGeneric(const nixlProviderDeviceMap &provider_device_map, const std
 
 /**
  * @brief The first knownProviders() entry with usable domains, and those domains (one for a
- *        single_domain provider).
+ *        single_domain provider). An opt_in provider is passed over unless @p allow_opt_in.
  * @return Core provider name and its domains in rail order; {"none", {}} if none.
  */
 std::pair<std::string, std::vector<std::string>>
-selectProvider(const nixlProviderDeviceMap &provider_device_map);
+selectProvider(const nixlProviderDeviceMap &provider_device_map, bool allow_opt_in = false);
 
 /**
  * @brief Selects a provider from an fi_getinfo() list (see @ref selectProvider) and returns its
@@ -471,7 +477,7 @@ selectProvider(const nixlProviderDeviceMap &provider_device_map);
  * @return Core provider name and one entry per rail, in rail order; {"none", {}} if none found.
  */
 std::pair<std::string, std::vector<nixlLibfabricDeviceInfo>>
-selectNetworkDevices(const struct fi_info *info);
+selectNetworkDevices(const struct fi_info *info, bool allow_opt_in = false);
 // String utilities
 std::string
 hexdump(const void *data, size_t size);

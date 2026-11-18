@@ -5,6 +5,7 @@
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| `NIXL_LIBFABRIC_ENABLE_VERBS` | Boolean (`1`) | Not set | Set to `1` to consider the `verbs` provider (InfiniBand / RoCE), which is otherwise used only on hosts with discrete Intel GPUs. Same as the `enable_verbs` backend parameter. Enable it on every agent that talks to another, or on none. |
 | `NIXL_LIBFABRIC_MAX_BW_PER_DRAM_SEG` | Integer (Gbps) | Auto-computed from PCIe topology | Bandwidth limit in Gbps for NUMA-aware rail selection on DRAM segments. Override this when the auto-detected PCIe topology does not accurately reflect your network configuration. |
 
 Additional `NIXL_LIBFABRIC_*` variables may exist for provider-specific configuration. The Libfabric backend constructs environment variable names dynamically using the `NIXL_LIBFABRIC_` prefix followed by an uppercase key name. Consult the Libfabric backend README for provider-specific options.

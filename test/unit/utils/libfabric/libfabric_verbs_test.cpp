@@ -133,7 +133,8 @@ testLiveVerbsTopology() {
 
     std::optional<nixlLibfabricTopology> live;
     try {
-        live.emplace();
+        // verbs is opt-in; enable it, so a verbs host without Intel GPUs is checked too.
+        live.emplace(/*enable_verbs=*/true);
     }
     catch (const std::exception &e) {
         check(false,

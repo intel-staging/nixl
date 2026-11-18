@@ -193,8 +193,29 @@ fi_ep_recvmsg_stub(struct fid_ep *ep, const struct fi_msg *msg, uint64_t flags) 
     return 0;
 }
 
+// fi_senddata calls; the first mock_senddata_eagain of them are refused with -FI_EAGAIN.
+[[maybe_unused]] static size_t mock_senddata_calls = 0;
+[[maybe_unused]] static size_t mock_senddata_eagain = 0;
+
+static ssize_t
+fi_ep_senddata_stub(struct fid_ep *ep,
+                    const void *buf,
+                    size_t len,
+                    void *desc,
+                    uint64_t data,
+                    fi_addr_t dest_addr,
+                    void *context) {
+    mock_senddata_calls++;
+    if (mock_senddata_eagain > 0) {
+        mock_senddata_eagain--;
+        return -FI_EAGAIN;
+    }
+    return 0;
+}
+
 static fi_ops_msg fi_ep_msg_ops_stub{
     .recvmsg = fi_ep_recvmsg_stub,
+    .senddata = fi_ep_senddata_stub,
 };
 
 // fi_writemsg calls, recorded so a test can check the flags a rail posts writes with.

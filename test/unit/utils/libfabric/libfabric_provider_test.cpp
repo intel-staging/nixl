@@ -185,6 +185,9 @@ testProviderTable() {
               std::string(provider->name) +
                   (is_host_stack ? " skips hwloc grouping" : " does PCIe-proximity grouping"));
         const bool is_verbs = std::string(provider->name) == "verbs";
+        check(provider->opt_in == is_verbs,
+              std::string(provider->name) +
+                  (is_verbs ? " is selected only when enabled" : " is selected without opt-in"));
         check(provider->pcie_from_hwloc_osdev == is_verbs,
               std::string(provider->name) +
                   (is_verbs ? " looks a NIC's PCIe address up in hwloc" :
@@ -288,16 +291,21 @@ testProviderSelection() {
 
     auto select = [](const ProviderMap &map) { return LibfabricUtils::selectProvider(map); };
 
-    // verbs is preferred over tcp.
-    const auto roce = select({
+    // verbs is opt-in: a RoCE host keeps tcp unless verbs is enabled, and then prefers verbs.
+    const ProviderMap roce_host = {
         {"verbs;ofi_rxm", {"rocep153s0f0", "rocep153s0f1"}},
         {"verbs;ofi_rxd", {"rocep153s0f0-dgram"}},
         {"tcp", {"ens1f0np0", "lo"}},
         {"psm3", {"rocep153s0f0"}},
-    });
-    check(roce.first == "verbs", "verbs is preferred over tcp on a RoCE host");
+    };
+    check(select(roce_host).first == "tcp",
+          "a RoCE host keeps tcp while verbs is not enabled, as before verbs was added");
+    const auto roce = LibfabricUtils::selectProvider(roce_host, /*allow_opt_in=*/true);
+    check(roce.first == "verbs", "with verbs enabled, verbs is preferred over tcp on a RoCE host");
     check(roce.second == std::vector<std::string>({"rocep153s0f0", "rocep153s0f1"}),
           "the verbs hook's filtered domain list is the one used");
+    check(LibfabricUtils::selectProvider({{"efa", {"rdmap16s27-rdm"}}}, true).first == "efa",
+          "enabling verbs changes nothing on a host without verbs devices");
 
     // efa is preferred over verbs and uses the generic rule.
     const auto efa = select({
@@ -486,7 +494,10 @@ testDeviceMetadataPerProvider() {
     verbs.add("verbs;ofi_rxd", "mlx5_0", 0xcc, 50);
     verbs.add("verbs;ofi_rxm", "mlx5_0", 0x42, 400);
     verbs.add("verbs;ofi_rxm", "mlx5_0-xrc", 0x43, 400);
-    const auto [verbs_provider, verbs_devices] = LibfabricUtils::selectNetworkDevices(verbs.head());
+    check(LibfabricUtils::selectNetworkDevices(verbs.head()).first == "none",
+          "a host offering only verbs selects nothing while verbs is not enabled");
+    const auto [verbs_provider, verbs_devices] =
+        LibfabricUtils::selectNetworkDevices(verbs.head(), /*allow_opt_in=*/true);
     check(verbs_provider == "verbs" && verbs_devices.size() == 1,
           "verbs is selected with one rail, the -xrc variant dropped");
     check(!verbs_devices.empty() && verbs_devices[0].pcie_address == "0:42:00.0" &&

@@ -195,7 +195,8 @@ private:
 };
 
 nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
-                                                   bool progress_thread_enabled)
+                                                   bool progress_thread_enabled,
+                                                   bool enable_verbs)
     : striping_threshold_(striping_threshold),
       runtime_(FI_HMEM_CUDA),
       progress_thread_enabled_(progress_thread_enabled) {
@@ -206,7 +207,7 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
     nixlAccelInstallLogBridge();
 
     // Initialize topology system
-    topology = std::make_unique<nixlLibfabricTopology>();
+    topology = std::make_unique<nixlLibfabricTopology>(enable_verbs);
 
     // Determine system runtime type once at initialization. NVIDIA and AMD GPUs decide it as
     // before Level Zero support, except that a build without CUDA or ROCm (neither defines
@@ -1157,6 +1158,11 @@ nixlLibfabricRailManager::postControlMessage(
     // Use rail 0 for notifications
     nixl_status_t status = rails_[rail_id]->postSend(imm_data, dest_addr, req);
 
+    if (status == NIXL_IN_PROG) {
+        // Refused for now under nixlLibfabricRail::PostOnceScope; the caller tries again.
+        rails_[rail_id]->releaseRequest(req);
+        return status;
+    }
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Failed to send control message type " << static_cast<int>(msg_type)
                    << " on rail " << rail_id;

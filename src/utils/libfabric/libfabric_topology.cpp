@@ -37,8 +37,9 @@
 #endif
 #endif
 
-nixlLibfabricTopology::nixlLibfabricTopology()
-    : num_aws_accel(0),
+nixlLibfabricTopology::nixlLibfabricTopology(bool enable_verbs)
+    : enable_verbs_(enable_verbs),
+      num_aws_accel(0),
       num_nvidia_accel(0),
       num_amd_accel(0),
       num_intel_accel(0),
@@ -225,8 +226,16 @@ nixlLibfabricTopology::neuronEfaPreflightForNonEfaProvider() {
 
 nixl_status_t
 nixlLibfabricTopology::discoverProviderWithDevices() {
+    // verbs is opt-in, so a host that ran over tcp before verbs was added keeps tcp. Enabled on
+    // request, and on a host with discrete Intel GPUs, which reach the network only through an
+    // RDMA provider carrying Level Zero memory (counted above, before the provider is chosen).
+    const bool allow_opt_in = enable_verbs_ || num_intel_accel > 0;
+    if (allow_opt_in) {
+        NIXL_INFO << "verbs enabled"
+                  << (enable_verbs_ ? " (enable_verbs)" : " (discrete Intel GPUs present)");
+    }
     // Use the utility function from libfabric_common
-    auto network_device = LibfabricUtils::getAvailableNetworkDevices();
+    auto network_device = LibfabricUtils::getAvailableNetworkDevices(allow_opt_in);
     provider_name = network_device.first;
     discovered_devices = std::move(network_device.second);
 

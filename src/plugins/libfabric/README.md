@@ -142,9 +142,19 @@ preference order is:
 
 1. `cxi`
 2. `efa`
-3. `verbs` (InfiniBand / RoCE, reached through the `verbs;ofi_rxm` layered endpoint)
+3. `verbs` (InfiniBand / RoCE, reached through the `verbs;ofi_rxm` layered endpoint), when enabled
 4. `tcp`
 5. `sockets`
+
+verbs is opt-in, so a host with InfiniBand or RoCE NICs and no `cxi` or `efa` device keeps using
+`tcp`, as it did before verbs was added. It is enabled:
+
+- with the `enable_verbs` backend parameter, or `NIXL_LIBFABRIC_ENABLE_VERBS`, set to `1` (also
+  `true`, `yes` or `on`);
+- automatically on a host with discrete Intel GPUs (see *Notes specific to Intel GPUs*), whose
+  memory reaches the network only through an RDMA provider that carries Level Zero memory.
+
+When verbs devices are found but verbs is not enabled, the plugin logs so at `INFO` level.
 
 Only the RDM-capable verbs domains are used: the `-xrc` and `-dgram` endpoint variants of the same
 NICs are skipped, as is the `ofi_rxd`-layered stack, which would place a second, slower rail on
@@ -153,11 +163,9 @@ hardware the `ofi_rxm` rail already covers.
 To force a different choice, restrict what libfabric reports rather than looking for a NIXL-specific
 knob -- for example `FI_PROVIDER=tcp` or `FI_PROVIDER=^verbs`.
 
-A host with InfiniBand or RoCE NICs and no `cxi` or `efa` device used `tcp` before verbs was added,
-and now uses verbs. Both ends of a connection must use the same provider, so upgrade the agents that
-talk to each other together, or pin them all with `FI_PROVIDER=tcp` until they are upgraded. verbs
-also needs a high locked-memory limit and, without the progress thread, `FI_PROGRESS_AUTO` (see
-below).
+Both ends of a connection must use the same provider, so enable verbs on every agent that talks to
+another, or on none. verbs also needs a high locked-memory limit and, without the progress thread,
+`FI_PROGRESS_AUTO` (see below).
 
 Notes specific to verbs:
 
@@ -301,6 +309,8 @@ one entry:
   no writes for the target to count, and post writes without remote CQ data. Set for a provider
   whose remote-write completions carry no usable source address (verbs).
 - `single_domain` -- set when one rail reaches every peer, so extra rails would only add host copies.
+- `opt_in` -- set when the provider is selected only once enabled (verbs: `enable_verbs`, or discrete
+  Intel GPUs), so hosts that ran over another provider before it was added keep that one.
 - `carries_ze` -- set when the provider can carry Level Zero memory given `FI_HMEM` (cxi, verbs,
   and tcp through libfabric's device copies).
 - `select_domains` -- a hook, needed only if the generic rule (every domain under this core provider,
