@@ -61,6 +61,14 @@ public:
     }
 
     ~xferBenchAsioRT() {
+        // Let the messages already posted reach the peer before stopping: barrier() returns once
+        // the peer's message has arrived, possibly before its own has been written, and the peer
+        // is still waiting for it. Bounded, for a peer that is gone.
+        {
+            std::unique_lock lock(mutex_);
+            cond_.wait_for(
+                lock, kFlushTimeout_, [&]() { return unsent_ == 0 || exception_ || closed_; });
+        }
         context_.stop();
         thread_.join();
     }
@@ -147,6 +155,7 @@ public:
 
 private:
     static constexpr std::size_t typeShift_ = 24;
+    static constexpr std::chrono::seconds kFlushTimeout_{5};
     static constexpr std::uint32_t sizeMask_ = 0x00ffffff;
 
     void
@@ -234,6 +243,7 @@ private:
                 std::rethrow_exception(exception_);
             }
             finishing_ = finishing;
+            ++unsent_;
         }
         asio::post(context_, [this, buffer]() {
             const bool was_empty = outgoing_.empty();
@@ -256,6 +266,11 @@ private:
                                   throw std::runtime_error("ASIO Write failed: " + ec.message());
                               }
                               outgoing_.pop_front();
+                              {
+                                  const std::unique_lock lock(mutex_);
+                                  --unsent_;
+                                  cond_.notify_all();
+                              }
 
                               if (!outgoing_.empty()) {
                                   sendImpl();
@@ -263,11 +278,24 @@ private:
                           });
     }
 
+    // The peer closed the connection: its last barrier is done and it is shutting down, or it
+    // exited. Not an error by itself; recvWait() fails only if a message it waits for never came.
+    void
+    peerClosed() {
+        const std::unique_lock lock(mutex_);
+        closed_ = true;
+        cond_.notify_all();
+    }
+
     void
     recvHead() {
         asio::async_read(*socket_,
                          asio::buffer(&head_, sizeof(head_)),
                          [this](const asio::error_code &ec, const std::size_t done) {
+                             if (ec == asio::error::eof) {
+                                 peerClosed();
+                                 return;
+                             }
                              if (ec.value()) {
                                  throw std::runtime_error("ASIO Read head failed: " + ec.message());
                              }
@@ -305,31 +333,33 @@ private:
     void
     recvWait(const asio_msg_type_t type, F &&f) {
         std::unique_lock lock(mutex_);
-        if (exception_) {
-            std::rethrow_exception(exception_);
-        }
 
         // We don't care about scanning the whole list every time because
         // the list is expected to be very small and not checked frequently.
-
+        // A message that has already arrived is taken even if the connection has failed or
+        // closed since: at the final barrier the peer may close as soon as it has ours, before
+        // this thread looks for the peer's.
+        bool found = false;
         if (!cond_.wait_for(lock, std::chrono::seconds(15), [&]() {
-                if (exception_) {
-                    return true;
-                }
                 for (auto it = incoming_.begin(); it != incoming_.end(); ++it) {
                     if ((it->type == type) && f(it->data)) {
                         incoming_.erase(it);
+                        found = true;
                         return true;
                     }
                 }
-                return false;
+                return exception_ || closed_;
             })) {
             throw std::runtime_error("ASIO Receive timeout");
         }
 
+        if (found) {
+            return;
+        }
         if (exception_) {
             std::rethrow_exception(exception_);
         }
+        throw std::runtime_error("ASIO Receive failed: the peer closed the connection");
     }
 
     const asio::ip::tcp::endpoint endpoint_;
@@ -340,6 +370,8 @@ private:
     std::condition_variable cond_;
     std::list<xferBenchAsioIncoming> incoming_;
     std::exception_ptr exception_;
+    bool closed_ = false; // The peer closed the connection; see peerClosed()
+    std::size_t unsent_ = 0; // Messages posted but not yet written to the socket
 
     bool finishing_ = false;
     std::uint32_t head_;

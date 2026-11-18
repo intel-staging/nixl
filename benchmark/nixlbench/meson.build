@@ -208,8 +208,14 @@ if cuda_locality_domain_available
     add_project_arguments('-DHAVE_CUDA_LOCALITY_DOMAIN', language: 'cpp')
 endif
 
-if not cuda_available and not rocm_available
-    warning('Neither CUDA nor ROCm found. VRAM support will be disabled.')
+# Level Zero (Intel GPU) VRAM support. Headers only: libze_loader is dlopen'd at runtime.
+ze_available = cpp.has_header('level_zero/ze_api.h')
+if ze_available
+    add_project_arguments('-DHAVE_ZE=1', language: 'cpp')
+endif
+
+if not cuda_available and not rocm_available and not ze_available
+    warning('Neither CUDA, ROCm nor Level Zero found. VRAM support will be disabled.')
 endif
 
 ucx_device_cuda_args = []
@@ -328,6 +334,7 @@ summary(
     {
         'UCX GPU Device API': ucx_gpu_device_api_available,
         'nvcc available': nvcc_prog.found(),
+        'Level Zero VRAM': ze_available,
         'DOCA GPUNETIO found': doca_gpunetio_dep.found(),
     },
     section: 'Optional features',
@@ -347,6 +354,7 @@ configure_file(
         'HAVE_NVSHMEM': nvshmem_available ? '1' : '0',
         'HAVE_CUDA': cuda_available ? '1' : '0',
         'HAVE_ROCM': rocm_available ? '1' : '0',
+        'HAVE_ZE': ze_available ? '1' : '0',
         'HAVE_CUDA_FABRIC': cuda_fabric_available ? '1' : '0',
         'HAVE_CUDA_LOCALITY_DOMAIN': cuda_locality_domain_available ? '1' :'0',
         'HAVE_RAW_CLI': raw_cli_available ? '1' : '0',
@@ -405,10 +413,14 @@ if nvshmem_available
     nvcc_args += ['-L' + meson.current_build_dir() + '/src/utils']
     nvcc_args += ['-L' + meson.current_build_dir() + '/src/runtime']
     nvcc_args += ['-L' + meson.current_build_dir() + '/src/worker']
-    nvcc_args += ['-lnixl', '-lnixl_build', '-lserdes', '-lcuda', '-lcudart', '-lnvshmem']
+    # -ldl for the dlopen() in neuron.cpp and ze.cpp
+    nvcc_args += ['-lnixl', '-lnixl_build', '-lserdes', '-lcuda', '-lcudart', '-lnvshmem', '-ldl']
     nvcc_args += args
     nvcc_cmd_files = [
                  meson.current_build_dir() + '/src/utils/libutils.a.p/utils.cpp.o',
+                 # utils.cpp calls into neuron.cpp and ze.cpp
+                 meson.current_build_dir() + '/src/utils/libutils.a.p/neuron.cpp.o',
+                 meson.current_build_dir() + '/src/utils/libutils.a.p/ze.cpp.o',
                  meson.current_build_dir() + '/src/runtime/libruntime.a.p/runtime.cpp.o',
                  meson.current_build_dir() + '/src/worker/libworker.a.p/worker.cpp.o',
                  meson.current_build_dir() + '/src/worker/nixl/libnixl_worker.a.p/nixl_worker.cpp.o',
