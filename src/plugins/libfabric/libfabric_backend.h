@@ -36,53 +36,14 @@
 #include "common/nixl_time.h"
 #include "serdes/serdes.h"
 
+#include "libfabric/libfabric_accel_scope.h"
 #include "libfabric/libfabric_rail_manager.h"
 #include "libfabric/libfabric_common.h"
 #include "libfabric_connection.h"
 
-#ifdef HAVE_CUDA
-#ifdef __HIP_PLATFORM_AMD__
-#include <hip/hip_runtime.h>
-#include <hip/hip_runtime_api.h>
-// Define CUDA types as HIP equivalents for AMD
-typedef hipCtx_t CUcontext;
-typedef hipDevice_t CUdevice;
-#else
-#include <cuda.h>
-#include <cuda_runtime.h>
-#endif
-#endif
-
 // Forward declarations
 class nixlLibfabricEngine;
 class nixlLibfabricPostThreadPool;
-
-#ifdef HAVE_CUDA
-/** CUDA context management for libfabric backend */
-class nixlLibfabricCudaCtx {
-private:
-    CUcontext pthrCudaCtx_;
-    int myDevId_;
-
-public:
-    nixlLibfabricCudaCtx() {
-        pthrCudaCtx_ = NULL;
-        myDevId_ = -1;
-    }
-
-    /** Reset CUDA context pointer to initial state */
-    void
-    cudaResetCtxPtr();
-
-    /** Update CUDA context pointer for given memory address and device */
-    int
-    cudaUpdateCtxPtr(void *address, int expected_dev, bool &was_updated);
-
-    /** Set the current CUDA context */
-    int
-    cudaSetCtx();
-};
-#endif
 
 /** Private metadata for locally registered memory */
 class nixlLibfabricPrivateMetadata : public nixlBackendMD {
@@ -90,13 +51,14 @@ private:
     void *buffer_; // Local memory buffer address
     size_t length_; // Buffer length in bytes
     int device_id_; // Device ID for VRAM, -1 for DRAM
+    struct nfi_hmem_info hmem_info_; // Runtime and device of the buffer; FI_HMEM_SYSTEM for DRAM
     std::vector<struct fid_mr *> rail_mr_list_; // Memory registrations, one per rail
     std::vector<uint64_t> rail_key_list_; // Remote access keys, one per rail
     std::vector<char *> src_ep_names_; // Source endpoint names, one per rail
     std::vector<size_t> selected_rails_; // Rails selected based on memory topology
 
 public:
-    nixlLibfabricPrivateMetadata() : nixlBackendMD(true), device_id_(-1) {}
+    nixlLibfabricPrivateMetadata() : nixlBackendMD(true), device_id_(-1), hmem_info_{} {}
     friend class nixlLibfabricEngine;
 };
 
@@ -147,10 +109,19 @@ public:
 
     const std::shared_ptr<CompletionNotifResult> completion_notif_result_;
 
+    /** Device a manual CQ progress for this post binds (no progress thread): the first local
+     *  buffer whose runtime keeps thread-current state, or none. Set by postXfer() before any
+     *  descriptor is posted, so a provider copying device memory while progressing has its
+     *  context even when the application thread has none current. */
+    nixlAccelBinding progress_accel_;
+
     uint16_t post_xfer_id;
     const nixl_xfer_op_t operation_;
     const std::string remote_agent_;
     bool has_notif;
+    // A notified WRITE whose posting failed partway, so the notification postXfer() would have
+    // sent was not; notifXferFailure() sends it after the failure notice. Reset per post.
+    bool notif_deferred = false;
     uint32_t total_notif_msg_len; // Total length of notification message across all fragments
 
     std::vector<BinaryNotification> binary_notifs; // Vector of BinaryNotification for fragmentation
@@ -217,6 +188,12 @@ public:
      *         delivery is best effort. */
     bool
     claim_xfer_error_send();
+
+    /** Lets this post report its failure again, for a post whose notification was deferred. */
+    void
+    reset_xfer_error_send() {
+        xfer_error_sent_.store(false);
+    }
 
     /** Claim the right to send this post's notification once the transfer has completed (see
      *  nixlLibfabricEngine::notifiesOnCompletion()). The progress thread, postXfer() and
@@ -295,10 +272,6 @@ private:
 
     // Mutex for connection state tracking
     mutable std::mutex connection_state_mutex_;
-
-
-    // System runtime type (set during initialization from rail_manager_)
-    fi_hmem_iface runtime_;
 
     void
     cleanup();
@@ -437,13 +410,6 @@ private:
                                 uint32_t &total_message_length,
                                 std::vector<BinaryNotification> &fragments_out) const;
 
-#ifdef HAVE_CUDA
-    // CUDA context management
-    std::unique_ptr<nixlLibfabricCudaCtx> cudaCtx_;
-    bool cuda_addr_wa_; // CUDA address workaround flag
-    mutable std::mutex cuda_ctx_mutex_; // Protects cudaCtx_ and cuda_addr_wa_.
-#endif
-
     void
     postShutdownCompletion();
     // Progress thread for rail CQs
@@ -493,39 +459,8 @@ private:
                         int start_idx,
                         int end_idx,
                         size_t xfer_base_offset,
-                        bool allow_fi_more,
                         size_t &submitted_count) const;
 
-    /** Rail a WRITE descriptor posts on, or -1 if it does not participate in FI_MORE batching
-     *  (no metadata, no selected rails, or striped across multiple rails). */
-    int
-    batchingRail(const nixl_meta_dlist_t &local, int desc_idx, size_t xfer_base_offset) const;
-
-    /** Whether descriptor desc_idx should carry FI_MORE: false (flush) for a rail's last post
-     *  in [start,end) and when the rail's batch reaches NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE.
-     *  Updates posts_since_flush. */
-    bool
-    useFiMore(int desc_idx,
-              int rail_id,
-              const std::vector<int> &last_desc_idx_per_rail,
-              std::vector<int> &posts_since_flush) const;
-
-#ifdef HAVE_CUDA
-    // CUDA context management methods
-    void
-    vramInitCtx();
-    int
-    vramUpdateCtx(void *address, uint64_t devId, bool &restart_reqd);
-    int
-    vramApplyCtx();
-    void
-    vramFiniCtx();
-
-    // same as vramApplyCtx, but with additional output parameter
-    nixl_status_t
-    vramApplyCtxEx(bool &use_cuda_addr_wa) const;
-    friend class nixlLibfaricCudaCtxEngineMediator;
-#endif
 
 public:
     /** Initialize multi-rail libfabric backend engine */

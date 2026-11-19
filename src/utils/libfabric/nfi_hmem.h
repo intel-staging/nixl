@@ -94,6 +94,13 @@ struct nfi_hmem_info {
      * @ref pooled_dmabuf_size being 0 proves nothing. Level Zero only.
      */
     bool pooled_check_skipped;
+
+    /**
+     * Opaque handle of the runtime context that owns the allocation, for
+     * @ref nfi_hmem_scope_push_ctx: the CUcontext for CUDA, or 0 when the runtime reports none
+     * (e.g. CUDA virtual-memory allocations) or keeps no per-context state.
+     */
+    uint64_t context;
 };
 
 /** @brief A pushed accelerator context, popped on the same thread. Zero-initialise it. */
@@ -161,6 +168,15 @@ nfi_hmem_available(void);
 /** @brief Whether the runtime for @p iface is usable. Initialises that vendor on first call. */
 bool
 nfi_hmem_iface_available(enum fi_hmem_iface iface);
+
+/**
+ * @brief Marks the runtime for @p iface eligible or not. An ineligible runtime counts as unusable
+ *        everywhere (availability, the primary runtime, pointer attribution) and is never
+ *        initialised, e.g. on a host without that vendor's hardware. Every runtime is eligible by
+ *        default; the caller decides, so this library needs no hardware discovery of its own.
+ */
+void
+nfi_hmem_set_eligible(enum fi_hmem_iface iface, bool eligible);
 
 /**
  * @brief The usable runtime a process should prefer: CUDA, then ROCr, Neuron and Level Zero, as
@@ -236,6 +252,17 @@ nfi_hmem_needs_scope(enum fi_hmem_iface iface);
  */
 int
 nfi_hmem_scope_push(enum fi_hmem_iface iface, uint64_t device, struct nfi_hmem_scope *scope);
+
+/**
+ * @brief Like @ref nfi_hmem_scope_push, but binds @p context, the allocation's owning context from
+ * @ref nfi_hmem_info::context, when it is not 0, so work runs in the context that owns the memory
+ * rather than the device's primary context. With @p context 0 it is @ref nfi_hmem_scope_push.
+ */
+int
+nfi_hmem_scope_push_ctx(enum fi_hmem_iface iface,
+                        uint64_t device,
+                        uint64_t context,
+                        struct nfi_hmem_scope *scope);
 
 /** @brief Undoes @ref nfi_hmem_scope_push on the same thread. Safe to call twice. */
 void

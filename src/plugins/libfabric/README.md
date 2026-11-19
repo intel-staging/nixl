@@ -39,10 +39,10 @@ The Libfabric plugin provides a high-performance RDMA communication backend with
 The Level Zero and Neuron runtime libraries are `dlopen`'d, so one binary works on hosts with and
 without their drivers. CUDA and ROCm builds link their runtime, and so need it at load time. Meson
 reports what it found -- look for `Found Level Zero headers, libfabric backend will build with
-FI_HMEM_ZE support` in the configure output. `-Dlevel_zero=disabled` builds without Level Zero even when the headers are
-installed, and `-Dlevel_zero=enabled` makes missing or too-old headers an error. At startup the
-plugin logs the accelerators it found per vendor (`Topology: ... CUDA=0 ROCR=0 ZE=3 NEURON=0`)
-and the runtime it selected (`System runtime: ZE`).
+FI_HMEM_ZE support` in the configure output. `-Dlevel_zero=disabled` builds without Level Zero
+even when the headers are installed, and `-Dlevel_zero=enabled` makes missing or too-old headers
+an error. At startup the plugin logs the accelerators it found per vendor (`Topology: ... CUDA=0
+ROCR=0 ZE=3 NEURON=0`) and the first usable runtime (`System runtime: ZE`).
 
 Notes specific to Intel GPUs:
 
@@ -55,20 +55,24 @@ Notes specific to Intel GPUs:
 - Each buffer's Level Zero device ordinal is taken from the driver
   (`zeMemGetAllocProperties()`), not from the NIXL device ID, and passed to libfabric as
   `fi_mr_attr::device.ze`.
-- One runtime is selected per process. A CUDA or ROCm build on a host with NVIDIA or AMD GPUs
-  selects CUDA or ROCm, on any provider, and its Intel GPUs then take no part in rail selection
-  (Level Zero is not even initialised). A build without CUDA or ROCm cannot register NVIDIA or AMD
-  memory: on a host with discrete Intel GPUs it selects ZE, and only the Intel GPUs form proximity
-  groups; without them the runtime is chosen as before Level Zero support.
-- Level Zero is initialised only on a host where hwloc lists an Intel display or
-  processing-accelerator PCI device, so other hosts never load `libze_loader`.
-- A `VRAM_SEG` buffer that Level Zero driver 0 does not own (host memory, another driver's
-  allocation, or a device driver 0 does not list) is refused with `NIXL_ERR_INVALID_PARAM`: libfabric could not register it as ZE
-  either.
+- Each buffer's runtime is identified from its pointer, so a process can register memory from GPUs
+  of more than one vendor. The process-wide runtime (`System runtime:`) is the first usable of
+  CUDA, ROCm, Neuron and Level Zero; under ZE, only providers that carry `FI_HMEM_ZE` offer
+  `VRAM_SEG`. Intel GPUs take part in proximity grouping only where no NVIDIA or AMD GPU that a
+  CUDA or ROCm build can register is present.
+- A `VRAM_SEG` buffer that no runtime owns -- host memory, another driver's allocation, or a
+  device Level Zero driver 0 does not list -- is refused with `NIXL_ERR_INVALID_PARAM`: libfabric
+  could not register it either. The exception is Neuron, whose pointer query can miss its own
+  memory: there such a buffer is registered as Neuron memory on every rail.
+- Each `VRAM_SEG` buffer is attributed by probing the runtimes in libfabric's order (Neuron, ZE,
+  ROCr, CUDA). Only runtimes whose hardware hwloc lists are initialised, for the process runtime
+  and for this probe alike: NVIDIA, AMD and Neuron devices by their PCI attributes, and Level Zero
+  for any Intel display or processing-accelerator device, integrated GPUs included. A host without
+  Intel GPUs never loads `libze_loader`, and one without Neuron devices never loads `libnrt`.
 - Device memory needs a provider that can carry `FI_HMEM_ZE`, such as `verbs` (see
   [Provider Selection](#provider-selection)) or `cxi` (or `tcp`, by copy), with `FI_HMEM`: there is
-  no NIC peer-memory module for Intel GPUs. Without `FI_HMEM`, and always on `efa` (no Level Zero support), the
-  plugin does not offer `VRAM_SEG` under the ZE runtime.
+  no NIC peer-memory module for Intel GPUs. Without `FI_HMEM`, and always on `efa` (no Level Zero
+  support), the plugin does not offer `VRAM_SEG` under the ZE runtime.
 - **Allocate VRAM for NIXL as exportable.** Chain a `ze_external_memory_export_desc_t` with
   `ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF` into `zeMemAllocDevice()`. Without it, in a context that
   holds a single device (for example under `ZE_AFFINITY_MASK`), the driver may
@@ -301,7 +305,10 @@ manager and topology code need not name vendors. A new vendor needs:
 4. A branch in `accelIfaceOfHwlocObj()` and a decision in `accelIfaceIsGroupable()` in
    `libfabric_accel.cpp`, and its place in `accelUnclaimedVramIface()`: a usable runtime whose
    query attributes every allocation made through it makes an unclaimed pointer an error, and one
-   whose query can miss its own memory becomes a fallback.
+   whose query can miss memory libfabric can still register becomes a fallback.
+
+Registration and posting run inside an `nixlAccelScope` for the buffer's device; pointer
+detection needs no context.
 
 ### Adding a provider
 
@@ -331,6 +338,8 @@ one entry:
   Intel GPUs), so hosts that ran over another provider before it was added keep that one.
 - `carries_ze` -- set when the provider can carry Level Zero memory given `FI_HMEM` (cxi, verbs,
   and tcp through libfabric's device copies).
+- `device_memory_needs_hmem` -- set when device memory of any runtime needs `FI_HMEM` (tcp, sockets:
+  kernel copies). Clear for an RDMA provider, which can fall back to NIC peer-memory support.
 - `select_domains` -- a hook, needed only if the generic rule (every domain under this core provider,
   de-duplicated, in `fi_getinfo` order) is not enough. `selectVerbsDomains()` is the one example.
 

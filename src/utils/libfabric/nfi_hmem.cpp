@@ -87,7 +87,7 @@ struct nfi_vendor {
     size_t (*device_bdfs)(struct nfi_hmem_bus_id *out, size_t max);
 
     /* Thread-current context management; nullptr for a runtime without such state. */
-    int (*scope_push)(uint64_t device, uint64_t *saved);
+    int (*scope_push)(uint64_t device, uint64_t context, uint64_t *saved);
     void (*scope_pop)(uint64_t saved);
 };
 
@@ -507,10 +507,12 @@ enum nfi_vendor_state : unsigned char {
 
 static std::mutex nfi_vendor_lock;
 static std::atomic<unsigned char> nfi_vendor_state[NFI_NUM_VENDORS];
+/* Set by nfi_hmem_set_eligible(); an ineligible vendor is never initialised. */
+static std::atomic<bool> nfi_vendor_ineligible[NFI_NUM_VENDORS];
 
 static bool
 nfi_vendor_available(size_t index) {
-    if (index >= NFI_NUM_VENDORS) {
+    if (index >= NFI_NUM_VENDORS || nfi_vendor_ineligible[index].load(std::memory_order_acquire)) {
         return false;
     }
 
@@ -634,6 +636,14 @@ nfi_hmem_available(void) {
     return false;
 }
 
+void
+nfi_hmem_set_eligible(enum fi_hmem_iface iface, bool eligible) {
+    const size_t index = nfi_vendor_index(iface);
+    if (index < NFI_NUM_VENDORS) {
+        nfi_vendor_ineligible[index].store(!eligible, std::memory_order_release);
+    }
+}
+
 bool
 nfi_hmem_iface_available(enum fi_hmem_iface iface) {
     return nfi_vendor_available(nfi_vendor_index(iface));
@@ -739,6 +749,14 @@ nfi_hmem_needs_scope(enum fi_hmem_iface iface) {
 
 int
 nfi_hmem_scope_push(enum fi_hmem_iface iface, uint64_t device, struct nfi_hmem_scope *scope) {
+    return nfi_hmem_scope_push_ctx(iface, device, 0, scope);
+}
+
+int
+nfi_hmem_scope_push_ctx(enum fi_hmem_iface iface,
+                        uint64_t device,
+                        uint64_t context,
+                        struct nfi_hmem_scope *scope) {
     if (!scope) {
         return -EINVAL;
     }
@@ -753,7 +771,7 @@ nfi_hmem_scope_push(enum fi_hmem_iface iface, uint64_t device, struct nfi_hmem_s
         return 0;
     }
 
-    int ret = nfi_vendors[index].scope_push(device, &scope->saved);
+    int ret = nfi_vendors[index].scope_push(device, context, &scope->saved);
     if (ret) {
         return ret;
     }

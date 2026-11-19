@@ -192,6 +192,10 @@ testProviderTable() {
               std::string(provider->name) +
                   (is_verbs ? " looks a NIC's PCIe address up in hwloc" :
                               " uses only the PCIe address libfabric reports"));
+        check(provider->device_memory_needs_hmem == is_host_stack,
+              std::string(provider->name) +
+                  (is_host_stack ? " needs FI_HMEM for device memory" :
+                                   " may carry device memory without FI_HMEM"));
         const std::string name = provider->name;
         check(provider->carries_ze == (name == "cxi" || name == "verbs" || name == "tcp"),
               name +

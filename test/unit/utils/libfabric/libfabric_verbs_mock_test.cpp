@@ -342,8 +342,10 @@ testCanCarryDeviceMemory() {
     check(carries("efa", FI_HMEM_CUDA, true), "efa with FI_HMEM carries CUDA memory");
     check(carries("verbs", FI_HMEM_CUDA, false),
           "verbs without FI_HMEM still carries CUDA memory through NIC peer memory");
-    check(carries("tcp", FI_HMEM_CUDA, false),
-          "tcp without FI_HMEM still offers CUDA memory, registered as host memory as before");
+    check(!carries("tcp", FI_HMEM_CUDA, false),
+          "tcp without FI_HMEM does not carry CUDA memory: it would be registered as host memory");
+    check(!carries("sockets", FI_HMEM_NEURON, false),
+          "sockets without FI_HMEM does not carry Neuron memory either");
     check(carries("tcp", FI_HMEM_CUDA, true), "tcp with FI_HMEM carries device memory");
     check(carries("tcp", FI_HMEM_ZE, true), "tcp with FI_HMEM carries Level Zero memory by copy");
     check(!carries("tcp", FI_HMEM_ZE, false),

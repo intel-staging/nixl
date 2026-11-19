@@ -44,7 +44,8 @@
 #define LF_EP_NAME_MAX_LEN 56
 #define NIXL_LIBFABRC_DEFAULT_POST_QUEUE_SIZE (32 * 1024) // 32K MPSC entries
 
-// Number of consecutive WRITE descriptors batched onto one rail with FI_MORE before flushing.
+// Number of consecutive WRITE descriptors grouped onto one rail. (They are not posted with
+// FI_MORE: see prepareAndSubmitTransfer().)
 #define NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE 16
 
 // Request pool configuration constants
@@ -385,6 +386,12 @@ struct nixlLibfabricProviderInfo {
     /** @brief The provider can carry Level Zero (FI_HMEM_ZE) memory given FI_HMEM: by RDMA (cxi,
      *  verbs) or through libfabric's own device copies (tcp). */
     bool carries_ze;
+    /**
+     * @brief Device memory of any runtime needs FI_HMEM: without it the provider copies through
+     * the kernel and fails on a device pointer (tcp, sockets). Clear for an RDMA provider, which
+     * can register device memory as host memory when the NIC has peer-memory support.
+     */
+    bool device_memory_needs_hmem;
 };
 
 /** @brief The provider table, in preference order (highest first). */
@@ -520,34 +527,6 @@ getCustomStringParam(const nixl_b_params_t &custom_params,
  */
 extern nixl_status_t
 getCustomIntParam(const nixl_b_params_t &custom_params, const std::string &key, size_t &value);
-} // namespace LibfabricUtils
-
-// CUDA context workaround temporary API for exposing to progress thread
-namespace LibfabricUtils {
-
-/**
- * @brief Mediator class for abstracting engine internals, while allowing consumers (e.g. progress
- * thread) to have access to the API without having an engine pointer.
- */
-class nixlLibfaricCudaCtxMediator {
-public:
-    virtual ~nixlLibfaricCudaCtxMediator() {}
-
-    virtual nixl_status_t
-    cudaSetCtx(bool &use_cuda_addr_wa) = 0;
-
-protected:
-    nixlLibfaricCudaCtxMediator() {}
-};
-
-extern void
-setCudaCtxMediator(std::unique_ptr<nixlLibfaricCudaCtxMediator> &&mediator);
-
-extern void
-clearCudaCtxMediator();
-
-extern nixl_status_t
-cudaSetCtx(bool &use_cuda_addr_wa);
 } // namespace LibfabricUtils
 
 #endif // NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_COMMON_H

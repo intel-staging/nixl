@@ -43,3 +43,13 @@ libfabric_notif_test = executable('libfabric_notif_test',
         install: true)
 
 test('libfabric_notif_test', libfabric_notif_test, timeout: 180)
+
+# Defines fi_fabric() to hook the plugin's endpoints, so it needs dlvsym (libdl).
+libfabric_post_failure_test = executable('libfabric_post_failure_test',
+        'libfabric_post_failure_test.cpp',
+        dependencies: libfabric_backend_test_dep,
+        include_directories: libfabric_test_include_directories,
+        cpp_args: ['-DHAVE_LIBFABRIC', '-D_GNU_SOURCE'],
+        install: true)
+
+test('libfabric_post_failure_test', libfabric_post_failure_test, timeout: 180)
