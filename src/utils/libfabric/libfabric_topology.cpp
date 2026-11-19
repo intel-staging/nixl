@@ -29,14 +29,6 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
 
-#ifdef HAVE_CUDA
-#ifdef __HIP_PLATFORM_AMD__
-#include <hip/hip_runtime.h>
-#else
-#include <cuda_runtime.h>
-#endif
-#endif
-
 nixlLibfabricTopology::nixlLibfabricTopology(bool enable_verbs)
     : enable_verbs_(enable_verbs),
       num_numa_nodes(0),
@@ -123,9 +115,8 @@ nixlLibfabricTopology::discoverTopology() {
         neuronEfaPreflightForNonEfaProvider();
 
         // Set basic values without hwloc discovery
-        // TCP doesn't need accelerator topology. The AMD count is kept, as before: a ROCm build
-        // selects the ROCr runtime from it, and getMrAttrIface() takes AMD memory's iface from
-        // it. Level Zero's eligibility stays in intel_accel_eligible_.
+        // TCP doesn't need accelerator topology. Past this point only logs read the counts (each
+        // buffer's runtime comes from its pointer), so they are cleared as before: all but AMD's.
         accel_counts.erase(FI_HMEM_CUDA);
         accel_counts.erase(FI_HMEM_NEURON);
         accel_counts.erase(FI_HMEM_ZE);
@@ -530,23 +521,31 @@ nixlLibfabricTopology::discoverAccelWithHwloc() {
     };
 
     // Vendors identified by PCI attributes alone. Level Zero is not consulted here.
+    std::set<enum fi_hmem_iface> present;
     hwloc_obj_t pci_obj = nullptr;
     while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
         const enum fi_hmem_iface iface = accelIfaceOfHwlocObj(pci_obj, /*match_ze=*/false);
         if (iface != FI_HMEM_SYSTEM) {
             record(pci_obj, iface);
+            present.insert(iface);
         }
+        if (accelIsIntelGpuClass(pci_obj)) { // integrated GPUs included
+            present.insert(FI_HMEM_ZE);
+        }
+    }
+    // nfi_hmem initialises only runtimes whose hardware hwloc lists. Kept apart from the counts,
+    // which leave out Intel GPUs another vendor's runtime outranks and which tcp/sockets clear.
+    for (const enum fi_hmem_iface iface :
+         {FI_HMEM_CUDA, FI_HMEM_ROCR, FI_HMEM_NEURON, FI_HMEM_ZE}) {
+        nfi_hmem_set_eligible(iface, present.count(iface) != 0);
     }
 
     // Intel GPUs count only when Level Zero could become the runtime, which depends on the counts
     // above; see intelAccelCanDecideRuntime().
     intel_accel_eligible_ = intelAccelCanDecideRuntime();
-    intel_gpu_class_seen_ = false;
     if (intel_accel_eligible_) {
         pci_obj = nullptr;
         while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
-            // From hwloc alone: Level Zero is started only when there is an Intel GPU to find.
-            intel_gpu_class_seen_ = intel_gpu_class_seen_ || accelIsIntelGpuClass(pci_obj);
             if (accelIsLevelZeroDevice(pci_obj)) {
                 record(pci_obj, FI_HMEM_ZE);
             }
@@ -942,10 +941,10 @@ nixlLibfabricTopology::getTotalNumAccel() const {
 
 bool
 nixlLibfabricTopology::intelAccelCanDecideRuntime() const {
-    // Mirrors the runtime order in nixlLibfabricRailManager: CUDA and ROCm builds (both define
+    // Follows the runtime order of nfi_hmem_primary_iface(): CUDA and ROCm builds (both define
     // HAVE_CUDA) register NVIDIA and AMD memory, and Neuron comes before Level Zero. Intel GPUs
-    // that cannot become the runtime must not anchor NIC groups, or the GPUs that do get fewer
-    // rails.
+    // that cannot become the process runtime must not anchor NIC groups, or the GPUs that do get
+    // fewer rails; their buffers, which each buffer's own runtime still registers, use every rail.
 #ifdef HAVE_CUDA
     if (getNumNvidiaAccel() > 0 || getNumAmdAccel() > 0) {
         return false;

@@ -49,7 +49,7 @@ nfi_cuda_query(const void *addr, struct nfi_hmem_info *info);
 size_t
 nfi_cuda_device_bdfs(struct nfi_hmem_bus_id *out, size_t max);
 int
-nfi_cuda_scope_push(uint64_t device, uint64_t *saved);
+nfi_cuda_scope_push(uint64_t device, uint64_t context, uint64_t *saved);
 void
 nfi_cuda_scope_pop(uint64_t saved);
 #endif

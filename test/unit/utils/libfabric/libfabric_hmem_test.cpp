@@ -26,6 +26,7 @@
 #include "common/nixl_log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -197,6 +198,70 @@ testAvailability() {
     // Answers are stable across calls.
     check(nfi_hmem_available() == any, "nfi_hmem_available() is stable across calls");
     check(nfi_hmem_primary_iface() == primary, "nfi_hmem_primary_iface() is stable across calls");
+}
+
+#ifdef HAVE_ZE
+// Level Zero's initialisation logs at least one line whatever its outcome ("Level Zero detection
+// enabled", "libze_loader.so.1 not available", "zeInit failed", ...), so counting them shows
+// whether it ran.
+std::atomic<int> ze_init_logs{0};
+
+void
+countZeInitLogs(enum nfi_hmem_log_level, const char *msg) {
+    if (strstr(msg, "Level Zero") != nullptr || strncmp(msg, "ze", 2) == 0) {
+        ++ze_init_logs;
+    }
+}
+
+// Run before anything initialises Level Zero: a runtime marked ineligible before its first use is
+// never initialised, whatever asks for it, and is initialised exactly once when allowed again.
+void
+testIneligibleBeforeFirstUse() {
+    NIXL_INFO << "0. Testing that an ineligible runtime is never initialised";
+    nfi_hmem_set_log_fn(countZeInitLogs);
+    nfi_hmem_set_eligible(FI_HMEM_ZE, false);
+
+    std::vector<char> host(64);
+    struct nfi_hmem_info info;
+    check(!nfi_hmem_iface_available(FI_HMEM_ZE), "ZE is unavailable while ineligible");
+    check(nfi_hmem_primary_iface() != FI_HMEM_ZE, "ZE is not the primary while ineligible");
+    check(nfi_hmem_device_bdfs(FI_HMEM_ZE, nullptr, 0) == 0,
+          "ZE lists no devices while ineligible");
+    check(nfi_hmem_query_ptr(host.data(), &info) == 0 && info.iface != FI_HMEM_ZE,
+          "a pointer query does not consult ZE while ineligible");
+    check(ze_init_logs.load() == 0, "Level Zero was never initialised while ineligible");
+
+    nfi_hmem_set_eligible(FI_HMEM_ZE, true);
+    nfi_hmem_iface_available(FI_HMEM_ZE);
+    const int after_first = ze_init_logs.load();
+    nfi_hmem_iface_available(FI_HMEM_ZE);
+    nfi_hmem_query_ptr(host.data(), &info);
+    check(after_first > 0, "Level Zero is initialised once eligible again");
+    check(ze_init_logs.load() == after_first, "and only once");
+    nfi_hmem_set_log_fn(nullptr);
+}
+#endif // HAVE_ZE
+
+// An ineligible runtime is unusable everywhere and comes back once eligible again.
+void
+testEligibility() {
+    NIXL_INFO << "3b. Testing runtime eligibility";
+    bool any = false;
+    for (const enum fi_hmem_iface iface : knownIfaces()) {
+        if (!nfi_hmem_iface_available(iface)) {
+            continue;
+        }
+        any = true;
+        const std::string name = nfi_hmem_iface_name(iface);
+        nfi_hmem_set_eligible(iface, false);
+        check(!nfi_hmem_iface_available(iface), name + " is unavailable while ineligible");
+        check(nfi_hmem_primary_iface() != iface, name + " is not the primary while ineligible");
+        nfi_hmem_set_eligible(iface, true);
+        check(nfi_hmem_iface_available(iface), name + " is available again once eligible");
+    }
+    if (!any) {
+        NIXL_INFO << "   SKIP: no accelerator runtime on this host";
+    }
 }
 
 /****************************************
@@ -398,19 +463,17 @@ void
 testUnclaimedVramPolicy() {
     NIXL_INFO << "8. Testing the unclaimed-VRAM policy";
 
-    // An error where CUDA or ROCr is usable, otherwise Neuron, then Level Zero.
+    // An error where CUDA or ROCr is usable, otherwise a Neuron fallback. Never Level Zero.
     const enum fi_hmem_iface fallback = accelUnclaimedVramIface();
+    check(fallback != FI_HMEM_ZE, "Level Zero is never the unclaimed-VRAM fallback");
     if (nfi_hmem_iface_available(FI_HMEM_CUDA) || nfi_hmem_iface_available(FI_HMEM_ROCR)) {
         check(fallback == FI_HMEM_SYSTEM,
               "an unclaimed VRAM pointer is an error where CUDA or ROCr is usable");
     } else if (nfi_hmem_iface_available(FI_HMEM_NEURON)) {
         check(fallback == FI_HMEM_NEURON,
-              "without CUDA or ROCr, unclaimed VRAM falls back to Neuron first");
-    } else if (nfi_hmem_iface_available(FI_HMEM_ZE)) {
-        check(fallback == FI_HMEM_ZE,
-              "without CUDA, ROCr or Neuron, unclaimed VRAM falls back to ZE");
+              "without CUDA or ROCr, unclaimed VRAM falls back to Neuron");
     } else {
-        check(fallback == FI_HMEM_SYSTEM, "with no fallback runtime, unclaimed VRAM is an error");
+        check(fallback == FI_HMEM_SYSTEM, "without Neuron, unclaimed VRAM is an error");
     }
 }
 
@@ -441,6 +504,23 @@ testScope() {
         const nixlAccelScope guard(FI_HMEM_SYSTEM, 0);
         check(guard.ok(), "nixlAccelScope reports success when there is nothing to bind");
     }
+
+    // A binding compares iface, device and owning context; a scope holds only what it bound
+    {
+        const nixlAccelBinding host(FI_HMEM_SYSTEM, 0);
+        const nixlAccelScope guard(host);
+        check(guard.holds(host), "a scope holds the binding it was made for");
+        check(!guard.holds(nixlAccelBinding(FI_HMEM_SYSTEM, 0, 0x1000)),
+              "a scope does not hold a binding with another owning context");
+        struct nfi_hmem_info info = {};
+        info.iface = FI_HMEM_SYSTEM;
+        check(guard.holds(info), "a binding built from an nfi_hmem_info compares equal");
+    }
+
+    struct nfi_hmem_scope ctx_scope;
+    check(nfi_hmem_scope_push_ctx(FI_HMEM_SYSTEM, 0, 0, &ctx_scope) == 0 && !ctx_scope.pushed,
+          "a context push for host memory is a no-op");
+    nfi_hmem_scope_pop(&ctx_scope);
 
     if (!nfi_hmem_iface_available(FI_HMEM_CUDA)) {
         NIXL_INFO << "   SKIP: CUDA unavailable, cannot test real context push/pop";
@@ -487,6 +567,33 @@ testScope() {
     check(nfi_hmem_scope_push(FI_HMEM_CUDA, 1ULL << 32, &bad) == -EINVAL && !bad.pushed,
           "a device ordinal past INT_MAX is refused");
     nfi_hmem_scope_pop(&bad);
+
+    // An owning context is bound as given, and its pop releases nothing. A retained primary
+    // context stands in for the application's (cuCtxCreate's signature differs across CUDA 12
+    // and 13).
+    CUdevice dev0 = 0;
+    CUcontext own = nullptr;
+    if (cuDeviceGet(&dev0, 0) == CUDA_SUCCESS &&
+        cuDevicePrimaryCtxRetain(&own, dev0) == CUDA_SUCCESS) {
+        {
+            const nixlAccelScope guard(
+                nixlAccelBinding(FI_HMEM_CUDA, 0, reinterpret_cast<uint64_t>(own)));
+            CUcontext bound = nullptr;
+            check(guard.ok() && cuCtxGetCurrent(&bound) == CUDA_SUCCESS && bound == own,
+                  "a scope with an owning context binds that context");
+        }
+        CUcontext after_own = nullptr;
+        (void)cuCtxGetCurrent(&after_own);
+        check(after_own == after, "the owning-context scope restores the previous binding");
+        unsigned int flags = 0;
+        int active = 0;
+        check(cuDevicePrimaryCtxGetState(dev0, &flags, &active) == CUDA_SUCCESS && active,
+              "the owning-context pop released no reference of the caller's");
+        (void)cuDevicePrimaryCtxRelease(dev0);
+    } else {
+        NIXL_INFO << "   SKIP: could not retain a CUDA context for the owning-context check";
+    }
+
     CUcontext final_ctx = nullptr;
     (void)cuCtxGetCurrent(&final_ctx);
     check(final_ctx == after, "nested scopes unwind to the original binding");
@@ -810,12 +917,18 @@ main() {
 
     NIXL_INFO << "=== Testing the libfabric HMEM shim ===";
 
+#ifdef HAVE_ZE
+    // First, before the log bridge and before anything initialises Level Zero.
+    testIneligibleBeforeFirstUse();
+#endif
+
     // Before vendor initialisation, so its log lines appear.
     nixlAccelInstallLogBridge();
 
     testIfaceList();
     testIfaceNames();
     testAvailability();
+    testEligibility();
     testQueryPtr();
     testFillMrAttr();
     testDeviceBdfs();

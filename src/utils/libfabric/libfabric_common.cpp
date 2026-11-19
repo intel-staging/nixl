@@ -126,6 +126,7 @@ namespace {
         /*opt_in=*/false,
         /*select_domains=*/nullptr,
         /*carries_ze=*/true,
+        /*device_memory_needs_hmem=*/false,
     };
 
     const nixlLibfabricProviderInfo k_efa_provider = {
@@ -145,6 +146,7 @@ namespace {
         /*select_domains=*/nullptr,
         // libfabric's efa provider has no Level Zero support.
         /*carries_ze=*/false,
+        /*device_memory_needs_hmem=*/false,
     };
 
     const nixlLibfabricProviderInfo k_verbs_provider = {
@@ -170,6 +172,7 @@ namespace {
         /*opt_in=*/true,
         /*select_domains=*/selectVerbsDomains,
         /*carries_ze=*/true,
+        /*device_memory_needs_hmem=*/false,
     };
 
     const nixlLibfabricProviderInfo k_tcp_provider = {
@@ -188,6 +191,7 @@ namespace {
         /*opt_in=*/false,
         /*select_domains=*/nullptr,
         /*carries_ze=*/true,
+        /*device_memory_needs_hmem=*/true,
     };
 
     const nixlLibfabricProviderInfo k_sockets_provider = {
@@ -206,6 +210,7 @@ namespace {
         /*opt_in=*/false,
         /*select_domains=*/nullptr,
         /*carries_ze=*/false,
+        /*device_memory_needs_hmem=*/true,
     };
 
     /*
@@ -668,26 +673,6 @@ getCustomIntParam(const nixl_b_params_t &custom_params, const std::string &key, 
         return NIXL_ERR_INVALID_PARAM;
     }
     return NIXL_SUCCESS;
-}
-
-static std::unique_ptr<nixlLibfaricCudaCtxMediator> cuda_ctx_mediator;
-
-void
-setCudaCtxMediator(std::unique_ptr<nixlLibfaricCudaCtxMediator> &&mediator) {
-    cuda_ctx_mediator = std::move(mediator);
-}
-
-void
-clearCudaCtxMediator() {
-    cuda_ctx_mediator.reset(nullptr);
-}
-
-nixl_status_t
-cudaSetCtx(bool &use_cuda_addr_wa) {
-    if (cuda_ctx_mediator.get() == nullptr) {
-        return NIXL_ERR_INVALID_PARAM;
-    }
-    return cuda_ctx_mediator->cudaSetCtx(use_cuda_addr_wa);
 }
 
 } // namespace LibfabricUtils

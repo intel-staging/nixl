@@ -54,9 +54,6 @@ private:
     // Whether Intel GPUs are counted and grouped; see intelAccelCanDecideRuntime(). Kept apart
     // from accel_counts, whose ZE count tcp/sockets clear.
     bool intel_accel_eligible_ = false;
-    // Whether hwloc lists an Intel display or processing-accelerator PCI device (integrated GPUs
-    // included); see intelAccelCanBeRuntime()
-    bool intel_gpu_class_seen_ = false;
     int num_numa_nodes;
     int num_devices;
 
@@ -309,18 +306,6 @@ public:
         return getNumAccel(FI_HMEM_ZE);
     }
 
-    /**
-     * @brief Whether Level Zero may become the system runtime: hwloc lists an Intel display or
-     * processing-accelerator PCI device (integrated GPUs included), and there is no NVIDIA or AMD
-     * GPU a GPU build can register, and no Neuron device. Taken from the accelerator inventory,
-     * which is made for every provider, so it holds also where tcp/sockets reset the counts. When
-     * false, Level Zero is never initialised.
-     */
-    bool
-    intelAccelCanBeRuntime() const {
-        return intel_accel_eligible_ && intel_gpu_class_seen_;
-    }
-
     const std::vector<std::string> &
     getAllDevices() const {
         return all_devices;
@@ -339,17 +324,6 @@ public:
 
     bool
     isValidDevice(const std::string &nic_device) const;
-
-    enum fi_hmem_iface
-    getMrAttrIface(int device_id) const {
-        if (device_id < getNumNvidiaAccel()) {
-            return FI_HMEM_CUDA;
-        } else if (device_id < getNumNvidiaAccel() + getNumAmdAccel()) {
-            return FI_HMEM_ROCR;
-        } else {
-            return FI_HMEM_NEURON;
-        }
-    }
 
     /** @brief Invalid NUMA node id constant. */
     static const uint16_t INVALID_NUMA_NODE_ID = UINT16_MAX;
