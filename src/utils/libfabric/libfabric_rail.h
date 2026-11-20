@@ -397,8 +397,8 @@ struct nixlLibfabricPostRequest {
 class nixlLibfabricRail {
 public:
     uint16_t rail_id; ///< Unique rail identifier
-    std::string device_name; ///< EFA device name for this rail
-    std::string provider_name; ///< Provider name (e.g., "efa", "efa-direct")
+    std::string device_name; ///< Libfabric domain name for this rail
+    std::string provider_name; ///< Core provider name (e.g., "efa", "cxi", "tcp")
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
     struct fid_ep *endpoint; ///< Libfabric endpoint handle
 
@@ -645,6 +645,9 @@ private:
 
     // Provider capability flags
     bool provider_supports_hmem_;
+
+    // Provider table entry the rail was created with (defaultProviderInfo() if unlisted)
+    const LibfabricUtils::nixlLibfabricProviderInfo &provider_info_;
 
     // System runtime type (CUDA, NEURON, or SYSTEM) this rail was created for
     enum fi_hmem_iface runtime_;
