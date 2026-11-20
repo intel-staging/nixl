@@ -159,8 +159,8 @@ main() {
 
     c->disconnect("AgentD");
     d->disconnect("AgentC");
-    // Delete the replyer (D) first: its CM thread must be gone before the peer
-    // it replies to frees its receive buffers.
+    // Delete the replyer (D) first: its progress thread, which sends the reply, must be gone before
+    // the peer it replies to frees its receive buffers.
     delete d;
     delete c;
 
