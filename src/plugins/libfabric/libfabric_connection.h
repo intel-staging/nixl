@@ -44,6 +44,9 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
     std::unordered_map<size_t, std::vector<fi_addr_t>>
         rail_remote_addr_list_; // Rail libfabric addresses. key=rail id.
     std::vector<char *> src_ep_names_; // Rail endpoint names
+    // The peer's rail addresses, by peer rail id, for preferring a peer rail on the posting rail's
+    // subnet (LibfabricUtils::pickPeerRail). Empty when not readable.
+    LibfabricUtils::nixlLibfabricFabricIds peer_fabric_ids_;
     std::atomic<ConnectionState> overall_state_; // Current connection state
 
     // Set once the peer holds our endpoints in its AV, so it can attribute our traffic.
