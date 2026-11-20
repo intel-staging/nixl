@@ -39,7 +39,9 @@
 //   2. a striped descriptor partly submitted (skipped with a single rail);
 //   3. a failure in one of the posting threads;
 //   4. two failures in a row on one reused handle;
-//   5. a failure with FI_MORE posts held until a flush: the transfer must still end.
+//   5. a failure with FI_MORE posts held until a flush: the transfer must still end;
+//   7. with the notification's send completion withheld, the report keeps its XFER_ID reserved
+//      until that send completes, and frees it once it has (after 6, a successful transfer).
 
 #include <dlfcn.h>
 #include <rdma/fabric.h>
@@ -126,6 +128,9 @@ atomic<bool> hold_fi_more{false};
 // the failure (or would have) before the notification may follow it.
 constexpr milliseconds kErrorCompletionDelay(100);
 unordered_set<void *> delayed_contexts; // send contexts of transfer-error messages
+// While set, a notification's send completion is withheld until release_held_completions()
+atomic<bool> hold_notif_completions{false};
+unordered_set<void *> held_notif_contexts;
 
 struct HeldCompletion {
     fid_cq *cq; // the CQ it came from, the only one it may be returned on
@@ -162,14 +167,17 @@ hooked_cq_readfrom(fid_cq *cq, void *buf, size_t count, fi_addr_t *src_addr) {
     auto *entries = static_cast<fi_cq_data_entry *>(buf);
     const lock_guard<mutex> lock(hook_mutex);
     for (ssize_t i = 0; i < ret;) {
-        if (delayed_contexts.erase(entries[i].op_context) == 0) {
+        const bool delayed = delayed_contexts.erase(entries[i].op_context) != 0;
+        const bool held = !delayed && held_notif_contexts.erase(entries[i].op_context) != 0;
+        if (!delayed && !held) {
             ++i;
             continue;
         }
-        held_completions.push_back({cq,
-                                    entries[i],
-                                    src_addr != nullptr ? src_addr[i] : FI_ADDR_UNSPEC,
-                                    steady_clock::now() + kErrorCompletionDelay});
+        held_completions.push_back(
+            {cq,
+             entries[i],
+             src_addr != nullptr ? src_addr[i] : FI_ADDR_UNSPEC,
+             held ? steady_clock::time_point::max() : steady_clock::now() + kErrorCompletionDelay});
         for (ssize_t j = i + 1; j < ret; ++j) {
             entries[j - 1] = entries[j];
             if (src_addr != nullptr) {
@@ -257,6 +265,9 @@ hooked_senddata(fid_ep *ep,
                                  static_cast<uint16_t>(NIXL_GET_XFER_ID_FROM_IMM(data))});
         if (NIXL_GET_MSG_TYPE_FROM_IMM(data) == NIXL_LIBFABRIC_MSG_XFER_ERROR) {
             delayed_contexts.insert(context);
+        } else if (NIXL_GET_MSG_TYPE_FROM_IMM(data) == NIXL_LIBFABRIC_MSG_NOTIFICTION &&
+                   hold_notif_completions.load()) {
+            held_notif_contexts.insert(context);
         }
     }
     return ret;
@@ -595,7 +606,10 @@ failedWrite(Peers &p,
             }
         }
     }
-    check(errors == 1, "one transfer-error message was posted (got " + to_string(errors) + ")");
+    // Posted once, then once more right before the notification, so the target still holds the
+    // failure when the notification arrives
+    check(errors == 2,
+          "the transfer-error message was posted twice (got " + to_string(errors) + ")");
     check(notif_posts == 1,
           "one notification was posted (got " + to_string(notif_posts) +
               "), after it: " + (error_first ? "yes" : "no"));
@@ -666,6 +680,45 @@ main() {
         check(st == NIXL_SUCCESS, "it completes");
         check(notifs == 1, "and delivers one notification");
         p.a->releaseReqH(h);
+    }
+
+    // The report keeps its XFER_ID reserved until the messages it posted have completed, so after
+    // the counter wraps a newer transfer cannot take it while a late one may still arrive
+    hold_notif_completions = true;
+    nixlBackendReqH *h7 = nullptr;
+    failedWrite(p, "7. XFER_ID held until the report's sends complete", 4, false, 1, h7, "fail-7");
+    hold_notif_completions = false;
+    {
+        const uint16_t id = static_cast<nixlLibfabricBackendH *>(h7)->post_xfer_id;
+        p.a->releaseReqH(h7);
+        auto handedOut = [id] {
+            for (int i = 0; i < 65536; ++i) {
+                if (LibfabricUtils::getNextXferId() == id) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        check(!handedOut(),
+              "the XFER_ID was not handed out while the notification's send was in flight");
+        {
+            // The initiator has no progress thread, so its completion may not even have been
+            // read yet; either way the initiator has not seen the send complete
+            const lock_guard<mutex> lock(hook_mutex);
+            check(!held_completions.empty() || !held_notif_contexts.empty(),
+                  "the notification's send completion was withheld or not yet read");
+            held_notif_contexts.clear();
+            for (HeldCompletion &c : held_completions) {
+                c.release = steady_clock::now();
+            }
+        }
+        // Once the initiator reaps those completions, the report finishes and frees the ID
+        const auto until = steady_clock::now() + milliseconds(500);
+        while (steady_clock::now() < until) {
+            notif_list_t ignored;
+            p.a->getNotifs(ignored);
+        }
+        check(handedOut(), "the XFER_ID was handed out again once the report's sends completed");
     }
 
     tearDown(p);

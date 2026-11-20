@@ -65,6 +65,9 @@ struct ifaddrs;
 // -FI_EAGAIN before they fail: 0, retry until the provider takes them. -FI_EAGAIN cannot tell a
 // dead peer from a healthy one under pressure, so failing on it is the application's choice.
 #define NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S 0
+// How long a failed WRITE's transfer-error report is resent when post_eagain_timeout is 0: the
+// report runs in the background, so unlike a post it must end on its own
+#define NIXL_LIBFABRIC_XFER_ERROR_REPORT_TIMEOUT_S 60
 
 // Handshake SerDes tag names
 constexpr const char *NIXL_HANDSHAKE_TAG_VER = "ver";
@@ -312,9 +315,16 @@ template<typename T, typename U = T> struct pair_hash {
 
 // Global XFER_ID management
 namespace LibfabricUtils {
-// Get next unique XFER_ID
+// Get next unique XFER_ID, skipping reserved ones
 uint16_t
 getNextXferId();
+// Keep getNextXferId() from handing out @p xfer_id until releaseXferId(): for an XFER_ID that a
+// queued message may still refer to on the target, so a newer transfer does not take it after
+// the 16-bit counter wraps. Not counted: reserve an ID at most once at a time.
+void
+reserveXferId(uint16_t xfer_id);
+void
+releaseXferId(uint16_t xfer_id);
 // Get next 4-bit SEQ_ID
 uint8_t
 getNextSeqId();

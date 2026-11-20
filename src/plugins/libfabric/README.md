@@ -191,7 +191,29 @@ Notes specific to verbs:
   soon as the progress thread reaps the last completion; without one, from the `postXfer()` or
   `checkXfer()` call that sees the transfer complete, as a READ's notification does. A WRITE that
   fails sends the target a transfer-error message and then the notification, which the target
-  releases with a warning that the data is incomplete, as on other providers.
+  releases with a warning that the data is incomplete, as on other providers. The report goes
+  out in the background: on the progress thread, or without one from later `checkXfer()` and
+  `getNotifs()` calls. With a progress thread `checkXfer()` returns the error at once. Without
+  one, a transfer that owes its notification stays `NIXL_IN_PROG` until the report has finished,
+  so the application's own polling keeps driving it. The transfer-error message is resent until
+  its send completes, since the failed write may have broken the connection it travels on and
+  flushed it, and the notification follows only once it has, so the target never takes a failed
+  transfer's notification for a successful one. The message is sent once more right before the
+  notification as a safeguard; the target keeps a connected sender's failure record until its
+  notification arrives, whatever `pending_notif_timeout` is set to. If the message is not
+  delivered in time, neither is the notification: the target application does not hear of that
+  transfer. The deadline (below) stops new attempts in each phase; an attempt already in flight
+  is still awaited, since it may yet be delivered, so a report can outlast it. Every post of the
+  report is a single attempt, retried 100 ms later if refused, so it never holds up the progress
+  thread. A report goes only to the connection its transfer was posted on, and is dropped if that
+  connection is gone or has been replaced. Its XFER_ID is not reused by a newer transfer until the
+  report is finished and every message it posted has completed. A send completion means the peer
+  acknowledged the message on verbs; on tcp it only means the socket took it.
+  - Known limitation on tcp and sockets: where the notification goes out at `postXfer()` (not
+    notify-after-completion), it can complete and still be lost if the failed WRITE tears the
+    connection down before the socket delivers it. The report resends only the transfer-error
+    message, so the target records the failure but never receives the notification, and the
+    target application does not hear of that transfer.
   - The notification travels on rail 0, possibly through a different NIC than the data. The
     initiator's completion of a write means the target NIC has acknowledged it, and the target
     relies on that NIC having written the data before it acknowledged, as the UCX backend does
@@ -310,6 +332,9 @@ Defaults to 0: refused posts are retried until the provider takes them, so a pee
 refuses keeps its transfer waiting, and holds up its rail's queued posts (other rails keep
 progressing). Also the `post_eagain_timeout` backend parameter; the environment variable takes
 precedence. At most 604800 (7 days).
+It also sets the deadline after which a failed WRITE's transfer-error report stops making new
+attempts in each phase: 60 s when it is 0, the default. An attempt already in flight is still
+awaited, so this is not a hard limit on how long a report takes.
 
 ### Summary
 
