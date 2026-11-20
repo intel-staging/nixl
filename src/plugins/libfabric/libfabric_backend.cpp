@@ -376,6 +376,24 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
                          "writes complete, and writes carry no remote CQ data";
         }
 
+        // NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT, or the backend parameter of that name
+        size_t eagain_secs = NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S;
+        if (LibfabricUtils::getCustomIntParam(
+                getCustomParams(), "post_eagain_timeout", eagain_secs) == NIXL_SUCCESS) {
+            if (eagain_secs > static_cast<size_t>(kMaxStaleAge.count())) {
+                NIXL_WARN << "post_eagain_timeout " << eagain_secs << " s exceeds the maximum "
+                          << kMaxStaleAge.count() << " s; using "
+                          << NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S << " s";
+                eagain_secs = NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT_S;
+            }
+            NIXL_INFO << "post_eagain_timeout: "
+                      << (eagain_secs == 0 ? std::string("never") :
+                                             std::to_string(eagain_secs) + " s");
+        }
+        for (size_t rail_id = 0; rail_id < rail_manager_.getNumRails(); ++rail_id) {
+            rail_manager_.getRail(rail_id).setPostEagainTimeout(std::chrono::seconds(eagain_secs));
+        }
+
         // NIXL_LIBFABRIC_PENDING_{DISCONNECTED,NOTIF,WRITES}_TIMEOUT, or the backend parameters
         // of that name
         for (auto [key, age] : {std::pair{"pending_disconnected_timeout", &stale_disconnected_age_},

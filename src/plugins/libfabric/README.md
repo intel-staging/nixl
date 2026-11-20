@@ -279,6 +279,17 @@ backend parameters, `pending_disconnected_timeout`, `pending_notif_timeout` and
 `pending_writes_timeout`. Sweeps run every 5 s (or every shortest non-zero timeout, if shorter) once
 a progress pass finds the completion queues empty, or after four intervals regardless.
 
+### NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT
+
+The longest, in seconds, a destination may keep refusing posts with -FI_EAGAIN before posts to it
+fail: a maximum tolerated posting delay, for applications that need bounded waits. -FI_EAGAIN means
+the provider cannot accept the operation now; it does not tell a peer that is gone from a healthy
+one under pressure, so a finite value can also fail transfers during heavy but healthy congestion.
+Defaults to 0: refused posts are retried until the provider takes them, so a peer that only ever
+refuses keeps its transfer waiting, and holds up its rail's queued posts (other rails keep
+progressing). Also the `post_eagain_timeout` backend parameter; the environment variable takes
+precedence. At most 604800 (7 days).
+
 ### Summary
 
 The following table summarizes briefly the plugin's runtime configuration:
@@ -289,6 +300,7 @@ The following table summarizes briefly the plugin's runtime configuration:
 | pending_disconnected_timeout | Drops a disconnected sender's pending notification this long without progress | Backend init param or `NIXL_LIBFABRIC_PENDING_DISCONNECTED_TIMEOUT` environment variable | integer | 60, 0 | Seconds, default 60, at most 604800; 0 never drops one |
 | pending_notif_timeout | Drops a connected sender's incomplete notification this long without progress | Backend init param or `NIXL_LIBFABRIC_PENDING_NOTIF_TIMEOUT` environment variable | integer | 60, 0 | Seconds, default 0 (never), at most 604800 |
 | pending_writes_timeout | Drops a connected sender's complete notification this long without its writes | Backend init param or `NIXL_LIBFABRIC_PENDING_WRITES_TIMEOUT` environment variable | integer | 600, 0 | Seconds, default 0 (never), at most 604800 |
+| post_eagain_timeout | Maximum tolerated posting delay: fails posts to a destination that has refused them with -FI_EAGAIN this long | Backend init param or `NIXL_LIBFABRIC_POST_EAGAIN_TIMEOUT` environment variable | integer | 60, 0 | Seconds, default 0 (retry until accepted), at most 604800; can expire during healthy congestion |
 | num_threads | Enables a thread pool for parallel descriptor posting in postXfer | Backend init param | integer | 4, 8 | Default 0 keeps the serial posting path |
 | split_batch_size | Minimum descriptor count before postXfer uses the posting thread pool | Backend init param | integer | 1024, 4096 | Default 1024; only applies when num_threads is greater than 0 |
 | dmabuf_mapping | Selects the CUDA dmabuf mapping type a VRAM_SEG registration exports for an EFA rail | Backend init param or `NIXL_LIBFABRIC_DMABUF_MAPPING` environment variable | auto, pcie, default, off | auto, off | Default auto takes a per-NIC verdict from the PCIe-path topology; pcie and default force the GPU's PCIe aperture (BAR1) or the platform default mapping on every device; off registers by virtual address. Only applies to CUDA device memory on an EFA provider whose fabric carries libfabric API 1.20 or newer |
