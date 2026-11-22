@@ -148,7 +148,8 @@ public:
     /** Record completion of one request (with status).
      *  Stores error and bumps successful_requests_ before incrementing the counter so that
      *  is_completed() observers always see the error_status_ that caused the transition and the
-     *  final successful count. Used unless the provider notifies after completion. */
+     *  final successful count. Used unless the provider notifies after completion or the
+     *  transfer is a notified READ (nixlLibfabricEngine::notifiesOnCompletion()). */
     void
     complete_request(nixl_status_t status);
 
@@ -249,6 +250,9 @@ private:
         uint32_t total_len = 0;
         uint16_t xfer_id = 0;
         std::shared_ptr<nixlLibfabricBackendH::CompletionNotifResult> result;
+        // The connection the transfer was posted on: the notification goes only to it, never to a
+        // connection that replaced it after a disconnect and reconnect.
+        std::weak_ptr<nixlLibfabricConnection> connection;
         // Fragments already posted; a send the provider refused resumes here.
         size_t next_fragment = 0;
     };
@@ -434,9 +438,10 @@ private:
     createAgentConnection(const std::string &agent_name,
                           const std::vector<std::array<char, 56>> &data_rail_endpoints);
 
-    // Whether handle is a notified WRITE whose notification is sent once its writes complete
-    // locally (notify-after-completion), rather than right after posting. A READ's notification
-    // is sent by the postXfer() or checkXfer() call that sees the READ complete, as before.
+    // Whether handle's notification is sent once the transfer completes locally: a notified READ's
+    // always, a notified WRITE's when its writes are not counted by the target
+    // (notify-after-completion) rather than sent right after posting. The progress thread sends it;
+    // without one, the postXfer() or checkXfer() call that sees the transfer complete does.
     bool
     notifiesOnCompletion(const nixlLibfabricBackendH &handle) const;
 
@@ -479,7 +484,8 @@ private:
                   uint16_t notif_xfer_id,
                   uint32_t expected_completions,
                   bool may_reconnect = true,
-                  size_t *next_fragment = nullptr) const;
+                  size_t *next_fragment = nullptr,
+                  const std::weak_ptr<nixlLibfabricConnection> *bound_connection = nullptr) const;
 
     // Post, in a single attempt, message @p index of @p report to the connection it was created
     // for: 0 is the transfer-error message, telling the target that the transfer failed on this

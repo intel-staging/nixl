@@ -1256,7 +1256,7 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
                 backend_handle->post_xfer_id :
                 static_cast<uint16_t>(NIXL_UNTRACKED_XFER_ID),
             [this, backend_handle](nixl_status_t status) {
-                if (!notify_after_completion_) {
+                if (!notify_after_completion_ && !notifiesOnCompletion(*backend_handle)) {
                     backend_handle->complete_request(status);
                     return;
                 }
@@ -1576,19 +1576,9 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
 
     // For very small transfers we can check for local completions immediately.
     if (backend_handle->is_completed()) {
-        if (backend_handle->has_notif && backend_handle->operation_ == nixl_xfer_op_t::NIXL_READ) {
-            nixl_status_t notif_status = notifSendPriv(remote_agent,
-                                                       backend_handle->binary_notifs,
-                                                       backend_handle->total_notif_msg_len,
-                                                       backend_handle->post_xfer_id,
-                                                       0);
-            if (notif_status != NIXL_SUCCESS) {
-                NIXL_ERROR << "Failed to send notification";
-                return notif_status;
-            }
-        } else if (notifiesOnCompletion(*backend_handle)) {
-            // A failed transfer is left to checkXfer(), which sends the notification after the
-            // error message.
+        if (notifiesOnCompletion(*backend_handle)) {
+            // A failed transfer is left to checkXfer(), which sends a failed WRITE's notification
+            // after the error message (a failed READ sends none).
             if (backend_handle->get_error_status() != NIXL_SUCCESS) {
                 return NIXL_IN_PROG;
             }
@@ -1602,11 +1592,12 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
 
 bool
 nixlLibfabricEngine::notifiesOnCompletion(const nixlLibfabricBackendH &handle) const {
-    // A WRITE's notification waits for its writes to complete when the target cannot count them
-    // (see providerNotifiesAfterCompletion()); it then carries no writes to count. A READ's
-    // notification is sent by the postXfer() or checkXfer() call that sees the READ complete.
-    return handle.has_notif && handle.operation_ == nixl_xfer_op_t::NIXL_WRITE &&
-        notify_after_completion_;
+    // A READ's notification always waits for the data to arrive locally; a WRITE's does when the
+    // target cannot count the writes (see providerNotifiesAfterCompletion()). Either way it
+    // carries no writes to count.
+    return handle.has_notif &&
+        (handle.operation_ == nixl_xfer_op_t::NIXL_READ ||
+         (handle.operation_ == nixl_xfer_op_t::NIXL_WRITE && notify_after_completion_));
 }
 
 nixl_status_t
@@ -1625,7 +1616,10 @@ nixlLibfabricEngine::sendCompletionNotif(nixlLibfabricBackendH &handle) const {
                                                handle.binary_notifs,
                                                handle.total_notif_msg_len,
                                                handle.post_xfer_id,
-                                               0);
+                                               0,
+                                               true,
+                                               nullptr,
+                                               &handle.post_connection_);
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Failed to send the notification for XFER_ID=" << handle.post_xfer_id
                    << " to " << handle.remote_agent_;
@@ -1651,7 +1645,8 @@ nixlLibfabricEngine::onXferComplete(nixlLibfabricBackendH &handle) const {
                           handle.binary_notifs,
                           handle.total_notif_msg_len,
                           handle.post_xfer_id,
-                          handle.completion_notif_result_});
+                          handle.completion_notif_result_,
+                          handle.post_connection_});
 }
 
 void
@@ -1689,8 +1684,14 @@ nixlLibfabricEngine::sendQueuedCompletionNotifs() const {
         }
         // Re-establishing a connection waits for a handshake only this thread can process, so a
         // notification to a disconnected peer fails here; checkXfer() reports it.
-        const nixl_status_t status = notifSendPriv(
-            n.remote_agent, n.fragments, n.total_len, n.xfer_id, 0, false, &n.next_fragment);
+        const nixl_status_t status = notifSendPriv(n.remote_agent,
+                                                   n.fragments,
+                                                   n.total_len,
+                                                   n.xfer_id,
+                                                   0,
+                                                   false,
+                                                   &n.next_fragment,
+                                                   &n.connection);
         if (status == NIXL_IN_PROG) {
             refused_peers.insert(n.remote_agent);
             kept.push_back(std::move(n));
@@ -1765,18 +1766,6 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
         }
 
         NIXL_DEBUG << "Data transfer completed successfully";
-        if (backend_handle->has_notif && backend_handle->operation_ == nixl_xfer_op_t::NIXL_READ) {
-            nixl_status_t notif_status = notifSendPriv(backend_handle->remote_agent_,
-                                                       backend_handle->binary_notifs,
-                                                       backend_handle->total_notif_msg_len,
-                                                       backend_handle->post_xfer_id,
-                                                       0);
-            if (notif_status != NIXL_SUCCESS) {
-                NIXL_ERROR << "Failed to send notification";
-                return notif_status;
-            }
-            return NIXL_SUCCESS;
-        }
         return sendCompletionNotif(*backend_handle);
     }
     return NIXL_IN_PROG;
@@ -1881,19 +1870,29 @@ nixlLibfabricEngine::fragmentNotificationMessage(
 
 // notifSendPriv that accepts vector of BinaryNotifications for fragmentation support
 nixl_status_t
-nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
-                                   std::vector<BinaryNotification> &binary_notifications,
-                                   uint32_t total_message_length,
-                                   uint16_t notif_xfer_id,
-                                   uint32_t expected_completions,
-                                   bool may_reconnect,
-                                   size_t *next_fragment) const {
+nixlLibfabricEngine::notifSendPriv(
+    const std::string &remote_agent,
+    std::vector<BinaryNotification> &binary_notifications,
+    uint32_t total_message_length,
+    uint16_t notif_xfer_id,
+    uint32_t expected_completions,
+    bool may_reconnect,
+    size_t *next_fragment,
+    const std::weak_ptr<nixlLibfabricConnection> *bound_connection) const {
     std::shared_ptr<nixlLibfabricConnection> connection;
     {
         std::lock_guard<std::mutex> lock(connection_state_mutex_);
         auto it = connections_.find(remote_agent);
         if (it == connections_.end()) {
             NIXL_ERROR << "No connection found for agent: " << remote_agent;
+            return NIXL_ERR_NOT_FOUND;
+        }
+        // A transfer's notification goes only to the connection it was posted on: one that has
+        // since been removed, or replaced by a newer agent of the same name, is gone.
+        if (bound_connection != nullptr && it->second != bound_connection->lock()) {
+            NIXL_ERROR << "Connection to " << remote_agent
+                       << " was replaced since the transfer was posted; notification XFER_ID="
+                       << notif_xfer_id << " dropped";
             return NIXL_ERR_NOT_FOUND;
         }
         connection = it->second;
@@ -1934,34 +1933,75 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
                 total_message_length, expected_completions, metadata.agent_name_length);
         }
 
-        // Allocate control request for this notification fragment from rail 0
         size_t rail_id = 0;
         size_t max_size = BinaryNotification::MAX_FRAGMENT_SIZE;
-        nixlLibfabricReq *control_request =
-            rail_manager_.getRail(rail_id).allocateControlRequest(max_size, notif_xfer_id);
+        nixl_status_t status;
+        while (true) {
+            // Allocate control request for this notification fragment from rail 0. A refused post
+            // releases it, so each attempt takes its own.
+            nixlLibfabricReq *control_request =
+                rail_manager_.getRail(rail_id).allocateControlRequest(max_size, notif_xfer_id);
 
-        if (!control_request) {
-            if (post_once && next_fragment != nullptr) {
-                // Every control request is in flight; one frees once its send completes.
-                *next_fragment = seq_id;
-                return NIXL_IN_PROG;
+            if (!control_request) {
+                if (post_once && next_fragment != nullptr) {
+                    // Every control request is in flight; one frees once its send completes.
+                    *next_fragment = seq_id;
+                    return NIXL_IN_PROG;
+                }
+                NIXL_ERROR << "Failed to allocate control request for notification fragment "
+                           << seq_id;
+                return NIXL_ERR_BACKEND;
             }
-            NIXL_ERROR << "Failed to allocate control request for notification fragment " << seq_id;
-            return NIXL_ERR_BACKEND;
+
+            size_t serialized_size = binary_notification.serialize(control_request->buffer);
+            control_request->buffer_size = serialized_size;
+
+            NIXL_DEBUG << "Sending binary notification fragment " << seq_id << "/"
+                       << binary_notifications.size() << " size=" << serialized_size << "B"
+                       << " payload_chunk_size=" << header.payload_length << "B"
+                       << " notif_xfer_id=" << header.notif_xfer_id;
+
+            if (bound_connection == nullptr) {
+                status = rail_manager_.postControlMessage(
+                    nixlLibfabricRailManager::ControlMessageType::NOTIFICATION,
+                    control_request,
+                    connection->rail_remote_addr_list_[rail_id][0]);
+                break;
+            }
+            {
+                // Checked and posted under the lock disconnect() holds while it removes a
+                // connection, as postFailureReportMessage() does, so the fragment never goes out
+                // on the address of a connection that has been removed or replaced. One attempt
+                // per hold: a refused one is retried below, outside the lock.
+                const nixlLibfabricRail::PostOnceScope one_attempt;
+                const std::lock_guard<std::mutex> lock(connection_state_mutex_);
+                const auto it = connections_.find(remote_agent);
+                if (it == connections_.end() || it->second != bound_connection->lock()) {
+                    rail_manager_.getRail(rail_id).releaseRequest(control_request);
+                    NIXL_ERROR << "Connection to " << remote_agent
+                               << " was replaced since the transfer was posted; notification "
+                               << "XFER_ID=" << notif_xfer_id << " dropped";
+                    return NIXL_ERR_NOT_FOUND;
+                }
+                status = rail_manager_.postControlMessage(
+                    nixlLibfabricRailManager::ControlMessageType::NOTIFICATION,
+                    control_request,
+                    it->second->rail_remote_addr_list_[rail_id][0]);
+            }
+            if (status != NIXL_IN_PROG || post_once) {
+                break; // a caller under its own PostOnceScope tries again later
+            }
+            // Refused: let the provider free resources, then check the connection again
+            if (!progress_thread_enabled_) {
+                status = rail_manager_.getRail(rail_id).progressCompletionQueue();
+                if (status != NIXL_SUCCESS && status != NIXL_IN_PROG) {
+                    NIXL_ERROR << "Failed to progress rail 0 in notifSendPriv";
+                    return status;
+                }
+            } else {
+                std::this_thread::yield();
+            }
         }
-
-        size_t serialized_size = binary_notification.serialize(control_request->buffer);
-        control_request->buffer_size = serialized_size;
-
-        NIXL_DEBUG << "Sending binary notification fragment " << seq_id << "/"
-                   << binary_notifications.size() << " size=" << serialized_size << "B"
-                   << " payload_chunk_size=" << header.payload_length << "B"
-                   << " notif_xfer_id=" << header.notif_xfer_id;
-
-        nixl_status_t status = rail_manager_.postControlMessage(
-            nixlLibfabricRailManager::ControlMessageType::NOTIFICATION,
-            control_request,
-            connection->rail_remote_addr_list_[rail_id][0]);
 
         if (status == NIXL_IN_PROG && next_fragment != nullptr) {
             // Refused for now under PostOnceScope; nothing of this fragment was posted.
