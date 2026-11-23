@@ -189,7 +189,7 @@ Notes specific to verbs:
   of connected peers. The cost is that the notification leaves after the writes complete, not
   alongside them: about 4 us later on a 400G RoCE link. With the progress thread it goes out as
   soon as the progress thread reaps the last completion; without one, from the `postXfer()` or
-  `checkXfer()` call that sees the transfer complete, as a READ's notification does. A WRITE that
+  `checkXfer()` call that sees the transfer complete; a READ's is sent the same way. A WRITE that
   fails sends the target a transfer-error message and then the notification, which the target
   releases with a warning that the data is incomplete, as on other providers. The report goes
   out in the background: on the progress thread, or without one from later `checkXfer()` and

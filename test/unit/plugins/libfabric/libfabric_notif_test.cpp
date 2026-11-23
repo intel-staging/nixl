@@ -20,9 +20,10 @@
 // arrives exactly once. On a notify-after-completion provider the initiator sends it from the
 // progress thread once the writes complete; on the others it goes out at postXfer().
 //
-// A notified READ's notification is sent by the checkXfer() (or postXfer()) call that sees the
-// READ complete, before it reports success, so a genNotif() sent after it reaches the target
-// second.
+// A notified READ's notification is sent by the progress thread once the READ completes, so it too
+// arrives without the initiator polling checkXfer(), and exactly once; the first READ is held in
+// progress past postXfer() so this does not depend on scheduling. checkXfer() reports success
+// only once it has been sent, so a genNotif() sent after that reaches the target second.
 //
 // Runs with the provider's own notification mode, so the notify-after-completion path is covered on
 // a host whose provider uses it (verbs).
@@ -30,6 +31,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,6 +41,20 @@
 
 using namespace std;
 using namespace std::chrono;
+
+// Holds the endpoint lock of an engine's rail 0, which the progress thread takes to reap that
+// rail's completion queue and to post: while it is held no transfer posted through the progress
+// thread can complete. postXfer() with a progress thread only queues its posts, so it does not
+// take the lock.
+class nixlLibfabricEngineTestAccess {
+public:
+    static std::unique_lock<std::mutex>
+    holdRail0(nixlLibfabricEngine &engine) {
+        return std::unique_lock<std::mutex>(engine.rail_manager_.getRail(0).ep_mutex_);
+    }
+};
+
+using TestAccess = nixlLibfabricEngineTestAccess;
 
 static const size_t kLen = 1 << 20;
 static const int kIters = 50;
@@ -196,9 +212,32 @@ runScenario(const string &mode, const string &a_name, const string &b_name) {
             a->prepXfer(NIXL_READ, local_descs, remote_descs, b_name, handle, &opt_args) ==
                 NIXL_SUCCESS,
             "prepXfer(READ) failed");
+        // The first READ cannot complete before postXfer() returns: the progress thread is held
+        // until then, so its notification can only come from the progress thread.
+        std::unique_lock<std::mutex> held;
+        if (k == 0) {
+            held = TestAccess::holdRail0(*a);
+        }
         nixl_status_t st =
             a->postXfer(NIXL_READ, local_descs, remote_descs, b_name, handle, &opt_args);
         nixl_exit_on_failure(st >= NIXL_SUCCESS, "postXfer(READ) failed");
+        if (k == 0) {
+            nixl_exit_on_failure(st == NIXL_IN_PROG,
+                                 "a READ completed while the progress thread was held");
+            held.unlock();
+        }
+
+        // Even iterations: the initiator does not poll, so the progress thread must send it.
+        const bool unpolled = k % 2 == 0;
+        if (unpolled) {
+            const notif_list_t notifs = waitNotifs(b);
+            nixl_exit_on_failure(notifs.size() == 1 && notifs.front().second == opt_args.notifMsg,
+                                 "READ iteration " + to_string(k) + ": " +
+                                     to_string(notifs.size()) + " notifications within " +
+                                     to_string(kNotifWait.count()) +
+                                     " s while the initiator did not poll checkXfer()");
+        }
+
         const auto deadline = steady_clock::now() + kNotifWait;
         while (st == NIXL_IN_PROG && steady_clock::now() < deadline) {
             st = a->checkXfer(handle);
@@ -210,26 +249,33 @@ runScenario(const string &mode, const string &a_name, const string &b_name) {
         const string after = "after-read-" + to_string(k);
         nixl_exit_on_failure(a->genNotif(b_name, after) == NIXL_SUCCESS, "genNotif failed");
 
+        // Odd iterations: checkXfer() reported success, so the READ's notification is on its way
+        // and must arrive before the genNotif() sent after it. Even ones: only genNotif()'s is due.
+        const size_t expected = unpolled ? 1 : 2;
         notif_list_t notifs;
         const auto notif_deadline = steady_clock::now() + kNotifWait;
-        while (notifs.size() < 2 && steady_clock::now() < notif_deadline) {
+        while (notifs.size() < expected && steady_clock::now() < notif_deadline) {
             notif_list_t more = waitNotifs(b);
             notifs.insert(notifs.end(), more.begin(), more.end());
         }
-        nixl_exit_on_failure(notifs.size() == 2,
+        nixl_exit_on_failure(notifs.size() == expected,
                              "READ iteration " + to_string(k) + ": " + to_string(notifs.size()) +
-                                 " notifications instead of the READ's and genNotif()'s");
-        nixl_exit_on_failure(notifs[0].second == opt_args.notifMsg && notifs[1].second == after,
-                             "READ iteration " + to_string(k) + ": got '" + notifs[0].second +
-                                 "' then '" + notifs[1].second +
-                                 "': the READ's notification must precede a later genNotif()");
+                                 " notifications instead of " + to_string(expected));
+        nixl_exit_on_failure(
+            unpolled ? notifs[0].second == after :
+                       notifs[0].second == opt_args.notifMsg && notifs[1].second == after,
+            "READ iteration " + to_string(k) + ": got '" + notifs[0].second + "'" +
+                (unpolled ? "" : " then '" + notifs[1].second + "'") +
+                ": the READ's notification must arrive once, before a later genNotif()");
     }
 
     cout << "libfabric_notif_test OK (" << mode << "): " << kIters
          << " notified WRITEs, each notification delivered once without the initiator polling "
             "(slowest "
          << max_ms << " ms), and " << kIters
-         << " notified READs whose notification preceded a later genNotif()" << endl;
+         << " notified READs whose notification arrived once (half of them unpolled, the first "
+            "held in progress past postXfer()) and before a later genNotif()"
+         << endl;
 
     a->unloadMD(remote_md);
     a->deregisterMem(src_md);

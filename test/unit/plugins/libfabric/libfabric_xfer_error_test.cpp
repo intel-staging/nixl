@@ -22,8 +22,8 @@
 // stays quiet past the target's pending_notif_timeout, the target keeps the failure it recorded
 // and still releases the notification as failed;
 // to a peer that is gone it is given up after the post -FI_EAGAIN timeout, with no notification.
-// A reserved XFER_ID is not handed out. A report for a transfer posted on a connection that has
-// since been replaced never reaches the replacement.
+// A reserved XFER_ID is not handed out. A report, or a completed transfer's queued notification,
+// for a transfer posted on a connection that has since been replaced never reaches the replacement.
 
 #include <chrono>
 #include <cstdlib>
@@ -69,6 +69,26 @@ public:
         engine.fragmentNotificationMessage(
             msg, engine.localAgent, handle.total_notif_msg_len, handle.binary_notifs);
         engine.notifXferFailure(&handle, NIXL_ERR_BACKEND);
+    }
+
+    // Queue the after-completion notification @p msg (XFER_ID @p xfer_id) of a transfer posted on
+    // @p posted_on to @p remote_agent, as onXferComplete() does; the progress thread sends it.
+    // Returns its result, settled once the send has gone out or failed.
+    static shared_ptr<nixlLibfabricBackendH::CompletionNotifResult>
+    queueCompletionNotif(const nixlLibfabricEngine &engine,
+                         const string &remote_agent,
+                         uint16_t xfer_id,
+                         const string &msg,
+                         weak_ptr<nixlLibfabricConnection> posted_on) {
+        nixlLibfabricEngine::CompletionNotif n;
+        n.remote_agent = remote_agent;
+        n.xfer_id = xfer_id;
+        n.result = make_shared<nixlLibfabricBackendH::CompletionNotifResult>();
+        n.connection = std::move(posted_on);
+        engine.fragmentNotificationMessage(msg, engine.localAgent, n.total_len, n.fragments);
+        auto result = n.result;
+        engine.queueCompletionNotif(std::move(n));
+        return result;
     }
 
     // Reports not finished yet; waits for a step in progress, whose reports the driver holds
@@ -468,8 +488,35 @@ runReplacedConnectionScenario() {
     const notif_list_t notifs = waitNotifs(b);
     nixl_exit_on_failure(notifs.size() == 1 && notifs.front().second == "current",
                          "a report for a transfer posted on the new connection did not arrive");
-    cout << "libfabric_xfer_error_test OK (replaced connection): the stale report was dropped, the "
-            "current one delivered"
+
+    // A completed transfer's queued notification (a READ's, or a notify-after-completion WRITE's)
+    // is bound the same way: the progress thread drops one posted on the replaced connection.
+    const auto stale_notif =
+        TestAccess::queueCompletionNotif(*a, "AgentL", 84, "stale-completion", old_conn);
+    const auto settle_until = steady_clock::now() + seconds(5);
+    while (!stale_notif->done.load() && steady_clock::now() < settle_until) {
+        this_thread::sleep_for(milliseconds(5));
+    }
+    nixl_exit_on_failure(stale_notif->done.load() && stale_notif->status.load() != NIXL_SUCCESS,
+                         "the completion notification for the replaced connection was not failed");
+    notif_list_t got;
+    nixl_exit_on_failure(b->getNotifs(got) >= NIXL_SUCCESS, "getNotifs failed");
+    nixl_exit_on_failure(got.empty(),
+                         "a completion notification for a transfer posted on the replaced "
+                         "connection reached the new one");
+    const auto current_notif = TestAccess::queueCompletionNotif(
+        *a, "AgentL", 85, "current-completion", TestAccess::connectionTo(*a, "AgentL"));
+    const notif_list_t completion = waitNotifs(b);
+    const auto sent_until = steady_clock::now() + seconds(5);
+    while (!current_notif->done.load() && steady_clock::now() < sent_until) {
+        this_thread::sleep_for(milliseconds(5));
+    }
+    nixl_exit_on_failure(
+        completion.size() == 1 && completion.front().second == "current-completion" &&
+            current_notif->done.load() && current_notif->status.load() == NIXL_SUCCESS,
+        "a completion notification posted on the new connection did not arrive");
+    cout << "libfabric_xfer_error_test OK (replaced connection): the stale report and completion "
+            "notification were dropped, the current ones delivered"
          << endl;
 
     a->disconnect("AgentL");

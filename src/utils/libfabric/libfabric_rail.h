@@ -402,6 +402,9 @@ struct nixlLibfabricPostRequest {
 
 /** Individual libfabric rail managing fabric, domain, endpoint, CQ, and AV */
 class nixlLibfabricRail {
+    // Unit tests: libfabric_notif_test holds ep_mutex_ to keep the progress thread from reaping
+    friend class nixlLibfabricEngineTestAccess;
+
 public:
     uint16_t rail_id; ///< Unique rail identifier
     std::string device_name; ///< Libfabric domain name for this rail
