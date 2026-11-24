@@ -38,8 +38,11 @@ private:
     // All available network devices discovered on this system
     std::vector<std::string> all_devices;
 
-    // Network fabric name (efa-direct, efa, tcp, sockets, etc.)
+    // Core libfabric provider name (cxi, efa, tcp, sockets)
     std::string provider_name;
+
+    // Every selected domain as reported by device discovery, in rail order
+    std::vector<LibfabricUtils::nixlLibfabricDeviceInfo> discovered_devices;
 
     // System information
     int num_aws_accel; // AWS Trainium accelerators
@@ -76,7 +79,7 @@ private:
     initHwlocTopology();
     nixl_status_t
     discoverHwlocTopology();
-    nixl_status_t
+    void
     buildPcieToLibfabricMapping();
     nixl_status_t
     discoverAccelWithHwloc();
